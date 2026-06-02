@@ -49,8 +49,7 @@ struct DeepSeekClient {
             temperature: settings.temperature,
             top_p: settings.topP,
             max_tokens: settings.maxTokens,
-            stop: settings.stop.isEmpty ? nil : settings.stop,
-            response_format: .init(type: settings.responseFormat.apiValue)
+            stop: settings.stop.isEmpty ? nil : settings.stop
         )
 
         var request = URLRequest(url: url)

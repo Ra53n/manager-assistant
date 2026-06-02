@@ -275,17 +275,12 @@ struct ChatSettingsView: View {
                 }
 
                 Section("Формат ответа") {
-                    Picker("Формат", selection: $settings.responseFormat) {
-                        ForEach(ResponseFormat.allCases) { format in
-                            Text(format.label).tag(format)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    if settings.responseFormat == .json {
-                        Text("Ответ вернётся как JSON-объект (удобно для машинной обработки).")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                    TextEditor(text: $settings.responseFormat)
+                        .frame(minHeight: 56)
+                        .font(.body)
+                    Text("Как форматировать ответ (свободная инструкция). Напр.: «Выведи заказ в виде чека: позиции с ценами, внизу ИТОГО». Пусто — без требований к формату.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 Section("Роль ассистента") {

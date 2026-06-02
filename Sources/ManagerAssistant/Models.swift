@@ -14,17 +14,6 @@ struct ChatMessage: Identifiable {
     let content: String
 }
 
-/// Формат ответа модели (DeepSeek `response_format`).
-enum ResponseFormat: String, CaseIterable, Identifiable, Equatable {
-    case text
-    case json
-
-    var id: String { rawValue }
-    /// Значение для поля API `response_format.type`.
-    var apiValue: String { self == .json ? "json_object" : "text" }
-    var label: String { self == .json ? "JSON" : "Текст" }
-}
-
 /// Параметры генерации DeepSeek, настраиваемые на каждый чат.
 /// Включены только реально поддерживаемые API параметры.
 /// (top_k DeepSeek не принимает; frequency/presence_penalty — deprecated.)
@@ -38,8 +27,9 @@ struct GenerationSettings: Equatable {
     /// Стоп-последовательности (до 16). Пустой массив — не отправлять.
     var stop: [String] = []
 
-    /// Формат ответа: обычный текст или JSON-объект.
-    var responseFormat: ResponseFormat = .text
+    /// Формат ответа — свободная текст-инструкция, как форматировать ответ.
+    /// Пусто — без специальных требований к формату.
+    var responseFormat: String = ""
 
     /// Системная роль/задача ассистента. Пусто — берётся дефолт из Config.
     var systemPrompt: String = ""
@@ -80,8 +70,9 @@ enum PromptBuilder {
             parts.append("Как только вся перечисленная информация собрана, \(action) и заверши работу, больше не задавая вопросов.")
         }
 
-        if s.responseFormat == .json {
-            parts.append("Итоговый результат верни СТРОГО как валидный JSON-объект, без markdown и текста вокруг.")
+        let format = s.responseFormat.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !format.isEmpty {
+            parts.append("Формат ответа: \(format)")
         }
 
         return parts.joined(separator: "\n\n")
@@ -110,15 +101,10 @@ struct ChatRequest: Encodable {
     let max_tokens: Int
     /// nil — ключ не отправляется (синтезированный Encodable использует encodeIfPresent).
     let stop: [String]?
-    let response_format: ResponseFormatField?
 
     struct RequestMessage: Encodable {
         let role: String
         let content: String
-    }
-
-    struct ResponseFormatField: Encodable {
-        let type: String
     }
 }
 
