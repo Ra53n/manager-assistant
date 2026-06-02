@@ -265,7 +265,7 @@ struct ChatSettingsView: View {
                 }
 
                 Section("Стоп-последовательности") {
-                    TextField("через запятую, напр.: \\n\\n, END", text: $stopText)
+                    TextField("", text: $stopText, prompt: Text("через запятую, напр.: \\n\\n, END"))
                         .onChange(of: stopText) { _ in
                             settings.stop = Self.parseStop(stopText)
                         }
@@ -295,7 +295,7 @@ struct ChatSettingsView: View {
                 Section("Условия завершения") {
                     ForEach(settings.completionConditions.indices, id: \.self) { i in
                         HStack {
-                            TextField("условие \(i + 1)", text: $settings.completionConditions[i])
+                            TextField("", text: $settings.completionConditions[i], prompt: Text("условие \(i + 1)"))
                             Button {
                                 settings.completionConditions.remove(at: i)
                             } label: {
@@ -312,7 +312,10 @@ struct ChatSettingsView: View {
                     }
                     .buttonStyle(.borderless)
 
-                    TextField("Действие при завершении (напр.: составь готовое описание тикета)", text: $settings.completionInstruction)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Действие при завершении")
+                        TextField("", text: $settings.completionInstruction, prompt: Text("напр.: составь итоговый результат"))
+                    }
 
                     Text("Ассистент задаёт по одному вопросу, пока не соберёт все условия, затем выполняет действие.")
                         .font(.caption)
