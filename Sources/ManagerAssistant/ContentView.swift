@@ -278,7 +278,7 @@ struct ChatSettingsView: View {
                     TextEditor(text: $settings.responseFormat)
                         .frame(minHeight: 56)
                         .font(.body)
-                    Text("Как форматировать ответ (свободная инструкция). Напр.: «Выведи заказ в виде чека: позиции с ценами, внизу ИТОГО». Пусто — без требований к формату.")
+                    Text("Как форматировать ответ (свободная инструкция). Напр.: «Маркированный список из 3 пунктов» или «верни строго JSON-объектом». Пусто — без требований к формату.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -287,7 +287,7 @@ struct ChatSettingsView: View {
                     TextEditor(text: $settings.systemPrompt)
                         .frame(minHeight: 56)
                         .font(.body)
-                    Text("Кто ассистент и что делает. Напр.: «Ты принимаешь заказ в Макдональдсе». Пусто — ответ по умолчанию.")
+                    Text("Кто ассистент и что делает. Напр.: «Ты турагент и подбираешь поездку» или «Ты помогаешь оформить баг-репорт». Пусто — ответ по умолчанию.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -312,7 +312,7 @@ struct ChatSettingsView: View {
                     }
                     .buttonStyle(.borderless)
 
-                    TextField("Действие при завершении (напр.: сформируй и выпиши заказ)", text: $settings.completionInstruction)
+                    TextField("Действие при завершении (напр.: составь готовое описание тикета)", text: $settings.completionInstruction)
 
                     Text("Ассистент задаёт по одному вопросу, пока не соберёт все условия, затем выполняет действие.")
                         .font(.caption)
