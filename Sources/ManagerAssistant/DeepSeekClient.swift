@@ -34,9 +34,9 @@ struct DeepSeekClient {
             throw DeepSeekError.invalidURL
         }
 
-        // Собираем сообщения: системный промпт + вся история диалога.
+        // Собираем сообщения: системный промпт (из настроек чата) + вся история диалога.
         var payloadMessages: [ChatRequest.RequestMessage] = [
-            .init(role: ChatRole.system.rawValue, content: Config.systemPrompt)
+            .init(role: ChatRole.system.rawValue, content: PromptBuilder.systemPrompt(for: settings))
         ]
         payloadMessages.append(contentsOf: messages.map {
             .init(role: $0.role.rawValue, content: $0.content)
@@ -49,7 +49,8 @@ struct DeepSeekClient {
             temperature: settings.temperature,
             top_p: settings.topP,
             max_tokens: settings.maxTokens,
-            stop: settings.stop.isEmpty ? nil : settings.stop
+            stop: settings.stop.isEmpty ? nil : settings.stop,
+            response_format: .init(type: settings.responseFormat.apiValue)
         )
 
         var request = URLRequest(url: url)

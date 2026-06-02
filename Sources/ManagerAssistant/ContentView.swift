@@ -274,6 +274,56 @@ struct ChatSettingsView: View {
                         .foregroundColor(.secondary)
                 }
 
+                Section("Формат ответа") {
+                    Picker("Формат", selection: $settings.responseFormat) {
+                        ForEach(ResponseFormat.allCases) { format in
+                            Text(format.label).tag(format)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    if settings.responseFormat == .json {
+                        Text("Ответ вернётся как JSON-объект (удобно для машинной обработки).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Section("Роль ассистента") {
+                    TextEditor(text: $settings.systemPrompt)
+                        .frame(minHeight: 56)
+                        .font(.body)
+                    Text("Кто ассистент и что делает. Напр.: «Ты принимаешь заказ в Макдональдсе». Пусто — ответ по умолчанию.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("Условия завершения") {
+                    ForEach(settings.completionConditions.indices, id: \.self) { i in
+                        HStack {
+                            TextField("условие \(i + 1)", text: $settings.completionConditions[i])
+                            Button {
+                                settings.completionConditions.remove(at: i)
+                            } label: {
+                                Image(systemName: "minus.circle.fill")
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    Button {
+                        settings.completionConditions.append("")
+                    } label: {
+                        Label("Добавить условие", systemImage: "plus.circle")
+                    }
+                    .buttonStyle(.borderless)
+
+                    TextField("Действие при завершении (напр.: сформируй и выпиши заказ)", text: $settings.completionInstruction)
+
+                    Text("Ассистент задаёт по одному вопросу, пока не соберёт все условия, затем выполняет действие.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
                 Section {
                     Label(
                         "DeepSeek не поддерживает top_k, frequency_penalty и presence_penalty — они игнорируются API. У reasoning-моделей температура и top_p тоже не действуют.",
@@ -294,7 +344,7 @@ struct ChatSettingsView: View {
             }
             .padding()
         }
-        .frame(width: 460, height: 560)
+        .frame(width: 480, height: 680)
         .onAppear {
             stopText = settings.stop.joined(separator: ", ")
         }
