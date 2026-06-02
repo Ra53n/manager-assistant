@@ -14,7 +14,29 @@ struct ChatMessage: Identifiable {
     let content: String
 }
 
-/// Отдельный чат со своим контекстом (историей), тайтлом и состоянием.
+/// Параметры генерации DeepSeek, настраиваемые на каждый чат.
+/// Включены только реально поддерживаемые API параметры.
+/// (top_k DeepSeek не принимает; frequency/presence_penalty — deprecated.)
+struct GenerationSettings: Equatable {
+    /// Температура сэмплирования, 0…2. Выше — креативнее, ниже — детерминированнее.
+    var temperature: Double = 1.0
+    /// Nucleus sampling (top_p), 0…1.
+    var topP: Double = 1.0
+    /// Максимум токенов в ответе.
+    var maxTokens: Int = 4096
+    /// Стоп-последовательности (до 16). Пустой массив — не отправлять.
+    var stop: [String] = []
+
+    static let `default` = GenerationSettings()
+
+    /// Диапазоны/границы для UI.
+    static let temperatureRange = 0.0...2.0
+    static let topPRange = 0.0...1.0
+    static let maxTokensRange = 256...8192
+    static let maxStopCount = 16
+}
+
+/// Отдельный чат со своим контекстом (историей), тайтлом, состоянием и настройками.
 /// У каждого чата своя история — удаление чата полностью очищает его контекст.
 struct Chat: Identifiable {
     let id = UUID()
@@ -22,6 +44,7 @@ struct Chat: Identifiable {
     var messages: [ChatMessage] = []
     var isLoading: Bool = false
     var errorText: String? = nil
+    var settings = GenerationSettings()
 }
 
 // MARK: - DTO запроса (OpenAI-совместимый формат)
@@ -30,6 +53,11 @@ struct ChatRequest: Encodable {
     let model: String
     let messages: [RequestMessage]
     let stream: Bool
+    let temperature: Double
+    let top_p: Double
+    let max_tokens: Int
+    /// nil — ключ не отправляется (синтезированный Encodable использует encodeIfPresent).
+    let stop: [String]?
 
     struct RequestMessage: Encodable {
         let role: String

@@ -44,6 +44,12 @@ final class ChatViewModel: ObservableObject {
         input = ""
     }
 
+    /// Обновляет параметры генерации выбранного чата.
+    func updateSelectedSettings(_ newValue: GenerationSettings) {
+        guard let idx = selectedIndex else { return }
+        chats[idx].settings = newValue
+    }
+
     /// Удаляет чат и тем самым полностью очищает его контекст.
     func deleteChat(_ id: UUID) {
         chats.removeAll { $0.id == id }
@@ -81,10 +87,11 @@ final class ChatViewModel: ObservableObject {
         input = ""
 
         let history = chats[idx].messages
+        let settings = chats[idx].settings
 
         Task {
             do {
-                let reply = try await client.send(messages: history)
+                let reply = try await client.send(messages: history, settings: settings)
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
                     chats[i].messages.append(ChatMessage(role: .assistant, content: reply))
                     chats[i].isLoading = false

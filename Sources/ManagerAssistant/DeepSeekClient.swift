@@ -24,8 +24,9 @@ enum DeepSeekError: LocalizedError {
 /// Клиент к DeepSeek (OpenAI-совместимый chat/completions).
 struct DeepSeekClient {
 
-    /// Отправляет всю историю переписки и возвращает текст ответа ассистента.
-    func send(messages: [ChatMessage]) async throws -> String {
+    /// Отправляет всю историю переписки с заданными параметрами генерации
+    /// и возвращает текст ответа ассистента.
+    func send(messages: [ChatMessage], settings: GenerationSettings) async throws -> String {
         guard !Config.isAPIKeyMissing else {
             throw DeepSeekError.missingAPIKey
         }
@@ -44,7 +45,11 @@ struct DeepSeekClient {
         let body = ChatRequest(
             model: Config.model,
             messages: payloadMessages,
-            stream: false
+            stream: false,
+            temperature: settings.temperature,
+            top_p: settings.topP,
+            max_tokens: settings.maxTokens,
+            stop: settings.stop.isEmpty ? nil : settings.stop
         )
 
         var request = URLRequest(url: url)

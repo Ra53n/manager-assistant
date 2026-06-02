@@ -72,10 +72,19 @@ struct ContentView: View {
 /// Область одного чата: список сообщений + поле ввода.
 struct ChatDetailView: View {
     @ObservedObject var vm: ChatViewModel
+    @State private var showingSettings = false
 
     private var messages: [ChatMessage] { vm.selectedChat?.messages ?? [] }
     private var isLoading: Bool { vm.selectedChat?.isLoading ?? false }
     private var errorText: String? { vm.selectedChat?.errorText }
+
+    /// Binding к настройкам выбранного чата.
+    private var settingsBinding: Binding<GenerationSettings> {
+        Binding(
+            get: { vm.selectedChat?.settings ?? .default },
+            set: { vm.updateSelectedSettings($0) }
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -86,6 +95,19 @@ struct ChatDetailView: View {
         }
         .frame(minWidth: 480, minHeight: 600)
         .navigationTitle(vm.selectedChat?.title ?? "Чат")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showingSettings = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                }
+                .help("Параметры генерации")
+            }
+        }
+        .sheet(isPresented: $showingSettings) {
+            ChatSettingsView(settings: settingsBinding)
+        }
     }
 
     // MARK: - Список сообщений
@@ -173,6 +195,143 @@ struct ChatDetailView: View {
             .disabled(!vm.canSend)
         }
         .padding()
+    }
+}
+
+/// Лист настроек параметров генерации для текущего чата.
+struct ChatSettingsView: View {
+    @Binding var settings: GenerationSettings
+    @Environment(\.dismiss) private var dismiss
+
+    /// Стоп-последовательности редактируем как строку «через запятую».
+    @State private var stopText: String = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Параметры генерации")
+                    .font(.headline)
+                Spacer()
+                Button("Сбросить") {
+                    settings = .default
+                    stopText = ""
+                }
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                Section {
+                    SliderRow(
+                        title: "Температура",
+                        subtitle: "Креативность ответа. Выше — разнообразнее.",
+                        value: $settings.temperature,
+                        range: GenerationSettings.temperatureRange,
+                        step: 0.1,
+                        format: "%.1f"
+                    )
+                    SliderRow(
+                        title: "Top P",
+                        subtitle: "Nucleus sampling. 1.0 — без ограничения.",
+                        value: $settings.topP,
+                        range: GenerationSettings.topPRange,
+                        step: 0.05,
+                        format: "%.2f"
+                    )
+                }
+
+                Section {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Макс. токенов")
+                            Spacer()
+                            Text("\(settings.maxTokens)")
+                                .foregroundColor(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { Double(settings.maxTokens) },
+                                set: { settings.maxTokens = Int($0) }
+                            ),
+                            in: Double(GenerationSettings.maxTokensRange.lowerBound)...Double(GenerationSettings.maxTokensRange.upperBound),
+                            step: 256
+                        )
+                        Text("Максимальная длина ответа модели.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Section("Стоп-последовательности") {
+                    TextField("через запятую, напр.: \\n\\n, END", text: $stopText)
+                        .onChange(of: stopText) { _ in
+                            settings.stop = Self.parseStop(stopText)
+                        }
+                    Text("Генерация остановится, встретив любую из них (до \(GenerationSettings.maxStopCount)).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section {
+                    Label(
+                        "DeepSeek не поддерживает top_k, frequency_penalty и presence_penalty — они игнорируются API. У reasoning-моделей температура и top_p тоже не действуют.",
+                        systemImage: "info.circle"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Готово") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+        }
+        .frame(width: 460, height: 560)
+        .onAppear {
+            stopText = settings.stop.joined(separator: ", ")
+        }
+    }
+
+    /// Парсит «a, b, c» в массив, обрезая пустые и лишние, не более лимита.
+    static func parseStop(_ text: String) -> [String] {
+        let items: [String] = text.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return Array(items.prefix(GenerationSettings.maxStopCount))
+    }
+}
+
+/// Строка с заголовком, подзаголовком, текущим значением и слайдером.
+struct SliderRow: View {
+    let title: String
+    let subtitle: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+    let format: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                Spacer()
+                Text(String(format: format, value))
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+            Slider(value: $value, in: range, step: step)
+            Text(subtitle)
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
     }
 }
 
