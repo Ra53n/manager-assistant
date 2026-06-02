@@ -1,0 +1,24 @@
+# Build artifacts
+.build/
+*.app
+DerivedData/
+.swiftpm/
+
+# Secrets — никогда не коммитим ключи
+*.key
+.env
+Secrets.swift
+Secrets.plist
+
+# Icon working files
+*.iconset/
+
+# Local editor / Claude Code settings
+.claude/
+
+# macOS
+.DS_Store
+
+# Xcode
+xcuserdata/
+*.xcuserstate
