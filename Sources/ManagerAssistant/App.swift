@@ -7,7 +7,27 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
+        if let icon = Self.loadAppIcon() {
+            NSApp.applicationIconImage = icon
+        }
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Иконка для Dock. Нужна в первую очередь для запуска через `swift run`
+    /// (у «голого» бинарника нет .app-обёртки, поэтому иконку ставим в рантайме).
+    /// Для собранного .app иконку и так даёт CFBundleIconFile.
+    private static func loadAppIcon() -> NSImage? {
+        // Ресурс пакета (`swift run`).
+        if let url = Bundle.module.url(forResource: "AppIcon", withExtension: "icns"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        // Ресурс внутри .app.
+        if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        return nil
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

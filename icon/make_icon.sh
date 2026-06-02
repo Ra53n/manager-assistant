@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 MASTER="icon_1024.png"
 ICONSET="AppIcon.iconset"
-OUT_DIR="../Resources"
+OUT_DIR="../Sources/ManagerAssistant/Resources"
 
 echo "▶ Рендер мастер-PNG (1024×1024)…"
 swift render_icon.swift "$MASTER"

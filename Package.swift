@@ -9,7 +9,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ManagerAssistant",
-            path: "Sources/ManagerAssistant"
+            path: "Sources/ManagerAssistant",
+            resources: [
+                .copy("Resources/AppIcon.icns")
+            ]
         )
     ]
 )

@@ -26,8 +26,9 @@ mkdir -p "${APP_DIR}/Contents/Resources"
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
 
 # Иконка приложения (если собрана).
-if [ -f "Resources/AppIcon.icns" ]; then
-    cp "Resources/AppIcon.icns" "${APP_DIR}/Contents/Resources/AppIcon.icns"
+ICON_SRC="Sources/ManagerAssistant/Resources/AppIcon.icns"
+if [ -f "${ICON_SRC}" ]; then
+    cp "${ICON_SRC}" "${APP_DIR}/Contents/Resources/AppIcon.icns"
 fi
 
 cat > "${APP_DIR}/Contents/Info.plist" <<PLIST
