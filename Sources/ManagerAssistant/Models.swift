@@ -31,13 +31,6 @@ struct GenerationSettings: Equatable {
     /// Пусто — без специальных требований к формату.
     var responseFormat: String = ""
 
-    /// Системная роль/задача ассистента. Пусто — берётся дефолт из Config.
-    var systemPrompt: String = ""
-    /// Условия, которые ассистент должен собрать перед завершением.
-    var completionConditions: [String] = []
-    /// Что сделать, когда все условия собраны. Пусто — «выдать итог».
-    var completionInstruction: String = ""
-
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -47,28 +40,10 @@ struct GenerationSettings: Equatable {
     static let maxStopCount = 16
 }
 
-/// Собирает системный промпт из настроек чата: роль + условия завершения + формат.
+/// Собирает системный промпт из настроек чата: базовая роль + формат ответа.
 enum PromptBuilder {
     static func systemPrompt(for s: GenerationSettings) -> String {
-        var parts: [String] = []
-
-        let base = s.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        parts.append(base.isEmpty ? Config.systemPrompt : base)
-
-        let conditions = s.completionConditions
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        if !conditions.isEmpty {
-            var block = "Прежде чем завершить работу, собери у пользователя следующую информацию. "
-            block += "Задавай по одному уточняющему вопросу за раз и не переспрашивай то, что уже известно:"
-            for c in conditions { block += "\n— \(c)" }
-            parts.append(block)
-
-            let instruction = s.completionInstruction.trimmingCharacters(in: .whitespacesAndNewlines)
-            let action = instruction.isEmpty ? "сформируй и выдай итоговый результат" : instruction
-            parts.append("Как только вся перечисленная информация собрана, \(action) и заверши работу, больше не задавая вопросов.")
-        }
+        var parts: [String] = [Config.systemPrompt]
 
         let format = s.responseFormat.trimmingCharacters(in: .whitespacesAndNewlines)
         if !format.isEmpty {

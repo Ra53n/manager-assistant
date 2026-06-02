@@ -222,6 +222,15 @@ struct ChatSettingsView: View {
             Divider()
 
             Form {
+                Section("Формат ответа") {
+                    TextEditor(text: $settings.responseFormat)
+                        .frame(minHeight: 56)
+                        .font(.body)
+                    Text("Как форматировать ответ (свободная инструкция). Напр.: «Маркированный список из 3 пунктов» или «верни строго JSON-объектом». Пусто — без требований к формату.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
                 Section {
                     SliderRow(
                         title: "Температура",
@@ -265,59 +274,11 @@ struct ChatSettingsView: View {
                 }
 
                 Section("Стоп-последовательности") {
-                    TextField("", text: $stopText, prompt: Text("через запятую, напр.: \\n\\n, END"))
+                    TextField("", text: $stopText, prompt: Text("через запятую, напр.: \\n, END"))
                         .onChange(of: stopText) { _ in
                             settings.stop = Self.parseStop(stopText)
                         }
-                    Text("Генерация остановится, встретив любую из них (до \(GenerationSettings.maxStopCount)).")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Section("Формат ответа") {
-                    TextEditor(text: $settings.responseFormat)
-                        .frame(minHeight: 56)
-                        .font(.body)
-                    Text("Как форматировать ответ (свободная инструкция). Напр.: «Маркированный список из 3 пунктов» или «верни строго JSON-объектом». Пусто — без требований к формату.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Section("Роль ассистента") {
-                    TextEditor(text: $settings.systemPrompt)
-                        .frame(minHeight: 56)
-                        .font(.body)
-                    Text("Кто ассистент и что делает. Напр.: «Ты турагент и подбираешь поездку» или «Ты помогаешь оформить баг-репорт». Пусто — ответ по умолчанию.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Section("Условия завершения") {
-                    ForEach(settings.completionConditions.indices, id: \.self) { i in
-                        HStack {
-                            TextField("", text: $settings.completionConditions[i], prompt: Text("условие \(i + 1)"))
-                            Button {
-                                settings.completionConditions.remove(at: i)
-                            } label: {
-                                Image(systemName: "minus.circle.fill")
-                                    .foregroundColor(.secondary)
-                            }
-                            .buttonStyle(.borderless)
-                        }
-                    }
-                    Button {
-                        settings.completionConditions.append("")
-                    } label: {
-                        Label("Добавить условие", systemImage: "plus.circle")
-                    }
-                    .buttonStyle(.borderless)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Действие при завершении")
-                        TextField("", text: $settings.completionInstruction, prompt: Text("напр.: составь итоговый результат"))
-                    }
-
-                    Text("Ассистент задаёт по одному вопросу, пока не соберёт все условия, затем выполняет действие.")
+                    Text("Генерация обрывается, как только модель напишет любую из этих строк (сама строка в ответ не попадает; до \(GenerationSettings.maxStopCount) штук). \\n — перенос строки.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -342,18 +303,27 @@ struct ChatSettingsView: View {
             }
             .padding()
         }
-        .frame(width: 480, height: 680)
+        .frame(width: 480, height: 520)
         .onAppear {
-            stopText = settings.stop.joined(separator: ", ")
+            stopText = Self.formatStop(settings.stop)
         }
     }
 
-    /// Парсит «a, b, c» в массив, обрезая пустые и лишние, не более лимита.
+    /// Парсит «a, b, c» в массив, превращая литералы \n и \t в реальные символы.
     static func parseStop(_ text: String) -> [String] {
         let items: [String] = text.split(separator: ",")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+            .map { $0.replacingOccurrences(of: "\\n", with: "\n")
+                     .replacingOccurrences(of: "\\t", with: "\t") }
         return Array(items.prefix(GenerationSettings.maxStopCount))
+    }
+
+    /// Обратное преобразование для отображения в поле (реальные символы → \n, \t).
+    static func formatStop(_ stops: [String]) -> String {
+        stops.map { $0.replacingOccurrences(of: "\n", with: "\\n")
+                      .replacingOccurrences(of: "\t", with: "\\t") }
+             .joined(separator: ", ")
     }
 }
 
