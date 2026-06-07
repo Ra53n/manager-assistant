@@ -517,6 +517,12 @@ struct MessageBubble: View {
                 bubble
                 if !isUser { Spacer(minLength: 40) }
             }
+            if !isUser, let metrics = message.metrics {
+                Text(Self.metricsText(metrics))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .help(Self.metricsTooltip(metrics))
+            }
             copyControl
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
@@ -564,5 +570,37 @@ struct MessageBubble: View {
         NSPasteboard.general.setString(message.content, forType: .string)
         copied = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
+    }
+
+    /// Короткая строка метрик под ответом: время · токены · стоимость.
+    static func metricsText(_ m: MessageMetrics) -> String {
+        var parts: [String] = [
+            String(format: "%.1f с", m.duration),
+            "↑\(m.promptTokens.formatted()) ↓\(m.completionTokens.formatted()) ток.",
+        ]
+        if let cost = m.totalCost {
+            parts.append(formatCost(cost))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Подробный тултип: разбивка стоимости запрос/ответ.
+    static func metricsTooltip(_ m: MessageMetrics) -> String {
+        var lines = [
+            "Время ответа: \(String(format: "%.2f", m.duration)) с",
+            "Токены: запрос \(m.promptTokens), ответ \(m.completionTokens), всего \(m.totalTokens)",
+        ]
+        if let p = m.promptCost, let c = m.completionCost {
+            lines.append("Стоимость: запрос \(formatCost(p)) + ответ \(formatCost(c)) = \(formatCost(p + c))")
+        } else {
+            lines.append("Стоимость: цена модели неизвестна")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func formatCost(_ c: Double) -> String {
+        if c <= 0 { return "$0" }
+        if c < 0.01 { return String(format: "$%.6f", c) }
+        return String(format: "$%.4f", c)
     }
 }

@@ -53,6 +53,28 @@ enum Provider: String, CaseIterable, Codable, Hashable {
     }
 }
 
+/// Цена модели в USD за один токен.
+struct ModelPricing: Equatable {
+    let promptPerToken: Double
+    let completionPerToken: Double
+}
+
+/// Прайс DeepSeek (их /models не отдаёт цены). USD за 1M токенов → за токен.
+/// Источник: api-docs.deepseek.com/quick_start/pricing (стандартные ставки, cache miss).
+enum DeepSeekPricing {
+    private static func perToken(_ inputPer1M: Double, _ outputPer1M: Double) -> ModelPricing {
+        ModelPricing(promptPerToken: inputPer1M / 1_000_000, completionPerToken: outputPer1M / 1_000_000)
+    }
+
+    static let table: [String: ModelPricing] = [
+        "deepseek-v4-flash": perToken(0.14, 0.28),
+        "deepseek-v4-pro":   perToken(1.74, 3.48),
+        // Алиасы — приблизительно по соответствующему тиру.
+        "deepseek-chat":     perToken(0.14, 0.28),
+        "deepseek-reasoner": perToken(1.74, 3.48),
+    ]
+}
+
 /// Хранилище ключей в ~/.config/manager-assistant/<provider>.key (вне репозитория).
 enum KeyStore {
     static var directory: URL {

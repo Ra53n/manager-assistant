@@ -86,8 +86,8 @@ struct DeepSeekClient {
         )
     }
 
-    /// Загружает список доступных моделей провайдера через его GET /models.
-    func fetchModels(provider: Provider) async throws -> [String] {
+    /// Загружает модели провайдера (id + цены, если они есть в /models).
+    func fetchModels(provider: Provider) async throws -> [ModelInfo] {
         let key = KeyStore.key(for: provider)
         guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
         guard let url = URL(string: provider.modelsURL) else { throw DeepSeekError.invalidURL }
@@ -103,6 +103,12 @@ struct DeepSeekClient {
         }
 
         let decoded = try JSONDecoder().decode(ModelsResponse.self, from: data)
-        return decoded.data.map { $0.id }
+        return decoded.data.map { model in
+            ModelInfo(
+                id: model.id,
+                promptPrice: model.pricing?.prompt.flatMap(Double.init),
+                completionPrice: model.pricing?.completion.flatMap(Double.init)
+            )
+        }
     }
 }

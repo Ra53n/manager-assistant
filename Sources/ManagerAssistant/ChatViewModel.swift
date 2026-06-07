@@ -15,6 +15,17 @@ final class ChatViewModel: ObservableObject {
     @Published var modelsError: String?
     private var hasLoadedModels = false
 
+    /// Цены по моделям, ключ — "<provider>|<model>". Сидим прайсом DeepSeek сразу.
+    private var pricing: [String: ModelPricing] = ChatViewModel.seedPricing()
+
+    private static func seedPricing() -> [String: ModelPricing] {
+        var prices: [String: ModelPricing] = [:]
+        for (model, price) in DeepSeekPricing.table {
+            prices["\(Provider.deepseek.rawValue)|\(model)"] = price
+        }
+        return prices
+    }
+
     private let client = DeepSeekClient()
 
     static let defaultTitle = "Новый чат"
@@ -67,16 +78,28 @@ final class ChatViewModel: ObservableObject {
         modelsError = nil
         Task {
             var combined: [ModelOption] = []
+            var prices: [String: ModelPricing] = [:]
             var failed: [String] = []
             for provider in Provider.allCases where KeyStore.hasKey(for: provider) {
                 do {
-                    let ids = try await client.fetchModels(provider: provider)
-                    combined += ids.map { ModelOption(provider: provider, model: $0) }
+                    let infos = try await client.fetchModels(provider: provider)
+                    for info in infos {
+                        let option = ModelOption(provider: provider, model: info.id)
+                        combined.append(option)
+                        if let pp = info.promptPrice, let cp = info.completionPrice {
+                            prices[option.id] = ModelPricing(promptPerToken: pp, completionPerToken: cp)
+                        }
+                    }
                 } catch {
                     failed.append(provider.displayName)
                 }
             }
+            // Цены DeepSeek (их API цены не отдаёт) — из таблицы.
+            for (model, price) in DeepSeekPricing.table {
+                prices["\(Provider.deepseek.rawValue)|\(model)"] = price
+            }
             if !combined.isEmpty { availableModels = combined }
+            pricing = prices
             modelsError = failed.isEmpty ? nil : "Не удалось загрузить: \(failed.joined(separator: ", "))"
             hasLoadedModels = true
             isLoadingModels = false
@@ -121,12 +144,23 @@ final class ChatViewModel: ObservableObject {
 
         let history = chats[idx].messages
         let settings = chats[idx].settings
+        let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
 
         Task {
+            let start = Date()
             do {
                 let result = try await client.send(messages: history, settings: settings)
+                let duration = Date().timeIntervalSince(start)
+                let metrics = MessageMetrics(
+                    promptTokens: result.promptTokens,
+                    completionTokens: result.completionTokens,
+                    totalTokens: result.totalTokens,
+                    duration: duration,
+                    promptCost: price.map { Double(result.promptTokens) * $0.promptPerToken },
+                    completionCost: price.map { Double(result.completionTokens) * $0.completionPerToken }
+                )
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
-                    chats[i].messages.append(ChatMessage(role: .assistant, content: result.text))
+                    chats[i].messages.append(ChatMessage(role: .assistant, content: result.text, metrics: metrics))
                     chats[i].promptTokens += result.promptTokens
                     chats[i].completionTokens += result.completionTokens
                     chats[i].totalTokens += result.totalTokens

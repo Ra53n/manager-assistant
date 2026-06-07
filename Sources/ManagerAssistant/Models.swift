@@ -7,11 +7,28 @@ enum ChatRole: String, Codable {
     case assistant
 }
 
+/// Метрики ответа модели (для сравнения скорости и стоимости).
+struct MessageMetrics: Equatable {
+    let promptTokens: Int
+    let completionTokens: Int
+    let totalTokens: Int
+    let duration: TimeInterval        // время ответа, сек (wall-clock)
+    let promptCost: Double?           // USD за токены запроса (если известна цена)
+    let completionCost: Double?       // USD за токены ответа
+
+    var totalCost: Double? {
+        guard let p = promptCost, let c = completionCost else { return nil }
+        return p + c
+    }
+}
+
 /// Одно сообщение в чате (для UI и для отправки в API).
 struct ChatMessage: Identifiable {
     let id = UUID()
     let role: ChatRole
     let content: String
+    /// Метрики ответа (только у сообщений ассистента).
+    var metrics: MessageMetrics? = nil
 }
 
 /// Параметры генерации DeepSeek, настраиваемые на каждый чат.
@@ -123,11 +140,24 @@ struct SendResult {
 }
 
 /// Ответ эндпоинта GET /models — список доступных моделей провайдера.
+/// У OpenRouter в каждой модели есть pricing (USD за токен, строками).
 struct ModelsResponse: Decodable {
     let data: [Model]
     struct Model: Decodable {
         let id: String
+        let pricing: Pricing?
+        struct Pricing: Decodable {
+            let prompt: String?
+            let completion: String?
+        }
     }
+}
+
+/// Сведения о модели, полученные из /models: id + цена за токен (если есть).
+struct ModelInfo {
+    let id: String
+    let promptPrice: Double?
+    let completionPrice: Double?
 }
 
 /// Модель в объединённом списке: провайдер + id модели.
