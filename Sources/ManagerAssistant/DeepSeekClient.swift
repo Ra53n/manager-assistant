@@ -42,8 +42,9 @@ struct DeepSeekClient {
             .init(role: $0.role.rawValue, content: $0.content)
         })
 
+        let model = settings.model.isEmpty ? Config.model : settings.model
         let body = ChatRequest(
-            model: Config.model,
+            model: model,
             messages: payloadMessages,
             stream: false,
             temperature: settings.temperature,
@@ -77,5 +78,24 @@ struct DeepSeekClient {
             throw DeepSeekError.emptyResponse
         }
         return text
+    }
+
+    /// Загружает список доступных моделей через GET /models.
+    func fetchModels() async throws -> [String] {
+        guard !Config.isAPIKeyMissing else { throw DeepSeekError.missingAPIKey }
+        guard let url = URL(string: Config.modelsURL) else { throw DeepSeekError.invalidURL }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(Config.deepSeekAPIKey)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw DeepSeekError.badStatus(code: code, message: "не удалось получить список моделей")
+        }
+
+        let decoded = try JSONDecoder().decode(ModelsResponse.self, from: data)
+        return decoded.data.map { $0.id }
     }
 }

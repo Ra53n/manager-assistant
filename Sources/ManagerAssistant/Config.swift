@@ -14,6 +14,9 @@ enum Config {
     /// OpenAI-совместимый endpoint DeepSeek.
     static let baseURL = "https://api.deepseek.com/chat/completions"
 
+    /// Endpoint со списком доступных моделей.
+    static let modelsURL = "https://api.deepseek.com/models"
+
     /// Модель: "deepseek-chat" (V3) — обычный чат;
     /// "deepseek-reasoner" (R1) — с рассуждениями.
     static let model = "deepseek-chat"

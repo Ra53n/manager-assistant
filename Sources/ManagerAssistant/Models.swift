@@ -18,6 +18,8 @@ struct ChatMessage: Identifiable {
 /// Включены только реально поддерживаемые API параметры.
 /// (top_k DeepSeek не принимает; frequency/presence_penalty — deprecated.)
 struct GenerationSettings: Equatable {
+    /// Выбранная модель DeepSeek (id из списка /models).
+    var model: String = Config.model
     /// Температура сэмплирования, 0…2. Выше — креативнее, ниже — детерминированнее.
     var temperature: Double = 1.0
     /// Nucleus sampling (top_p), 0…1.
@@ -95,6 +97,14 @@ struct ChatResponse: Decodable {
     struct ResponseMessage: Decodable {
         let role: String
         let content: String
+    }
+}
+
+/// Ответ эндпоинта GET /models — список доступных моделей DeepSeek.
+struct ModelsResponse: Decodable {
+    let data: [Model]
+    struct Model: Decodable {
+        let id: String
     }
 }
 

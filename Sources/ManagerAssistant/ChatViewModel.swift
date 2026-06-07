@@ -7,6 +7,12 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedChatID: UUID?
     @Published var input: String = ""
 
+    /// Список моделей DeepSeek (подтягивается из /models; до загрузки — дефолтный).
+    @Published var availableModels: [String] = [Config.model, "deepseek-reasoner"]
+    @Published var isLoadingModels = false
+    @Published var modelsError: String?
+    private var hasLoadedModels = false
+
     private let client = DeepSeekClient()
 
     static let defaultTitle = "Новый чат"
@@ -48,6 +54,24 @@ final class ChatViewModel: ObservableObject {
     func updateSelectedSettings(_ newValue: GenerationSettings) {
         guard let idx = selectedIndex else { return }
         chats[idx].settings = newValue
+    }
+
+    /// Загружает список моделей из DeepSeek. По умолчанию — один раз; force — принудительно.
+    func loadModels(force: Bool = false) {
+        if isLoadingModels { return }
+        if hasLoadedModels && !force { return }
+        isLoadingModels = true
+        modelsError = nil
+        Task {
+            do {
+                let models = try await client.fetchModels()
+                if !models.isEmpty { availableModels = models }
+                hasLoadedModels = true
+            } catch {
+                modelsError = "Не удалось загрузить список моделей"
+            }
+            isLoadingModels = false
+        }
     }
 
     /// Удаляет чат и тем самым полностью очищает его контекст.

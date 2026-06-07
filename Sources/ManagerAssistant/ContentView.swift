@@ -108,7 +108,7 @@ struct ChatDetailView: View {
             }
         }
         .sheet(isPresented: $showingSettings) {
-            ChatSettingsView(settings: settingsBinding)
+            ChatSettingsView(vm: vm, settings: settingsBinding)
         }
     }
 
@@ -212,6 +212,7 @@ struct ChatDetailView: View {
 
 /// Лист настроек параметров генерации для текущего чата.
 struct ChatSettingsView: View {
+    @ObservedObject var vm: ChatViewModel
     @Binding var settings: GenerationSettings
     @Environment(\.dismiss) private var dismiss
 
@@ -234,6 +235,32 @@ struct ChatSettingsView: View {
             Divider()
 
             Form {
+                Section("Модель") {
+                    Picker("Модель DeepSeek", selection: $settings.model) {
+                        ForEach(vm.availableModels, id: \.self) { model in
+                            Text(model).tag(model)
+                        }
+                        // Текущая модель должна быть выбираема, даже если её ещё нет в списке.
+                        if !vm.availableModels.contains(settings.model) {
+                            Text(settings.model).tag(settings.model)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Button {
+                            vm.loadModels(force: true)
+                        } label: {
+                            Label("Обновить список", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderless)
+                        if vm.isLoadingModels {
+                            ProgressView().controlSize(.small)
+                        }
+                        if let err = vm.modelsError {
+                            Text(err).font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                }
+
                 Section("Формат ответа") {
                     TextEditor(text: $settings.responseFormat)
                         .frame(minHeight: 56)
@@ -315,9 +342,10 @@ struct ChatSettingsView: View {
             }
             .padding()
         }
-        .frame(width: 480, height: 520)
+        .frame(width: 480, height: 560)
         .onAppear {
             stopText = Self.formatStop(settings.stop)
+            vm.loadModels()
         }
     }
 
