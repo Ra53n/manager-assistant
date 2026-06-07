@@ -140,7 +140,7 @@ struct ChatDetailView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     if messages.isEmpty {
-                        Text("Напиши сообщение, чтобы начать диалог с DeepSeek.")
+                        Text("Напиши сообщение, чтобы начать диалог с \(vm.selectedChat?.settings.model ?? "моделью").")
                             .foregroundColor(.secondary)
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.top, 40)
