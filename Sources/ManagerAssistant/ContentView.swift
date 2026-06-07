@@ -184,16 +184,26 @@ struct ChatDetailView: View {
     // MARK: - Поле ввода
 
     private var inputBar: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .bottom, spacing: 8) {
             TextField("Сообщение…", text: $vm.input, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1...5)
+                .textFieldStyle(.plain)
+                .lineLimit(1...5)            // растёт до 5 строк, дальше — скролл
+                .font(.body)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color(nsColor: .textBackgroundColor))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.gray.opacity(0.35), lineWidth: 1)
+                )
                 .onSubmit(vm.send)
 
             Button(action: vm.send) {
                 Image(systemName: "paperplane.fill")
             }
-            .keyboardShortcut(.return, modifiers: [])
             .disabled(!vm.canSend)
         }
         .padding()
