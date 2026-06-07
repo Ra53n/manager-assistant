@@ -98,6 +98,17 @@ struct ChatDetailView: View {
         .frame(minWidth: 480, minHeight: 600)
         .navigationTitle(vm.selectedChat?.title ?? "Чат")
         .toolbar {
+            ToolbarItem(placement: .status) {
+                if let chat = vm.selectedChat, chat.totalTokens > 0 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "circle.hexagongrid")
+                        Text("\(chat.totalTokens.formatted()) токенов")
+                    }
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .help("Токены в этом чате — запрос: \(chat.promptTokens.formatted()) · ответ: \(chat.completionTokens.formatted()) · всего: \(chat.totalTokens.formatted())")
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     showingSettings = true

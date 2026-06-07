@@ -65,6 +65,11 @@ struct Chat: Identifiable {
     var isLoading: Bool = false
     var errorText: String? = nil
     var settings = GenerationSettings()
+
+    /// Накопленный расход токенов по этому чату (суммарно за все запросы).
+    var promptTokens: Int = 0
+    var completionTokens: Int = 0
+    var totalTokens: Int = 0
 }
 
 // MARK: - DTO запроса (OpenAI-совместимый формат)
@@ -89,6 +94,7 @@ struct ChatRequest: Encodable {
 
 struct ChatResponse: Decodable {
     let choices: [Choice]
+    let usage: Usage?
 
     struct Choice: Decodable {
         let message: ResponseMessage
@@ -98,6 +104,20 @@ struct ChatResponse: Decodable {
         let role: String
         let content: String
     }
+
+    struct Usage: Decodable {
+        let prompt_tokens: Int
+        let completion_tokens: Int
+        let total_tokens: Int
+    }
+}
+
+/// Результат отправки: текст ответа + потраченные на запрос токены.
+struct SendResult {
+    let text: String
+    let promptTokens: Int
+    let completionTokens: Int
+    let totalTokens: Int
 }
 
 /// Ответ эндпоинта GET /models — список доступных моделей DeepSeek.

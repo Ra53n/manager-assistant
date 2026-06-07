@@ -115,9 +115,12 @@ final class ChatViewModel: ObservableObject {
 
         Task {
             do {
-                let reply = try await client.send(messages: history, settings: settings)
+                let result = try await client.send(messages: history, settings: settings)
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
-                    chats[i].messages.append(ChatMessage(role: .assistant, content: reply))
+                    chats[i].messages.append(ChatMessage(role: .assistant, content: result.text))
+                    chats[i].promptTokens += result.promptTokens
+                    chats[i].completionTokens += result.completionTokens
+                    chats[i].totalTokens += result.totalTokens
                     chats[i].isLoading = false
                 }
             } catch {

@@ -25,8 +25,8 @@ enum DeepSeekError: LocalizedError {
 struct DeepSeekClient {
 
     /// Отправляет всю историю переписки с заданными параметрами генерации
-    /// и возвращает текст ответа ассистента.
-    func send(messages: [ChatMessage], settings: GenerationSettings) async throws -> String {
+    /// и возвращает текст ответа ассистента вместе с расходом токенов.
+    func send(messages: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
         guard !Config.isAPIKeyMissing else {
             throw DeepSeekError.missingAPIKey
         }
@@ -77,7 +77,12 @@ struct DeepSeekClient {
         guard let text = decoded.choices.first?.message.content, !text.isEmpty else {
             throw DeepSeekError.emptyResponse
         }
-        return text
+        return SendResult(
+            text: text,
+            promptTokens: decoded.usage?.prompt_tokens ?? 0,
+            completionTokens: decoded.usage?.completion_tokens ?? 0,
+            totalTokens: decoded.usage?.total_tokens ?? 0
+        )
     }
 
     /// Загружает список доступных моделей через GET /models.
