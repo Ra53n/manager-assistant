@@ -239,6 +239,7 @@ struct ChatSettingsView: View {
 
     /// Стоп-последовательности редактируем как строку «через запятую».
     @State private var stopText: String = ""
+    @State private var showingModelPicker = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -257,26 +258,24 @@ struct ChatSettingsView: View {
 
             Form {
                 Section("Модель") {
-                    Picker("Модель", selection: Binding(
-                        get: { ModelOption(provider: settings.provider, model: settings.model) },
-                        set: { settings.provider = $0.provider; settings.model = $0.model }
-                    )) {
-                        ForEach(Provider.allCases, id: \.self) { prov in
-                            let opts = vm.availableModels.filter { $0.provider == prov }
-                            if !opts.isEmpty {
-                                Section(prov.displayName) {
-                                    ForEach(opts) { opt in
-                                        Text(opt.model).tag(opt)
-                                    }
-                                }
+                    Button {
+                        showingModelPicker = true
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(settings.model)
+                                Text(settings.provider.displayName)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                             }
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down")
+                                .foregroundColor(.secondary)
                         }
-                        // Текущая модель выбираема, даже если её ещё нет в загруженном списке.
-                        let current = ModelOption(provider: settings.provider, model: settings.model)
-                        if !vm.availableModels.contains(current) {
-                            Text("\(current.provider.displayName) · \(current.model)").tag(current)
-                        }
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+
                     HStack(spacing: 8) {
                         Button {
                             vm.loadModels(force: true)
@@ -291,7 +290,7 @@ struct ChatSettingsView: View {
                             Text(err).font(.caption).foregroundColor(.orange)
                         }
                     }
-                    Text("Список — из провайдеров с заданным ключом. Ключи: кнопка 🔑 слева вверху.")
+                    Text("Нажми на модель, чтобы выбрать с поиском. Список — из провайдеров с ключом (🔑 слева вверху).")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -382,6 +381,13 @@ struct ChatSettingsView: View {
             stopText = Self.formatStop(settings.stop)
             vm.loadModels()
         }
+        .sheet(isPresented: $showingModelPicker) {
+            ModelPickerView(
+                models: vm.availableModels,
+                provider: $settings.provider,
+                model: $settings.model
+            )
+        }
     }
 
     /// Парсит «a, b, c» в массив, превращая литералы \n и \t в реальные символы.
@@ -425,6 +431,95 @@ struct SliderRow: View {
                 .font(.caption)
                 .foregroundColor(.secondary)
         }
+    }
+}
+
+/// Лист выбора модели с поиском по всему списку (DeepSeek + OpenRouter).
+struct ModelPickerView: View {
+    let models: [ModelOption]
+    @Binding var provider: Provider
+    @Binding var model: String
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var search = ""
+
+    private var filtered: [ModelOption] {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return models }
+        return models.filter {
+            $0.model.lowercased().contains(q) || $0.provider.displayName.lowercased().contains(q)
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Выбор модели")
+                    .font(.headline)
+                Spacer()
+                Button("Готово") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+
+            // Поле поиска.
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundColor(.secondary)
+                TextField("", text: $search, prompt: Text("Поиск модели…"))
+                    .textFieldStyle(.plain)
+                if !search.isEmpty {
+                    Button { search = "" } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(8)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color(nsColor: .textBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.3)))
+            .padding(.horizontal)
+            .padding(.bottom, 8)
+
+            Divider()
+
+            if filtered.isEmpty {
+                Spacer()
+                Text("Ничего не найдено")
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else {
+                List {
+                    ForEach(Provider.allCases, id: \.self) { prov in
+                        let opts = filtered.filter { $0.provider == prov }
+                        if !opts.isEmpty {
+                            Section("\(prov.displayName) (\(opts.count))") {
+                                ForEach(opts) { opt in
+                                    Button {
+                                        provider = opt.provider
+                                        model = opt.model
+                                        dismiss()
+                                    } label: {
+                                        HStack {
+                                            Text(opt.model)
+                                                .lineLimit(1)
+                                            Spacer()
+                                            if opt.provider == provider && opt.model == model {
+                                                Image(systemName: "checkmark")
+                                                    .foregroundColor(.accentColor)
+                                            }
+                                        }
+                                        .contentShape(Rectangle())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: 480, height: 560)
     }
 }
 
