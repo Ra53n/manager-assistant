@@ -152,7 +152,7 @@ struct ChatDetailView: View {
                     if isLoading {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
-                            Text("DeepSeek печатает…")
+                            Text("\(vm.selectedChat?.settings.model ?? "Модель") печатает…")
                                 .foregroundColor(.secondary)
                                 .font(.callout)
                         }
