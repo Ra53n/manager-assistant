@@ -4,12 +4,16 @@ import MarkdownUI
 
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
+    @State private var showingKeys = false
 
     var body: some View {
         NavigationSplitView {
             sidebar
         } detail: {
             detail
+        }
+        .sheet(isPresented: $showingKeys) {
+            ProviderKeysView(vm: vm)
         }
     }
 
@@ -42,6 +46,12 @@ struct ContentView: View {
         .navigationTitle("Чаты")
         .frame(minWidth: 200)
         .toolbar {
+            ToolbarItem {
+                Button { showingKeys = true } label: {
+                    Label("API-ключи", systemImage: "key")
+                }
+                .help("API-ключи провайдеров")
+            }
             ToolbarItem {
                 Button(action: vm.newChat) {
                     Label("Новый чат", systemImage: "square.and.pencil")
@@ -247,13 +257,24 @@ struct ChatSettingsView: View {
 
             Form {
                 Section("Модель") {
-                    Picker("Модель DeepSeek", selection: $settings.model) {
-                        ForEach(vm.availableModels, id: \.self) { model in
-                            Text(model).tag(model)
+                    Picker("Модель", selection: Binding(
+                        get: { ModelOption(provider: settings.provider, model: settings.model) },
+                        set: { settings.provider = $0.provider; settings.model = $0.model }
+                    )) {
+                        ForEach(Provider.allCases, id: \.self) { prov in
+                            let opts = vm.availableModels.filter { $0.provider == prov }
+                            if !opts.isEmpty {
+                                Section(prov.displayName) {
+                                    ForEach(opts) { opt in
+                                        Text(opt.model).tag(opt)
+                                    }
+                                }
+                            }
                         }
-                        // Текущая модель должна быть выбираема, даже если её ещё нет в списке.
-                        if !vm.availableModels.contains(settings.model) {
-                            Text(settings.model).tag(settings.model)
+                        // Текущая модель выбираема, даже если её ещё нет в загруженном списке.
+                        let current = ModelOption(provider: settings.provider, model: settings.model)
+                        if !vm.availableModels.contains(current) {
+                            Text("\(current.provider.displayName) · \(current.model)").tag(current)
                         }
                     }
                     HStack(spacing: 8) {
@@ -270,6 +291,9 @@ struct ChatSettingsView: View {
                             Text(err).font(.caption).foregroundColor(.orange)
                         }
                     }
+                    Text("Список — из провайдеров с заданным ключом. Ключи: кнопка 🔑 слева вверху.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 Section("Формат ответа") {
@@ -400,6 +424,78 @@ struct SliderRow: View {
             Text(subtitle)
                 .font(.caption)
                 .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// Лист с API-ключами провайдеров (хранятся вне репозитория через KeyStore).
+struct ProviderKeysView: View {
+    @ObservedObject var vm: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var keys: [Provider: String] = [:]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("API-ключи провайдеров")
+                    .font(.headline)
+                Spacer()
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                ForEach(Provider.allCases, id: \.self) { provider in
+                    Section(provider.displayName) {
+                        TextField(
+                            "",
+                            text: Binding(
+                                get: { keys[provider] ?? "" },
+                                set: { keys[provider] = $0 }
+                            ),
+                            prompt: Text(provider.keyHint)
+                        )
+                        .font(.system(.body, design: .monospaced))
+                        Text(provider.keyHint)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Section {
+                    Label(
+                        "Ключи сохраняются локально в ~/.config/manager-assistant/ и не попадают в git. Пустое поле — удалить ключ.",
+                        systemImage: "lock.shield"
+                    )
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") {
+                    for provider in Provider.allCases {
+                        KeyStore.setKey(keys[provider] ?? "", for: provider)
+                    }
+                    vm.loadModels(force: true)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+        }
+        .frame(width: 480, height: 420)
+        .onAppear {
+            for provider in Provider.allCases {
+                keys[provider] = KeyStore.key(for: provider)
+            }
         }
     }
 }

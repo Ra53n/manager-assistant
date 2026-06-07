@@ -1,48 +1,16 @@
 import Foundation
 
-/// Конфигурация приложения.
+/// Базовая конфигурация приложения.
 ///
-/// Безопасность: API-ключ НЕ хранится в коде и НЕ попадает в git.
-/// Ключ читается во время выполнения из (в порядке приоритета):
-///   1. переменной окружения `DEEPSEEK_API_KEY` (удобно для `swift run` / схемы Xcode);
-///   2. файла `~/.config/manager-assistant/deepseek.key` (работает и для собранного .app).
-///
-/// Чтобы задать ключ, положи его в файл:
-///   mkdir -p ~/.config/manager-assistant
-///   echo "sk-..." > ~/.config/manager-assistant/deepseek.key
+/// Ключи провайдеров хранятся вне репозитория (см. `KeyStore`):
+///   ~/.config/manager-assistant/deepseek.key
+///   ~/.config/manager-assistant/openrouter.key
+/// Их можно задать прямо в приложении (кнопка «API-ключи») или переменными
+/// окружения DEEPSEEK_API_KEY / OPENROUTER_API_KEY.
 enum Config {
-    /// OpenAI-совместимый endpoint DeepSeek.
-    static let baseURL = "https://api.deepseek.com/chat/completions"
-
-    /// Endpoint со списком доступных моделей.
-    static let modelsURL = "https://api.deepseek.com/models"
-
-    /// Модель: "deepseek-chat" (V3) — обычный чат;
-    /// "deepseek-reasoner" (R1) — с рассуждениями.
+    /// Модель по умолчанию (DeepSeek).
     static let model = "deepseek-chat"
 
     /// Системный промпт, задающий поведение ассистента.
     static let systemPrompt = "Ты — полезный ассистент. Отвечай кратко и по делу."
-
-    /// Путь к локальному файлу с ключом (вне репозитория).
-    static let keyFileURL: URL = FileManager.default
-        .homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/manager-assistant/deepseek.key")
-
-    /// Ключ DeepSeek, прочитанный из окружения или локального файла.
-    static var deepSeekAPIKey: String {
-        if let env = ProcessInfo.processInfo.environment["DEEPSEEK_API_KEY"],
-           !env.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return env.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if let fileKey = try? String(contentsOf: keyFileURL, encoding: .utf8) {
-            return fileKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        return ""
-    }
-
-    /// Признак того, что ключ не найден.
-    static var isAPIKeyMissing: Bool {
-        deepSeekAPIKey.isEmpty
-    }
 }

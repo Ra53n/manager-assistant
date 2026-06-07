@@ -7,8 +7,10 @@ final class ChatViewModel: ObservableObject {
     @Published var selectedChatID: UUID?
     @Published var input: String = ""
 
-    /// Список моделей DeepSeek (подтягивается из /models; до загрузки — дефолтный).
-    @Published var availableModels: [String] = [Config.model, "deepseek-reasoner"]
+    /// Объединённый список моделей всех провайдеров с ключами (из их /models).
+    @Published var availableModels: [ModelOption] = [
+        ModelOption(provider: .deepseek, model: Config.model)
+    ]
     @Published var isLoadingModels = false
     @Published var modelsError: String?
     private var hasLoadedModels = false
@@ -56,20 +58,27 @@ final class ChatViewModel: ObservableObject {
         chats[idx].settings = newValue
     }
 
-    /// Загружает список моделей из DeepSeek. По умолчанию — один раз; force — принудительно.
+    /// Загружает модели из всех провайдеров, у кого задан ключ.
+    /// По умолчанию — один раз; force — принудительно (после смены ключей).
     func loadModels(force: Bool = false) {
         if isLoadingModels { return }
         if hasLoadedModels && !force { return }
         isLoadingModels = true
         modelsError = nil
         Task {
-            do {
-                let models = try await client.fetchModels()
-                if !models.isEmpty { availableModels = models }
-                hasLoadedModels = true
-            } catch {
-                modelsError = "Не удалось загрузить список моделей"
+            var combined: [ModelOption] = []
+            var failed: [String] = []
+            for provider in Provider.allCases where KeyStore.hasKey(for: provider) {
+                do {
+                    let ids = try await client.fetchModels(provider: provider)
+                    combined += ids.map { ModelOption(provider: provider, model: $0) }
+                } catch {
+                    failed.append(provider.displayName)
+                }
             }
+            if !combined.isEmpty { availableModels = combined }
+            modelsError = failed.isEmpty ? nil : "Не удалось загрузить: \(failed.joined(separator: ", "))"
+            hasLoadedModels = true
             isLoadingModels = false
         }
     }

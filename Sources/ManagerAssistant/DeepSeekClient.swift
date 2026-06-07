@@ -2,15 +2,15 @@ import Foundation
 
 /// Ошибки клиента с понятными для пользователя текстами.
 enum DeepSeekError: LocalizedError {
-    case missingAPIKey
+    case missingAPIKey(Provider)
     case invalidURL
     case badStatus(code: Int, message: String)
     case emptyResponse
 
     var errorDescription: String? {
         switch self {
-        case .missingAPIKey:
-            return "API-ключ не найден. Положи ключ в файл ~/.config/manager-assistant/deepseek.key (или задай переменную окружения DEEPSEEK_API_KEY)."
+        case .missingAPIKey(let provider):
+            return "Не задан API-ключ для \(provider.displayName). Открой «API-ключи» и вставь ключ."
         case .invalidURL:
             return "Некорректный URL запроса."
         case .badStatus(let code, let message):
@@ -21,18 +21,16 @@ enum DeepSeekError: LocalizedError {
     }
 }
 
-/// Клиент к DeepSeek (OpenAI-совместимый chat/completions).
+/// Клиент к OpenAI-совместимым провайдерам (DeepSeek, OpenRouter).
 struct DeepSeekClient {
 
     /// Отправляет всю историю переписки с заданными параметрами генерации
-    /// и возвращает текст ответа ассистента вместе с расходом токенов.
+    /// нужному провайдеру и возвращает текст ответа вместе с расходом токенов.
     func send(messages: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
-        guard !Config.isAPIKeyMissing else {
-            throw DeepSeekError.missingAPIKey
-        }
-        guard let url = URL(string: Config.baseURL) else {
-            throw DeepSeekError.invalidURL
-        }
+        let provider = settings.provider
+        let key = KeyStore.key(for: provider)
+        guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        guard let url = URL(string: provider.chatURL) else { throw DeepSeekError.invalidURL }
 
         // Собираем сообщения: системный промпт (из настроек чата) + вся история диалога.
         var payloadMessages: [ChatRequest.RequestMessage] = [
@@ -56,7 +54,11 @@ struct DeepSeekClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(Config.deepSeekAPIKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if provider == .openrouter {
+            // Необязательные заголовки OpenRouter для атрибуции.
+            request.setValue("Manager assistant", forHTTPHeaderField: "X-Title")
+        }
         request.httpBody = try JSONEncoder().encode(body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -66,7 +68,6 @@ struct DeepSeekClient {
         }
 
         guard (200...299).contains(http.statusCode) else {
-            // Пытаемся достать осмысленное сообщение об ошибке от API.
             let message = (try? JSONDecoder().decode(APIErrorResponse.self, from: data))?.error.message
                 ?? String(data: data, encoding: .utf8)
                 ?? "неизвестная ошибка"
@@ -85,14 +86,15 @@ struct DeepSeekClient {
         )
     }
 
-    /// Загружает список доступных моделей через GET /models.
-    func fetchModels() async throws -> [String] {
-        guard !Config.isAPIKeyMissing else { throw DeepSeekError.missingAPIKey }
-        guard let url = URL(string: Config.modelsURL) else { throw DeepSeekError.invalidURL }
+    /// Загружает список доступных моделей провайдера через его GET /models.
+    func fetchModels(provider: Provider) async throws -> [String] {
+        let key = KeyStore.key(for: provider)
+        guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        guard let url = URL(string: provider.modelsURL) else { throw DeepSeekError.invalidURL }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("Bearer \(Config.deepSeekAPIKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {

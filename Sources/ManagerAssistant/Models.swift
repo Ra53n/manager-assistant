@@ -18,7 +18,9 @@ struct ChatMessage: Identifiable {
 /// Включены только реально поддерживаемые API параметры.
 /// (top_k DeepSeek не принимает; frequency/presence_penalty — deprecated.)
 struct GenerationSettings: Equatable {
-    /// Выбранная модель DeepSeek (id из списка /models).
+    /// Провайдер выбранной модели.
+    var provider: Provider = .deepseek
+    /// Выбранная модель (id из списка /models этого провайдера).
     var model: String = Config.model
     /// Температура сэмплирования, 0…2. Выше — креативнее, ниже — детерминированнее.
     var temperature: Double = 1.0
@@ -120,12 +122,19 @@ struct SendResult {
     let totalTokens: Int
 }
 
-/// Ответ эндпоинта GET /models — список доступных моделей DeepSeek.
+/// Ответ эндпоинта GET /models — список доступных моделей провайдера.
 struct ModelsResponse: Decodable {
     let data: [Model]
     struct Model: Decodable {
         let id: String
     }
+}
+
+/// Модель в объединённом списке: провайдер + id модели.
+struct ModelOption: Identifiable, Hashable {
+    let provider: Provider
+    let model: String
+    var id: String { "\(provider.rawValue)|\(model)" }
 }
 
 /// Формат ошибки, который возвращает DeepSeek при не-2xx.
