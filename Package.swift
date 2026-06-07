@@ -6,9 +6,15 @@ let package = Package(
     platforms: [
         .macOS(.v13)
     ],
+    dependencies: [
+        .package(url: "https://github.com/gonzalezreal/swift-markdown-ui", from: "2.0.0")
+    ],
     targets: [
         .executableTarget(
             name: "ManagerAssistant",
+            dependencies: [
+                .product(name: "MarkdownUI", package: "swift-markdown-ui")
+            ],
             path: "Sources/ManagerAssistant",
             resources: [
                 .copy("Resources/AppIcon.icns")

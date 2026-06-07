@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import MarkdownUI
 
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
@@ -353,28 +355,69 @@ struct SliderRow: View {
     }
 }
 
-/// «Пузырь» одного сообщения: user — справа, assistant — слева.
+/// «Пузырь» одного сообщения: user — справа (обычный текст), assistant — слева (Markdown).
+/// При наведении показывается кнопка «Копировать».
 struct MessageBubble: View {
     let message: ChatMessage
+
+    @State private var hovering = false
+    @State private var copied = false
 
     private var isUser: Bool { message.role == .user }
 
     var body: some View {
-        HStack {
-            if isUser { Spacer(minLength: 40) }
-            Text(message.content)
-                .textSelection(.enabled)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(isUser ? Color.accentColor.opacity(0.9) : Color(nsColor: .windowBackgroundColor))
-                .foregroundColor(isUser ? .white : .primary)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.gray.opacity(isUser ? 0 : 0.25), lineWidth: 1)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-            if !isUser { Spacer(minLength: 40) }
+        VStack(alignment: isUser ? .trailing : .leading, spacing: 3) {
+            HStack(spacing: 0) {
+                if isUser { Spacer(minLength: 40) }
+                bubble
+                if !isUser { Spacer(minLength: 40) }
+            }
+            copyControl
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .onHover { hovering = $0 }
+    }
+
+    /// Содержимое пузыря: пользовательский текст — как есть, ответ агента — как Markdown.
+    private var bubble: some View {
+        Group {
+            if isUser {
+                Text(message.content)
+            } else {
+                Markdown(message.content)
+            }
+        }
+        .textSelection(.enabled)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isUser ? Color.accentColor.opacity(0.9) : Color(nsColor: .windowBackgroundColor))
+        .foregroundColor(isUser ? .white : .primary)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.gray.opacity(isUser ? 0 : 0.25), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    /// Кнопка копирования (появляется при наведении, на короткое время — подтверждение).
+    private var copyControl: some View {
+        Button(action: copy) {
+            Label(copied ? "Скопировано" : "Копировать",
+                  systemImage: copied ? "checkmark" : "doc.on.doc")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .opacity(hovering || copied ? 1 : 0)
+        .animation(.easeInOut(duration: 0.15), value: hovering)
+        .padding(.horizontal, 4)
+        .frame(height: 16)
+    }
+
+    private func copy() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message.content, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { copied = false }
     }
 }
