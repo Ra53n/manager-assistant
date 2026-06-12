@@ -167,6 +167,8 @@ struct ModelsResponse: Decodable {
     struct Model: Decodable {
         let id: String
         let pricing: Pricing?
+        /// Окно контекста модели (OpenRouter отдаёт, DeepSeek — нет).
+        let context_length: Int?
         struct Pricing: Decodable {
             let prompt: String?
             let completion: String?
@@ -174,11 +176,12 @@ struct ModelsResponse: Decodable {
     }
 }
 
-/// Сведения о модели, полученные из /models: id + цена за токен (если есть).
+/// Сведения о модели, полученные из /models: id + цена за токен + окно контекста.
 struct ModelInfo {
     let id: String
     let promptPrice: Double?
     let completionPrice: Double?
+    let contextLength: Int?
 }
 
 /// Модель в объединённом списке: провайдер + id модели.

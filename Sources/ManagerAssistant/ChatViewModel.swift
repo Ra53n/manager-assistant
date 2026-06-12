@@ -39,12 +39,24 @@ final class ChatViewModel: ObservableObject {
     /// Цены по моделям, ключ — "<provider>|<model>". Сидим прайсом DeepSeek сразу.
     private var pricing: [String: ModelPricing] = ChatViewModel.seedPricing()
 
+    /// Окна контекста моделей (OpenRouter — из /models, DeepSeek — из таблицы).
+    /// @Published, чтобы предупреждение об усечении появлялось после загрузки.
+    @Published private(set) var contextLimits: [String: Int] = ChatViewModel.seedContextLimits()
+
     private static func seedPricing() -> [String: ModelPricing] {
         var prices: [String: ModelPricing] = [:]
         for (model, price) in DeepSeekPricing.table {
             prices["\(Provider.deepseek.rawValue)|\(model)"] = price
         }
         return prices
+    }
+
+    private static func seedContextLimits() -> [String: Int] {
+        var limits: [String: Int] = [:]
+        for (model, limit) in DeepSeekPricing.contextLimits {
+            limits["\(Provider.deepseek.rawValue)|\(model)"] = limit
+        }
+        return limits
     }
 
     private let client = DeepSeekClient()
@@ -71,6 +83,10 @@ final class ChatViewModel: ObservableObject {
             .sink { chats in
                 DispatchQueue.global(qos: .utility).async { ChatStore.save(chats) }
             }
+
+        // Лимиты контекста и цены нужны сразу (для предупреждения об усечении),
+        // а не только при первом открытии настроек.
+        loadModels()
 
         // Страховка на выход из приложения — пишем без дебаунса.
         // willTerminate приходит на главном потоке, поэтому assumeIsolated корректен.
@@ -128,6 +144,7 @@ final class ChatViewModel: ObservableObject {
         Task {
             var combined: [ModelOption] = []
             var prices: [String: ModelPricing] = [:]
+            var limits: [String: Int] = Self.seedContextLimits()
             var failed: [String] = []
             for provider in Provider.allCases where KeyStore.hasKey(for: provider) {
                 do {
@@ -137,6 +154,9 @@ final class ChatViewModel: ObservableObject {
                         combined.append(option)
                         if let pp = info.promptPrice, let cp = info.completionPrice {
                             prices[option.id] = ModelPricing(promptPerToken: pp, completionPerToken: cp)
+                        }
+                        if let ctx = info.contextLength {
+                            limits[option.id] = ctx
                         }
                     }
                 } catch {
@@ -149,6 +169,7 @@ final class ChatViewModel: ObservableObject {
             }
             if !combined.isEmpty { availableModels = combined }
             pricing = prices
+            contextLimits = limits
             modelsError = failed.isEmpty ? nil : "Не удалось загрузить: \(failed.joined(separator: ", "))"
             hasLoadedModels = true
             isLoadingModels = false
@@ -222,6 +243,31 @@ final class ChatViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Видимость усечения контекста
+
+    /// Грубая оценка токенов текста без токенизатора: кириллица ~2.5 симв/токен,
+    /// латиница ~4; усреднённо берём 3 символа на токен.
+    static func estimateTokens(_ text: String) -> Int {
+        max(1, text.count / 3)
+    }
+
+    /// Оценка токенов всего запроса: системный промпт + история + накладные.
+    static func estimateHistoryTokens(_ chat: Chat) -> Int {
+        let system = estimateTokens(PromptBuilder.systemPrompt(for: chat.settings))
+        let messages = chat.messages.reduce(0) { $0 + estimateTokens($1.content) + 4 }
+        return system + messages
+    }
+
+    /// Текст предупреждения, если история чата рискует не влезть в окно модели.
+    /// nil — всё помещается (или окно модели неизвестно).
+    func truncationWarning(for chat: Chat) -> String? {
+        let key = "\(chat.settings.provider.rawValue)|\(chat.settings.model)"
+        guard let limit = contextLimits[key] else { return nil }
+        let estimated = Self.estimateHistoryTokens(chat)
+        guard estimated + chat.settings.maxTokens > limit else { return nil }
+        return "История ≈\(estimated.formatted()) ток. + лимит ответа \(chat.settings.maxTokens.formatted()) превышают окно модели (\(limit.formatted()) ток.) — провайдер может молча вырезать середину диалога. Уменьши лимит ответа, начни новый чат или выбери модель с большим окном."
     }
 
     // MARK: - Хелперы

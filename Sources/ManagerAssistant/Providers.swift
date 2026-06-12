@@ -88,6 +88,15 @@ enum DeepSeekPricing {
         "deepseek-chat":     perToken(0.14, 0.28),
         "deepseek-reasoner": perToken(1.74, 3.48),
     ]
+
+    /// Окна контекста DeepSeek (их /models этого не отдаёт).
+    /// По докам V4: 1M контекст у обеих моделей; алиасы указывают на V4-Flash.
+    static let contextLimits: [String: Int] = [
+        "deepseek-v4-flash": 1_000_000,
+        "deepseek-v4-pro":   1_000_000,
+        "deepseek-chat":     1_000_000,
+        "deepseek-reasoner": 1_000_000,
+    ]
 }
 
 /// Хранилище ключей в ~/.config/manager-assistant/<provider>.key (вне репозитория).

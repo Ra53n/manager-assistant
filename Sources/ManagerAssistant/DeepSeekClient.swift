@@ -123,7 +123,8 @@ struct DeepSeekClient {
             ModelInfo(
                 id: model.id,
                 promptPrice: model.pricing?.prompt.flatMap(Double.init),
-                completionPrice: model.pricing?.completion.flatMap(Double.init)
+                completionPrice: model.pricing?.completion.flatMap(Double.init),
+                contextLength: model.context_length
             )
         }
     }

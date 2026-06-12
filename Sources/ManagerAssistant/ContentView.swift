@@ -129,6 +129,7 @@ struct ChatDetailView: View {
             messagesList
             Divider()
             errorBar
+            truncationBar
             inputBar
         }
         .frame(minWidth: 480, minHeight: 600)
@@ -225,6 +226,26 @@ struct ChatDetailView: View {
             .padding(.horizontal)
             .padding(.vertical, 8)
             .background(Color.orange.opacity(0.12))
+        }
+    }
+
+    // MARK: - Предупреждение об усечении контекста
+
+    /// Жёлтый бар: история чата рискует не влезть в окно выбранной модели —
+    /// провайдер (например, OpenRouter middle-out) молча вырежет середину.
+    @ViewBuilder
+    private var truncationBar: some View {
+        if let chat = vm.selectedChat, let warning = vm.truncationWarning(for: chat) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "scissors")
+                    .foregroundColor(.yellow)
+                Text(warning)
+                    .font(.callout)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(Color.yellow.opacity(0.12))
         }
     }
 
