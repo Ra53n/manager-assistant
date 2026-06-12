@@ -26,8 +26,17 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
 
 ## Ключевые решения (почему так)
 
-- **API stateless** — «память» модели = повторная отправка всей истории чата в
+- **API stateless** — «память» модели = повторная отправка истории чата в
   каждом запросе. Из-за этого promptTokens растут с каждым сообщением.
+- **Компакция истории** — в запрос идёт саммари старой части (в системном
+  промпте) + хвост messages[summarizedUpTo...]. Каждые historyWindow сообщений
+  за окном ChatViewModel.maybeCompact фоном сворачивает их в summary через
+  client.summarize (той же моделью чата, t=0.3). Поля Chat.summary /
+  summarizedUpTo персистятся; isSummarizing — runtime.
+- **Миграция chats.json** — у Chat и GenerationSettings РУЧНЫЕ init(from:)
+  в extension с decodeIfPresent+дефолтами. Новые поля добавлять ТОЛЬКО так,
+  иначе старый файл перестанет декодироваться (уйдёт в .corrupt.json).
+  Ловушка: запуск СТАРОГО бинарника перезапишет файл без новых полей.
 - **Мультипровайдер** — добавить провайдера = новый case в `Provider` +
   endpoints/keyFileName/envVar; UI подхватит сам через `allCases`.
 - **Ключи API — никогда в коде/git.** Лежат в `~/.config/manager-assistant/<p>.key`

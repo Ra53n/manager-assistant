@@ -212,14 +212,22 @@ final class ChatViewModel: ObservableObject {
         chats[idx].isLoading = true
         input = ""
 
-        let history = chats[idx].messages
+        // Компакция: в запрос идёт только хвост после summarizedUpTo,
+        // сжатая часть представлена саммари в системном промпте.
+        let upTo = min(chats[idx].summarizedUpTo, chats[idx].messages.count)
+        let history = Array(chats[idx].messages[upTo...])
+        let summary = chats[idx].summary
         let settings = chats[idx].settings
         let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
 
         Task {
             let start = Date()
             do {
-                let result = try await client.send(messages: history, settings: settings)
+                let result = try await client.send(
+                    messages: history,
+                    settings: settings,
+                    summary: summary.isEmpty ? nil : summary
+                )
                 let duration = Date().timeIntervalSince(start)
                 let metrics = MessageMetrics(
                     promptTokens: result.promptTokens,
@@ -235,11 +243,56 @@ final class ChatViewModel: ObservableObject {
                     chats[i].completionTokens += result.completionTokens
                     chats[i].totalTokens += result.totalTokens
                     chats[i].isLoading = false
+                    maybeCompact(chatID: chatID)
                 }
             } catch {
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
                     chats[i].errorText = error.localizedDescription
                     chats[i].isLoading = false
+                }
+            }
+        }
+    }
+
+    // MARK: - Компакция истории (саммари старых сообщений)
+
+    /// Если за пределами окна historyWindow накопилось ещё ≥ historyWindow
+    /// несжатых сообщений — сворачивает их в саммари фоновым запросом.
+    /// Триггерится после каждого ответа ассистента. При ошибке просто
+    /// попробует снова после следующего ответа.
+    private func maybeCompact(chatID: UUID) {
+        guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
+        let chat = chats[i]
+        let s = chat.settings
+        guard s.compactionEnabled, !chat.isSummarizing, !chat.isLoading else { return }
+
+        let window = max(2, s.historyWindow)
+        let overflow = chat.messages.count - chat.summarizedUpTo - window
+        guard overflow >= window else { return } // копим блоками по N, не дёргаем API на каждое сообщение
+
+        let block = Array(chat.messages[chat.summarizedUpTo ..< (chat.summarizedUpTo + overflow)])
+        let previousSummary = chat.summary
+        chats[i].isSummarizing = true
+
+        Task {
+            do {
+                let result = try await client.summarize(
+                    previousSummary: previousSummary,
+                    block: block,
+                    settings: s
+                )
+                if let j = chats.firstIndex(where: { $0.id == chatID }) {
+                    chats[j].summary = result.text
+                    chats[j].summarizedUpTo += block.count
+                    // Суммаризация — тоже расход токенов этого чата.
+                    chats[j].promptTokens += result.promptTokens
+                    chats[j].completionTokens += result.completionTokens
+                    chats[j].totalTokens += result.totalTokens
+                    chats[j].isSummarizing = false
+                }
+            } catch {
+                if let j = chats.firstIndex(where: { $0.id == chatID }) {
+                    chats[j].isSummarizing = false
                 }
             }
         }
@@ -253,10 +306,15 @@ final class ChatViewModel: ObservableObject {
         max(1, text.count / 3)
     }
 
-    /// Оценка токенов всего запроса: системный промпт + история + накладные.
+    /// Оценка токенов всего запроса: системный промпт (с саммари) + хвост
+    /// истории после компакции + накладные.
     static func estimateHistoryTokens(_ chat: Chat) -> Int {
-        let system = estimateTokens(PromptBuilder.systemPrompt(for: chat.settings))
-        let messages = chat.messages.reduce(0) { $0 + estimateTokens($1.content) + 4 }
+        let system = estimateTokens(PromptBuilder.systemPrompt(
+            for: chat.settings,
+            summary: chat.summary.isEmpty ? nil : chat.summary
+        ))
+        let upTo = min(chat.summarizedUpTo, chat.messages.count)
+        let messages = chat.messages[upTo...].reduce(0) { $0 + estimateTokens($1.content) + 4 }
         return system + messages
     }
 

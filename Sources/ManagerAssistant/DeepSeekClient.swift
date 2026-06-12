@@ -40,31 +40,77 @@ enum DeepSeekError: LocalizedError {
 /// Клиент к OpenAI-совместимым провайдерам (DeepSeek, OpenRouter).
 struct DeepSeekClient {
 
-    /// Отправляет всю историю переписки с заданными параметрами генерации
-    /// нужному провайдеру и возвращает текст ответа вместе с расходом токенов.
-    func send(messages: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
-        let provider = settings.provider
-        let key = KeyStore.key(for: provider)
-        guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
-        guard let url = URL(string: provider.chatURL) else { throw DeepSeekError.invalidURL }
-
-        // Собираем сообщения: системный промпт (из настроек чата) + вся история диалога.
+    /// Отправляет историю переписки (хвост после компакции) с заданными
+    /// параметрами генерации; summary сжатой части истории подставляется
+    /// в системный промпт. Возвращает текст ответа + расход токенов.
+    func send(messages: [ChatMessage], settings: GenerationSettings, summary: String? = nil) async throws -> SendResult {
         var payloadMessages: [ChatRequest.RequestMessage] = [
-            .init(role: ChatRole.system.rawValue, content: PromptBuilder.systemPrompt(for: settings))
+            .init(role: ChatRole.system.rawValue, content: PromptBuilder.systemPrompt(for: settings, summary: summary))
         ]
         payloadMessages.append(contentsOf: messages.map {
             .init(role: $0.role.rawValue, content: $0.content)
         })
+        return try await post(
+            payloadMessages: payloadMessages,
+            settings: settings,
+            temperature: settings.temperature,
+            maxTokens: settings.maxTokens,
+            stop: settings.stop
+        )
+    }
+
+    /// Сворачивает блок старых сообщений в саммари (обновляя предыдущее).
+    /// Используется компакцией истории (ChatViewModel.maybeCompact).
+    func summarize(previousSummary: String, block: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
+        let system = """
+        Ты сжимаешь историю диалога пользователя с ассистентом. Составь компактное \
+        саммари (до ~200 слов): сохрани все факты, имена, числа, решения и \
+        договорённости; опусти вежливость и повторы. Верни ТОЛЬКО текст саммари.
+        """
+        var text = ""
+        if !previousSummary.isEmpty {
+            text += "Текущее саммари (обнови его с учётом новых сообщений):\n\(previousSummary)\n\n"
+        }
+        text += "Сообщения для сжатия:\n"
+        for m in block {
+            text += "[\(m.role == .user ? "Пользователь" : "Ассистент")]: \(m.content)\n"
+        }
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: system),
+            .init(role: ChatRole.user.rawValue, content: text),
+        ]
+        // Низкая температура — саммари должно быть фактологичным.
+        return try await post(
+            payloadMessages: payloadMessages,
+            settings: settings,
+            temperature: 0.3,
+            maxTokens: 1024,
+            stop: []
+        )
+    }
+
+    /// Общий POST chat/completions для send() и summarize().
+    private func post(
+        payloadMessages: [ChatRequest.RequestMessage],
+        settings: GenerationSettings,
+        temperature: Double,
+        maxTokens: Int,
+        stop: [String]
+    ) async throws -> SendResult {
+        let provider = settings.provider
+        let key = KeyStore.key(for: provider)
+        guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        guard let url = URL(string: provider.chatURL) else { throw DeepSeekError.invalidURL }
 
         let model = settings.model.isEmpty ? Config.model : settings.model
         let body = ChatRequest(
             model: model,
             messages: payloadMessages,
             stream: false,
-            temperature: settings.temperature,
+            temperature: temperature,
             top_p: settings.topP,
-            max_tokens: settings.maxTokens,
-            stop: settings.stop.isEmpty ? nil : settings.stop
+            max_tokens: maxTokens,
+            stop: stop.isEmpty ? nil : stop
         )
 
         var request = URLRequest(url: url)

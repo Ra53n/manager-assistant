@@ -172,6 +172,7 @@ struct ChatDetailView: View {
                             .frame(maxWidth: .infinity, alignment: .center)
                             .padding(.top, 40)
                     }
+                    compactionBanner
                     ForEach(messages) { message in
                         MessageBubble(message: message)
                             .id(message.id)
@@ -196,6 +197,32 @@ struct ChatDetailView: View {
             }
             .onChange(of: vm.selectedChatID) { _ in
                 scrollToBottom(proxy)
+            }
+        }
+    }
+
+    /// Плашка вверху ленты: сколько старых сообщений свёрнуто в саммари.
+    /// Наведение показывает само саммари (полезно для отладки и доверия).
+    @ViewBuilder
+    private var compactionBanner: some View {
+        if let chat = vm.selectedChat {
+            if chat.isSummarizing {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Сжимаю старые сообщения в саммари…")
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+            } else if chat.summarizedUpTo > 0 {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    Text("\(chat.summarizedUpTo) сообщ. выше сжаты в саммари — модель видит их кратко")
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .help(chat.summary)
             }
         }
     }
@@ -391,6 +418,28 @@ struct ChatSettingsView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
+                }
+
+                Section("История (сжатие контекста)") {
+                    Toggle("Сжимать старые сообщения в саммари", isOn: $settings.compactionEnabled)
+                    if settings.compactionEnabled {
+                        Stepper(
+                            value: $settings.historyWindow,
+                            in: GenerationSettings.historyWindowRange,
+                            step: 2
+                        ) {
+                            HStack {
+                                Text("Без сжатия — последние")
+                                Spacer()
+                                Text("\(settings.historyWindow) сообщ.")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                    }
+                    Text("В запрос идёт саммари старой части диалога + последние N сообщений как есть. Сжатие выполняется фоном каждые N сообщений. Экономит токены в длинных чатах.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
 
                 Section("Стоп-последовательности") {

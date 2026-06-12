@@ -67,6 +67,12 @@ struct GenerationSettings: Equatable, Codable {
     /// Пусто — без специальных требований к формату.
     var responseFormat: String = ""
 
+    /// Сжатие истории (компакция): в запрос идут саммари старых сообщений +
+    /// последние historyWindow сообщений как есть. Каждые historyWindow
+    /// сообщений за пределами окна сворачиваются в саммари (ChatViewModel.maybeCompact).
+    var compactionEnabled: Bool = true
+    var historyWindow: Int = 10
+
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -74,12 +80,41 @@ struct GenerationSettings: Equatable, Codable {
     static let topPRange = 0.0...1.0
     static let maxTokensRange = 256...8192
     static let maxStopCount = 16
+    static let historyWindowRange = 4...50
+
+    enum CodingKeys: String, CodingKey {
+        case provider, model, temperature, topP, maxTokens, stop, responseFormat
+        case compactionEnabled, historyWindow
+    }
 }
 
-/// Собирает системный промпт из настроек чата: базовая роль + формат ответа.
+/// Миграционно-устойчивое декодирование: поля, которых нет в старом chats.json,
+/// получают дефолты вместо ошибки decode (иначе любое новое поле ломало бы файл).
+extension GenerationSettings {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = GenerationSettings()
+        provider = try c.decodeIfPresent(Provider.self, forKey: .provider) ?? d.provider
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? d.model
+        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? d.temperature
+        topP = try c.decodeIfPresent(Double.self, forKey: .topP) ?? d.topP
+        maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens) ?? d.maxTokens
+        stop = try c.decodeIfPresent([String].self, forKey: .stop) ?? d.stop
+        responseFormat = try c.decodeIfPresent(String.self, forKey: .responseFormat) ?? d.responseFormat
+        compactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .compactionEnabled) ?? d.compactionEnabled
+        historyWindow = try c.decodeIfPresent(Int.self, forKey: .historyWindow) ?? d.historyWindow
+    }
+}
+
+/// Собирает системный промпт из настроек чата: базовая роль + саммари
+/// сжатой части истории (если есть) + формат ответа.
 enum PromptBuilder {
-    static func systemPrompt(for s: GenerationSettings) -> String {
+    static func systemPrompt(for s: GenerationSettings, summary: String? = nil) -> String {
         var parts: [String] = [Config.systemPrompt]
+
+        if let summary, !summary.isEmpty {
+            parts.append("Краткое содержание более ранней части этого диалога (используй как контекст, не упоминай его существование):\n\(summary)")
+        }
 
         let format = s.responseFormat.trimmingCharacters(in: .whitespacesAndNewlines)
         if !format.isEmpty {
@@ -105,10 +140,34 @@ struct Chat: Identifiable, Codable {
     var completionTokens: Int = 0
     var totalTokens: Int = 0
 
+    /// Компакция: messages[0..<summarizedUpTo] свёрнуты в summary и в запрос
+    /// не отправляются (в UI остаются). summary подставляется в системный промпт.
+    var summary: String = ""
+    var summarizedUpTo: Int = 0
+    /// Идёт фоновая суммаризация (runtime, не сохраняется).
+    var isSummarizing: Bool = false
+
     /// На диск уходят только данные диалога; runtime-состояние (isLoading,
-    /// errorText) не сохраняется — после перезапуска оно должно быть чистым.
+    /// errorText, isSummarizing) не сохраняется.
     enum CodingKeys: String, CodingKey {
         case id, title, messages, settings, promptTokens, completionTokens, totalTokens
+        case summary, summarizedUpTo
+    }
+}
+
+/// Миграционно-устойчивое декодирование (см. комментарий у GenerationSettings).
+extension Chat {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? "Новый чат"
+        messages = try c.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
+        settings = try c.decodeIfPresent(GenerationSettings.self, forKey: .settings) ?? GenerationSettings()
+        promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens) ?? 0
+        completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
+        totalTokens = try c.decodeIfPresent(Int.self, forKey: .totalTokens) ?? 0
+        summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
+        summarizedUpTo = try c.decodeIfPresent(Int.self, forKey: .summarizedUpTo) ?? 0
     }
 }
 
