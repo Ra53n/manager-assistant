@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 @MainActor
 final class ChatViewModel: ObservableObject {
@@ -27,13 +28,41 @@ final class ChatViewModel: ObservableObject {
     }
 
     private let client = DeepSeekClient()
+    private var saveCancellable: AnyCancellable?
 
     static let defaultTitle = "Новый чат"
 
     init() {
-        let first = Chat(title: Self.defaultTitle)
-        chats = [first]
-        selectedChatID = first.id
+        // История с диска; при первом запуске — один пустой чат.
+        let loaded = ChatStore.load()
+        if loaded.isEmpty {
+            let first = Chat(title: Self.defaultTitle)
+            chats = [first]
+            selectedChatID = first.id
+        } else {
+            chats = loaded
+            selectedChatID = loaded.first?.id
+        }
+
+        // Автосохранение при любом изменении чатов. Дебаунс гасит шквал
+        // обновлений (например, перетаскивание слайдеров в настройках).
+        saveCancellable = $chats
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .sink { chats in
+                DispatchQueue.global(qos: .utility).async { ChatStore.save(chats) }
+            }
+
+        // Страховка на выход из приложения — пишем без дебаунса.
+        // willTerminate приходит на главном потоке, поэтому assumeIsolated корректен.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let chats = self?.chats else { return }
+                ChatStore.save(chats)
+            }
+        }
     }
 
     // MARK: - Доступ к выбранному чату

@@ -8,7 +8,7 @@ enum ChatRole: String, Codable {
 }
 
 /// Метрики ответа модели (для сравнения скорости и стоимости).
-struct MessageMetrics: Equatable {
+struct MessageMetrics: Equatable, Codable {
     let promptTokens: Int
     let completionTokens: Int
     let totalTokens: Int
@@ -22,9 +22,9 @@ struct MessageMetrics: Equatable {
     }
 }
 
-/// Одно сообщение в чате (для UI и для отправки в API).
-struct ChatMessage: Identifiable {
-    let id = UUID()
+/// Одно сообщение в чате (для UI, отправки в API и сохранения на диск).
+struct ChatMessage: Identifiable, Codable {
+    var id = UUID()
     let role: ChatRole
     let content: String
     /// Метрики ответа (только у сообщений ассистента).
@@ -34,7 +34,7 @@ struct ChatMessage: Identifiable {
 /// Параметры генерации DeepSeek, настраиваемые на каждый чат.
 /// Включены только реально поддерживаемые API параметры.
 /// (top_k DeepSeek не принимает; frequency/presence_penalty — deprecated.)
-struct GenerationSettings: Equatable {
+struct GenerationSettings: Equatable, Codable {
     /// Провайдер выбранной модели.
     var provider: Provider = .deepseek
     /// Выбранная модель (id из списка /models этого провайдера).
@@ -77,8 +77,8 @@ enum PromptBuilder {
 
 /// Отдельный чат со своим контекстом (историей), тайтлом, состоянием и настройками.
 /// У каждого чата своя история — удаление чата полностью очищает его контекст.
-struct Chat: Identifiable {
-    let id = UUID()
+struct Chat: Identifiable, Codable {
+    var id = UUID()
     var title: String
     var messages: [ChatMessage] = []
     var isLoading: Bool = false
@@ -89,6 +89,12 @@ struct Chat: Identifiable {
     var promptTokens: Int = 0
     var completionTokens: Int = 0
     var totalTokens: Int = 0
+
+    /// На диск уходят только данные диалога; runtime-состояние (isLoading,
+    /// errorText) не сохраняется — после перезапуска оно должно быть чистым.
+    enum CodingKeys: String, CodingKey {
+        case id, title, messages, settings, promptTokens, completionTokens, totalTokens
+    }
 }
 
 // MARK: - DTO запроса (OpenAI-совместимый формат)
