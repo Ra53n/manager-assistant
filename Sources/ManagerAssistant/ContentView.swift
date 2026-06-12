@@ -1,3 +1,29 @@
+// ContentView.swift — весь UI приложения (SwiftUI).
+//
+// Структура вьюх в этом файле:
+//   ContentView            — NavigationSplitView: сайдбар чатов + детальная область;
+//                             листы: ProviderKeysView (🔑 в сайдбаре)
+//   ChatDetailView          — один чат: сообщения, ошибка, поле ввода;
+//                             тулбар: счётчик токенов чата + ⚙︎ настройки;
+//                             листы: ChatSettingsView → ModelPickerView
+//   ChatSettingsView         — параметры генерации текущего чата (модель,
+//                             формат ответа, температура, top_p, max_tokens,
+//                             стоп-последовательности; \n в стопах = перенос)
+//   ModelPickerView          — выбор модели с поиском, группировка по провайдеру
+//   ProviderKeysView         — поля API-ключей провайдеров (пишет в KeyStore)
+//   MessageBubble            — пузырь сообщения: user = простой текст справа,
+//                             assistant = Markdown слева; под ответом — строка
+//                             метрик (время · ↑↓токены · $); копирование по
+//                             наведению (в буфер уходит исходный Markdown)
+//   SliderRow                — переиспользуемая строка «заголовок+слайдер»
+//
+// UI-ловушки, на которые уже наступали (не повторять):
+//  - .roundedBorder у TextField на macOS делает поле однострочным — для
+//    многострочного ввода нужен .plain + axis: .vertical + lineLimit(1...5);
+//  - длинный текст в title TextField внутри Form(.grouped) переносится и
+//    «едет» — подсказки передавать через prompt:, не через title;
+//  - Label в .toolbar рендерится без текста — для текста использовать HStack.
+
 import SwiftUI
 import AppKit
 import MarkdownUI

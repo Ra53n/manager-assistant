@@ -1,3 +1,15 @@
+// App.swift — точка входа приложения.
+//
+// Архитектура приложения (поток данных):
+//   ContentView (UI) → ChatViewModel (состояние) → DeepSeekClient (HTTP)
+//        ↑                    ↓
+//   MarkdownUI-рендер    ChatStore (персистентность на диск)
+//
+// Особенность запуска: приложение распространяется и как Swift Package
+// (`swift run` — «голый» бинарник без .app-бандла), и как .app (run.sh /
+// install.sh). У голого бинарника macOS не активирует окно и не показывает
+// иконку в Dock — это чинит AppDelegate ниже.
+
 import SwiftUI
 import AppKit
 

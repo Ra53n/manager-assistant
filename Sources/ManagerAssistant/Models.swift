@@ -1,3 +1,18 @@
+// Models.swift — доменная модель и DTO для API.
+//
+// Здесь живут:
+//  - доменные типы: Chat (один чат со своей историей/настройками/токенами),
+//    ChatMessage, GenerationSettings, MessageMetrics. Все Codable — они
+//    сериализуются на диск через ChatStore (см. Chat.CodingKeys: runtime-поля
+//    isLoading/errorText сознательно НЕ сохраняются);
+//  - DTO запроса/ответа OpenAI-совместимого chat/completions (ChatRequest,
+//    ChatResponse, APIErrorResponse) и списка моделей (ModelsResponse);
+//  - PromptBuilder — собирает системный промпт из настроек чата.
+//
+// Важно: «память» модели реализована повторной отправкой ВСЕЙ истории чата
+// в каждом запросе (API stateless) — поэтому promptTokens растут с каждым
+// сообщением. Подробности отправки — в DeepSeekClient.swift.
+
 import Foundation
 
 /// Роль сообщения в диалоге.

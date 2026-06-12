@@ -1,3 +1,19 @@
+// DeepSeekClient.swift — HTTP-клиент к OpenAI-совместимым API.
+//
+// Несмотря на имя, клиент обслуживает ВСЕХ провайдеров (DeepSeek, OpenRouter):
+// endpoint и ключ берутся из settings.provider (см. Providers.swift).
+//
+// send(): собирает payload = системный промпт (PromptBuilder) + вся история
+// чата, POST на chat/completions без стриминга, возвращает SendResult
+// (текст + usage-токены). Ошибки локализованы для показа пользователю.
+//
+// fetchModels(): GET /models провайдера → [ModelInfo] (id + цены за токен,
+// если провайдер их отдаёт — OpenRouter отдаёт, DeepSeek нет).
+//
+// Параметры генерации: temperature, top_p, max_tokens, stop. top_k и
+// frequency/presence_penalty сознательно НЕ отправляются — DeepSeek их
+// не поддерживает/игнорирует.
+
 import Foundation
 
 /// Ошибки клиента с понятными для пользователя текстами.
