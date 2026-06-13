@@ -322,6 +322,8 @@ struct ChatDetailView: View {
 struct ChatSettingsView: View {
     @ObservedObject var vm: ChatViewModel
     @Binding var settings: GenerationSettings
+    /// В режиме сравнения модель выбирается в шапке колонки — секцию прячем.
+    var showModelSection: Bool = true
     @Environment(\.dismiss) private var dismiss
 
     /// Стоп-последовательности редактируем как строку «через запятую».
@@ -344,6 +346,7 @@ struct ChatSettingsView: View {
             Divider()
 
             Form {
+                if showModelSection {
                 Section("Модель") {
                     Button {
                         showingModelPicker = true
@@ -380,6 +383,7 @@ struct ChatSettingsView: View {
                     Text("Нажми на модель, чтобы выбрать с поиском. Список — из провайдеров с ключом (🔑 слева вверху).")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                }
                 }
 
                 Section("Формат ответа") {
