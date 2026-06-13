@@ -187,8 +187,12 @@ struct ChatDetailView: View {
                     }
                     compactionBanner
                     ForEach(messages) { message in
-                        MessageBubble(message: message)
-                            .id(message.id)
+                        MessageBubble(message: message, onBranch: {
+                            if let chatID = vm.selectedChatID {
+                                vm.branch(fromChatID: chatID, atMessageID: message.id)
+                            }
+                        })
+                        .id(message.id)
                     }
                     if isLoading {
                         HStack(spacing: 8) {
@@ -218,33 +222,48 @@ struct ChatDetailView: View {
     /// Наведение показывает само саммари (полезно для отладки и доверия).
     @ViewBuilder
     private var compactionBanner: some View {
-        if let chat = vm.selectedChat {
-            if chat.isSummarizing {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text("Сжимаю старые сообщения в саммари…")
+        Group {
+            if let chat = vm.selectedChat {
+                let strat = chat.settings.contextStrategy
+                let overhead = chat.summaryTokens > 0
+                    ? "на стратегию ушло \(chat.summaryTokens.formatted()) ток." +
+                      (chat.summaryCost > 0 ? " · \(MessageBubble.formatCost(chat.summaryCost))" : "")
+                    : ""
+
+                if chat.isSummarizing {
+                    bannerLine("Сжимаю старые сообщения в саммари…", system: nil, busy: true, sub: "", help: "")
+                } else if chat.isUpdatingFacts {
+                    bannerLine("Обновляю блок фактов…", system: nil, busy: true, sub: "", help: "")
+                } else if strat == .summary, chat.summarizedUpTo > 0 {
+                    bannerLine("\(chat.summarizedUpTo) сообщ. выше сжаты в саммари — модель видит их кратко",
+                               system: "arrow.down.right.and.arrow.up.left", busy: false, sub: overhead, help: chat.summary)
+                } else if strat == .stickyFacts, !chat.facts.isEmpty {
+                    bannerLine("Память фактов активна — наведи, чтобы посмотреть",
+                               system: "key", busy: false, sub: overhead, help: chat.facts)
+                } else if strat == .slidingWindow, chat.messages.count > chat.settings.historyWindow {
+                    bannerLine("Скользящее окно: модель видит только последние \(chat.settings.historyWindow) сообщ.",
+                               system: "rectangle.lefthalf.inset.filled", busy: false, sub: "", help: "")
                 }
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(maxWidth: .infinity, alignment: .center)
-            } else if chat.summarizedUpTo > 0 {
-                VStack(spacing: 1) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.down.right.and.arrow.up.left")
-                        Text("\(chat.summarizedUpTo) сообщ. выше сжаты в саммари — модель видит их кратко")
-                    }
-                    if chat.summaryTokens > 0 {
-                        Text("на саммаризацию ушло \(chat.summaryTokens.formatted()) ток." +
-                             (chat.summaryCost > 0 ? " · \(MessageBubble.formatCost(chat.summaryCost))" : ""))
-                            .font(.caption2)
-                    }
-                }
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .help(chat.summary)
             }
         }
+    }
+
+    @ViewBuilder
+    private func bannerLine(_ text: String, system: String?, busy: Bool, sub: String, help: String) -> some View {
+        VStack(spacing: 1) {
+            HStack(spacing: 6) {
+                if busy { ProgressView().controlSize(.mini) }
+                if let system { Image(systemName: system) }
+                Text(text)
+            }
+            if !sub.isEmpty {
+                Text(sub).font(.caption2)
+            }
+        }
+        .font(.caption)
+        .foregroundColor(.secondary)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .help(help)
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -444,16 +463,20 @@ struct ChatSettingsView: View {
                     }
                 }
 
-                Section("История (сжатие контекста)") {
-                    Toggle("Сжимать старые сообщения в саммари", isOn: $settings.compactionEnabled)
-                    if settings.compactionEnabled {
+                Section("Управление контекстом") {
+                    Picker("Стратегия", selection: $settings.contextStrategy) {
+                        ForEach(ContextStrategy.allCases) { strat in
+                            Text(strat.label).tag(strat)
+                        }
+                    }
+                    if settings.contextStrategy.usesWindow {
                         Stepper(
                             value: $settings.historyWindow,
                             in: GenerationSettings.historyWindowRange,
                             step: 2
                         ) {
                             HStack {
-                                Text("Без сжатия — последние")
+                                Text("Окно N — последние")
                                 Spacer()
                                 Text("\(settings.historyWindow) сообщ.")
                                     .foregroundColor(.secondary)
@@ -461,7 +484,7 @@ struct ChatSettingsView: View {
                             }
                         }
                     }
-                    Text("В запрос идёт саммари старой части диалога + последние N сообщений как есть. Сжатие выполняется фоном каждые N сообщений. Экономит токены в длинных чатах.")
+                    Text(settings.contextStrategy.hint)
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -718,6 +741,8 @@ struct ProviderKeysView: View {
 /// При наведении показывается кнопка «Копировать».
 struct MessageBubble: View {
     let message: ChatMessage
+    /// Действие «создать ветку диалога с этого места» (если доступно).
+    var onBranch: (() -> Void)? = nil
 
     @State private var hovering = false
     @State private var copied = false
@@ -764,15 +789,24 @@ struct MessageBubble: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
-    /// Кнопка копирования (появляется при наведении, на короткое время — подтверждение).
+    /// Кнопки под пузырём (появляются при наведении): копировать + ветка.
     private var copyControl: some View {
-        Button(action: copy) {
-            Label(copied ? "Скопировано" : "Копировать",
-                  systemImage: copied ? "checkmark" : "doc.on.doc")
-                .font(.caption2)
-                .foregroundColor(.secondary)
+        HStack(spacing: 10) {
+            Button(action: copy) {
+                Label(copied ? "Скопировано" : "Копировать",
+                      systemImage: copied ? "checkmark" : "doc.on.doc")
+            }
+            .buttonStyle(.borderless)
+            if let onBranch {
+                Button(action: onBranch) {
+                    Label("Ветка отсюда", systemImage: "arrow.triangle.branch")
+                }
+                .buttonStyle(.borderless)
+                .help("Создать новый чат-ветку с историей до этого сообщения")
+            }
         }
-        .buttonStyle(.borderless)
+        .font(.caption2)
+        .foregroundColor(.secondary)
         .opacity(hovering || copied ? 1 : 0)
         .animation(.easeInOut(duration: 0.15), value: hovering)
         .padding(.horizontal, 4)

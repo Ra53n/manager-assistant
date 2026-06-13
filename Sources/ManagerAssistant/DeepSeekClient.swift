@@ -43,9 +43,9 @@ struct DeepSeekClient {
     /// Отправляет историю переписки (хвост после компакции) с заданными
     /// параметрами генерации; summary сжатой части истории подставляется
     /// в системный промпт. Возвращает текст ответа + расход токенов.
-    func send(messages: [ChatMessage], settings: GenerationSettings, summary: String? = nil) async throws -> SendResult {
+    func send(messages: [ChatMessage], settings: GenerationSettings, summary: String? = nil, facts: String? = nil) async throws -> SendResult {
         var payloadMessages: [ChatRequest.RequestMessage] = [
-            .init(role: ChatRole.system.rawValue, content: PromptBuilder.systemPrompt(for: settings, summary: summary))
+            .init(role: ChatRole.system.rawValue, content: PromptBuilder.systemPrompt(for: settings, summary: summary, facts: facts))
         ]
         payloadMessages.append(contentsOf: messages.map {
             .init(role: $0.role.rawValue, content: $0.content)
@@ -84,6 +84,37 @@ struct DeepSeekClient {
             payloadMessages: payloadMessages,
             settings: settings,
             temperature: 0.3,
+            maxTokens: 1024,
+            stop: []
+        )
+    }
+
+    /// Обновляет блок «факты» (ключ-значение) по последним сообщениям —
+    /// для стратегии Sticky Facts.
+    func updateFacts(previousFacts: String, recent: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
+        let system = """
+        Ты ведёшь компактный блок ФАКТОВ о диалоге пользователя с ассистентом в формате \
+        «ключ: значение» (по одному на строку). Сохраняй важное: цель, ограничения, \
+        предпочтения, принятые решения, договорённости, имена, числа. Если новое сообщение \
+        отменяет старый факт — обнови/удали его, не дублируй. Верни ТОЛЬКО обновлённый \
+        список фактов, без пояснений.
+        """
+        var text = ""
+        if !previousFacts.isEmpty {
+            text += "Текущие факты:\n\(previousFacts)\n\n"
+        }
+        text += "Новые сообщения:\n"
+        for m in recent {
+            text += "[\(m.role == .user ? "Пользователь" : "Ассистент")]: \(m.content)\n"
+        }
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: system),
+            .init(role: ChatRole.user.rawValue, content: text),
+        ]
+        return try await post(
+            payloadMessages: payloadMessages,
+            settings: settings,
+            temperature: 0.2,
             maxTokens: 1024,
             stop: []
         )

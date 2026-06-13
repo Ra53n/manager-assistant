@@ -217,21 +217,25 @@ final class ChatViewModel: ObservableObject {
         chats[idx].isLoading = true
         input = ""
 
-        // Компакция: в запрос идёт только хвост после summarizedUpTo,
-        // сжатая часть представлена саммари в системном промпте.
-        let upTo = min(chats[idx].summarizedUpTo, chats[idx].messages.count)
-        let history = Array(chats[idx].messages[upTo...])
-        let summary = chats[idx].summary
+        // Что уходит модели — определяет выбранная стратегия контекста.
         let settings = chats[idx].settings
+        let payload = ContextManager.payload(
+            messages: chats[idx].messages,
+            settings: settings,
+            summarizedUpTo: chats[idx].summarizedUpTo,
+            summary: chats[idx].summary,
+            facts: chats[idx].facts
+        )
         let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
 
         Task {
             let start = Date()
             do {
                 let result = try await client.send(
-                    messages: history,
+                    messages: payload.tail,
                     settings: settings,
-                    summary: summary.isEmpty ? nil : summary
+                    summary: payload.summary,
+                    facts: payload.facts
                 )
                 let duration = Date().timeIntervalSince(start)
                 let metrics = MessageMetrics(
@@ -250,6 +254,7 @@ final class ChatViewModel: ObservableObject {
                     chats[i].totalCost += metrics.totalCost ?? 0
                     chats[i].isLoading = false
                     maybeCompact(chatID: chatID)
+                    maybeUpdateFacts(chatID: chatID)
                 }
             } catch {
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
@@ -270,7 +275,7 @@ final class ChatViewModel: ObservableObject {
         guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
         let chat = chats[i]
         let s = chat.settings
-        guard s.compactionEnabled, !chat.isSummarizing, !chat.isLoading else { return }
+        guard s.contextStrategy == .summary, !chat.isSummarizing, !chat.isLoading else { return }
 
         let window = max(2, s.historyWindow)
         let overflow = chat.messages.count - chat.summarizedUpTo - window
@@ -312,6 +317,66 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
+    // MARK: - Sticky Facts (блок фактов)
+
+    /// Для стратегии .stickyFacts — после каждого обмена обновляет блок фактов
+    /// по последней паре сообщений (фоновым запросом).
+    private func maybeUpdateFacts(chatID: UUID) {
+        guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
+        let chat = chats[i]
+        let s = chat.settings
+        guard s.contextStrategy == .stickyFacts, !chat.isUpdatingFacts, !chat.isLoading else { return }
+
+        // Кормим последнюю пару (вопрос + ответ).
+        let recent = Array(chat.messages.suffix(2))
+        guard !recent.isEmpty else { return }
+        let previousFacts = chat.facts
+        let price = pricing["\(s.provider.rawValue)|\(s.model)"]
+        chats[i].isUpdatingFacts = true
+
+        Task {
+            do {
+                let result = try await client.updateFacts(previousFacts: previousFacts, recent: recent, settings: s)
+                if let j = chats.firstIndex(where: { $0.id == chatID }) {
+                    chats[j].facts = result.text
+                    chats[j].promptTokens += result.promptTokens
+                    chats[j].completionTokens += result.completionTokens
+                    chats[j].totalTokens += result.totalTokens
+                    chats[j].summaryTokens += result.totalTokens
+                    if let price {
+                        let cost = Double(result.promptTokens) * price.promptPerToken
+                                 + Double(result.completionTokens) * price.completionPerToken
+                        chats[j].totalCost += cost
+                        chats[j].summaryCost += cost
+                    }
+                    chats[j].isUpdatingFacts = false
+                }
+            } catch {
+                if let j = chats.firstIndex(where: { $0.id == chatID }) {
+                    chats[j].isUpdatingFacts = false
+                }
+            }
+        }
+    }
+
+    // MARK: - Ветвление (форк диалога от чекпоинта)
+
+    /// Создаёт новый чат-ветку: копирует историю до сообщения messageID включительно
+    /// и настройки, вставляет рядом и делает активным. «Переключение веток» — сайдбар.
+    func branch(fromChatID chatID: UUID, atMessageID messageID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              let mi = chats[ci].messages.firstIndex(where: { $0.id == messageID }) else { return }
+        let source = chats[ci]
+        let prefix = Array(source.messages[0...mi])
+
+        var branchChat = Chat(title: source.title + " — ветка")
+        branchChat.messages = prefix
+        branchChat.settings = source.settings
+        // Состояние стратегий не наследуем — пусть пересчитается на новой ветке.
+        chats.insert(branchChat, at: ci + 1)
+        selectedChatID = branchChat.id
+    }
+
     // MARK: - Видимость усечения контекста
 
     /// Грубая оценка токенов текста без токенизатора: кириллица ~2.5 симв/токен,
@@ -323,12 +388,15 @@ final class ChatViewModel: ObservableObject {
     /// Оценка токенов всего запроса: системный промпт (с саммари) + хвост
     /// истории после компакции + накладные.
     static func estimateHistoryTokens(_ chat: Chat) -> Int {
-        let system = estimateTokens(PromptBuilder.systemPrompt(
-            for: chat.settings,
-            summary: chat.summary.isEmpty ? nil : chat.summary
-        ))
-        let upTo = min(chat.summarizedUpTo, chat.messages.count)
-        let messages = chat.messages[upTo...].reduce(0) { $0 + estimateTokens($1.content) + 4 }
+        let p = ContextManager.payload(
+            messages: chat.messages,
+            settings: chat.settings,
+            summarizedUpTo: chat.summarizedUpTo,
+            summary: chat.summary,
+            facts: chat.facts
+        )
+        let system = estimateTokens(PromptBuilder.systemPrompt(for: chat.settings, summary: p.summary, facts: p.facts))
+        let messages = p.tail.reduce(0) { $0 + estimateTokens($1.content) + 4 }
         return system + messages
     }
 

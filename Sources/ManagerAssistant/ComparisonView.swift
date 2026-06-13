@@ -21,7 +21,9 @@ final class ComparisonViewModel: ObservableObject {
         var messages: [ChatMessage] = []
         var summary = ""
         var summarizedUpTo = 0
+        var facts = ""
         var isSummarizing = false
+        var isUpdatingFacts = false
         var isLoading = false
         var errorText: String?
         var totalTokens = 0
@@ -80,19 +82,23 @@ final class ComparisonViewModel: ObservableObject {
             tracks[index].isLoading = true
 
             let trackID = tracks[index].id
-            // Компакция: шлём хвост после summarizedUpTo + саммари.
-            let upTo = settings.compactionEnabled ? min(tracks[index].summarizedUpTo, tracks[index].messages.count) : 0
-            let history = Array(tracks[index].messages[upTo...])
-            let summary = settings.compactionEnabled ? tracks[index].summary : ""
+            let payload = ContextManager.payload(
+                messages: tracks[index].messages,
+                settings: settings,
+                summarizedUpTo: tracks[index].summarizedUpTo,
+                summary: tracks[index].summary,
+                facts: tracks[index].facts
+            )
             let price = priceLookup(model)
 
             Task {
                 let start = Date()
                 do {
                     let result = try await client.send(
-                        messages: history,
+                        messages: payload.tail,
                         settings: settings,
-                        summary: summary.isEmpty ? nil : summary
+                        summary: payload.summary,
+                        facts: payload.facts
                     )
                     let duration = Date().timeIntervalSince(start)
                     let metrics = MessageMetrics(
@@ -109,6 +115,7 @@ final class ComparisonViewModel: ObservableObject {
                         tracks[j].totalCost += metrics.totalCost ?? 0
                         tracks[j].isLoading = false
                         maybeCompactTrack(trackID)
+                        maybeUpdateFactsTrack(trackID)
                     }
                 } catch {
                     if let j = tracks.firstIndex(where: { $0.id == trackID }) {
@@ -125,7 +132,7 @@ final class ComparisonViewModel: ObservableObject {
         guard let i = tracks.firstIndex(where: { $0.id == trackID }),
               let settings = effectiveSettings(tracks[i]) else { return }
         let track = tracks[i]
-        guard settings.compactionEnabled, !track.isSummarizing, !track.isLoading else { return }
+        guard settings.contextStrategy == .summary, !track.isSummarizing, !track.isLoading else { return }
 
         let window = max(2, settings.historyWindow)
         let overflow = track.messages.count - track.summarizedUpTo - window
@@ -160,15 +167,53 @@ final class ComparisonViewModel: ObservableObject {
         }
     }
 
+    /// Для стратегии .stickyFacts — обновляет факты дорожки по последней паре.
+    private func maybeUpdateFactsTrack(_ trackID: UUID) {
+        guard let i = tracks.firstIndex(where: { $0.id == trackID }),
+              let settings = effectiveSettings(tracks[i]) else { return }
+        let track = tracks[i]
+        guard settings.contextStrategy == .stickyFacts, !track.isUpdatingFacts, !track.isLoading else { return }
+        let recent = Array(track.messages.suffix(2))
+        guard !recent.isEmpty else { return }
+        let previousFacts = track.facts
+        let price = priceLookup(track.model!)
+        tracks[i].isUpdatingFacts = true
+
+        Task {
+            do {
+                let result = try await client.updateFacts(previousFacts: previousFacts, recent: recent, settings: settings)
+                if let j = tracks.firstIndex(where: { $0.id == trackID }) {
+                    tracks[j].facts = result.text
+                    tracks[j].totalTokens += result.totalTokens
+                    tracks[j].summaryTokens += result.totalTokens
+                    if let price {
+                        let cost = Double(result.promptTokens) * price.promptPerToken
+                                 + Double(result.completionTokens) * price.completionPerToken
+                        tracks[j].totalCost += cost
+                        tracks[j].summaryCost += cost
+                    }
+                    tracks[j].isUpdatingFacts = false
+                }
+            } catch {
+                if let j = tracks.firstIndex(where: { $0.id == trackID }) {
+                    tracks[j].isUpdatingFacts = false
+                }
+            }
+        }
+    }
+
     /// Очистить историю всех дорожек (модели и настройки оставить).
     func reset() {
         for i in tracks.indices {
             tracks[i].messages = []
             tracks[i].summary = ""
             tracks[i].summarizedUpTo = 0
+            tracks[i].facts = ""
             tracks[i].errorText = nil
             tracks[i].totalTokens = 0
             tracks[i].totalCost = 0
+            tracks[i].summaryTokens = 0
+            tracks[i].summaryCost = 0
         }
     }
 }
@@ -323,16 +368,21 @@ struct ComparisonView: View {
                     if comp.tracks[i].isSummarizing {
                         Label("сжимаю историю…", systemImage: "arrow.down.right.and.arrow.up.left")
                             .font(.caption2).foregroundColor(.secondary)
-                    } else if comp.tracks[i].summarizedUpTo > 0 {
+                    } else if comp.tracks[i].isUpdatingFacts {
+                        Label("обновляю факты…", systemImage: "key")
+                            .font(.caption2).foregroundColor(.secondary)
+                    } else if comp.tracks[i].summarizedUpTo > 0 || !comp.tracks[i].facts.isEmpty {
+                        let isFacts = !comp.tracks[i].facts.isEmpty
                         VStack(alignment: .leading, spacing: 1) {
-                            Label("\(comp.tracks[i].summarizedUpTo) сообщ. сжаты в саммари", systemImage: "arrow.down.right.and.arrow.up.left")
+                            Label(isFacts ? "память фактов активна" : "\(comp.tracks[i].summarizedUpTo) сообщ. сжаты",
+                                  systemImage: isFacts ? "key" : "arrow.down.right.and.arrow.up.left")
                             if comp.tracks[i].summaryTokens > 0 {
-                                Text("саммаризация: \(comp.tracks[i].summaryTokens.formatted()) ток." +
+                                Text("на стратегию: \(comp.tracks[i].summaryTokens.formatted()) ток." +
                                      (comp.tracks[i].summaryCost > 0 ? " · \(MessageBubble.formatCost(comp.tracks[i].summaryCost))" : ""))
                             }
                         }
                         .font(.caption2).foregroundColor(.secondary)
-                        .help(comp.tracks[i].summary)
+                        .help(isFacts ? comp.tracks[i].facts : comp.tracks[i].summary)
                     }
                     ForEach(comp.tracks[i].messages) { msg in
                         ComparisonMessage(message: msg)

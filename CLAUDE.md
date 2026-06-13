@@ -31,11 +31,15 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
 
 - **API stateless** — «память» модели = повторная отправка истории чата в
   каждом запросе. Из-за этого promptTokens растут с каждым сообщением.
-- **Компакция истории** — в запрос идёт саммари старой части (в системном
-  промпте) + хвост messages[summarizedUpTo...]. Каждые historyWindow сообщений
-  за окном ChatViewModel.maybeCompact фоном сворачивает их в summary через
-  client.summarize (той же моделью чата, t=0.3). Поля Chat.summary /
-  summarizedUpTo персистятся; isSummarizing — runtime.
+- **Стратегии контекста** — GenerationSettings.contextStrategy (full / summary /
+  slidingWindow / stickyFacts). Что слать модели решает `ContextManager.payload`
+  (общий для чата и сравнения). Фоновая поддержка: summary → maybeCompact
+  (client.summarize), stickyFacts → maybeUpdateFacts (client.updateFacts);
+  обе той же моделью чата. Состояние: Chat.summary/summarizedUpTo и Chat.facts
+  персистятся; isSummarizing/isUpdatingFacts — runtime. Миграция: старый
+  compactionEnabled → contextStrategy в GenerationSettings.init(from:).
+- **Ветвление** — ChatViewModel.branch форкает чат от сообщения-чекпоинта в
+  новый чат-ветку (копия префикса + настроек); переключение веток = сайдбар.
 - **Миграция chats.json** — у Chat и GenerationSettings РУЧНЫЕ init(from:)
   в extension с decodeIfPresent+дефолтами. Новые поля добавлять ТОЛЬКО так,
   иначе старый файл перестанет декодироваться (уйдёт в .corrupt.json).

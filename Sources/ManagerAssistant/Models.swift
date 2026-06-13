@@ -46,6 +46,67 @@ struct ChatMessage: Identifiable, Codable {
     var metrics: MessageMetrics? = nil
 }
 
+/// Стратегия управления контекстом — что именно уходит модели из истории.
+enum ContextStrategy: String, Codable, CaseIterable, Identifiable {
+    case full           // вся история целиком
+    case summary        // саммари старой части + последние N (компакция)
+    case slidingWindow  // только последние N сообщений, остальное отбрасываем
+    case stickyFacts    // блок «факты» (ключ-значение) + последние N
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .full: return "Полная история"
+        case .summary: return "Саммари старого + окно"
+        case .slidingWindow: return "Скользящее окно"
+        case .stickyFacts: return "Факты + окно"
+        }
+    }
+
+    var usesWindow: Bool { self != .full }
+
+    var hint: String {
+        switch self {
+        case .full: return "Шлём всю историю. Точно, но токены растут с каждым сообщением."
+        case .summary: return "Старую часть сворачиваем в саммари, последние N шлём как есть."
+        case .slidingWindow: return "Шлём только последние N сообщений, старое забываем полностью."
+        case .stickyFacts: return "Ведём блок фактов (цель, ограничения, решения) + последние N сообщений."
+        }
+    }
+}
+
+/// Что уходит в запрос при выбранной стратегии: хвост сообщений + опц. саммари/факты.
+struct ContextPayload {
+    let tail: [ChatMessage]
+    let summary: String?
+    let facts: String?
+}
+
+/// Единая логика стратегий — используется и чатом, и окном сравнения.
+enum ContextManager {
+    static func payload(
+        messages: [ChatMessage],
+        settings: GenerationSettings,
+        summarizedUpTo: Int,
+        summary: String,
+        facts: String
+    ) -> ContextPayload {
+        let n = max(1, settings.historyWindow)
+        switch settings.contextStrategy {
+        case .full:
+            return ContextPayload(tail: messages, summary: nil, facts: nil)
+        case .summary:
+            let upTo = min(max(0, summarizedUpTo), messages.count)
+            return ContextPayload(tail: Array(messages[upTo...]), summary: summary.isEmpty ? nil : summary, facts: nil)
+        case .slidingWindow:
+            return ContextPayload(tail: Array(messages.suffix(n)), summary: nil, facts: nil)
+        case .stickyFacts:
+            return ContextPayload(tail: Array(messages.suffix(n)), summary: nil, facts: facts.isEmpty ? nil : facts)
+        }
+    }
+}
+
 /// Параметры генерации DeepSeek, настраиваемые на каждый чат.
 /// Включены только реально поддерживаемые API параметры.
 /// (top_k DeepSeek не принимает; frequency/presence_penalty — deprecated.)
@@ -67,10 +128,9 @@ struct GenerationSettings: Equatable, Codable {
     /// Пусто — без специальных требований к формату.
     var responseFormat: String = ""
 
-    /// Сжатие истории (компакция): в запрос идут саммари старых сообщений +
-    /// последние historyWindow сообщений как есть. Каждые historyWindow
-    /// сообщений за пределами окна сворачиваются в саммари (ChatViewModel.maybeCompact).
-    var compactionEnabled: Bool = true
+    /// Стратегия управления контекстом (см. ContextStrategy) и размер окна N
+    /// для стратегий, которые им пользуются.
+    var contextStrategy: ContextStrategy = .full
     var historyWindow: Int = 10
 
     static let `default` = GenerationSettings()
@@ -84,8 +144,10 @@ struct GenerationSettings: Equatable, Codable {
 
     enum CodingKeys: String, CodingKey {
         case provider, model, temperature, topP, maxTokens, stop, responseFormat
-        case compactionEnabled, historyWindow
+        case contextStrategy, historyWindow
     }
+    /// Старый ключ для миграции (compactionEnabled → contextStrategy).
+    private enum LegacyKeys: String, CodingKey { case compactionEnabled }
 }
 
 /// Миграционно-устойчивое декодирование: поля, которых нет в старом chats.json,
@@ -101,19 +163,30 @@ extension GenerationSettings {
         maxTokens = try c.decodeIfPresent(Int.self, forKey: .maxTokens) ?? d.maxTokens
         stop = try c.decodeIfPresent([String].self, forKey: .stop) ?? d.stop
         responseFormat = try c.decodeIfPresent(String.self, forKey: .responseFormat) ?? d.responseFormat
-        compactionEnabled = try c.decodeIfPresent(Bool.self, forKey: .compactionEnabled) ?? d.compactionEnabled
         historyWindow = try c.decodeIfPresent(Int.self, forKey: .historyWindow) ?? d.historyWindow
+        if let strat = try c.decodeIfPresent(ContextStrategy.self, forKey: .contextStrategy) {
+            contextStrategy = strat
+        } else {
+            // Миграция со старого compactionEnabled.
+            let legacy = try decoder.container(keyedBy: LegacyKeys.self)
+            let compaction = try legacy.decodeIfPresent(Bool.self, forKey: .compactionEnabled)
+            contextStrategy = (compaction == true) ? .summary : .full
+        }
     }
 }
 
 /// Собирает системный промпт из настроек чата: базовая роль + саммари
 /// сжатой части истории (если есть) + формат ответа.
 enum PromptBuilder {
-    static func systemPrompt(for s: GenerationSettings, summary: String? = nil) -> String {
+    static func systemPrompt(for s: GenerationSettings, summary: String? = nil, facts: String? = nil) -> String {
         var parts: [String] = [Config.systemPrompt]
 
         if let summary, !summary.isEmpty {
             parts.append("Краткое содержание более ранней части этого диалога (используй как контекст, не упоминай его существование):\n\(summary)")
+        }
+
+        if let facts, !facts.isEmpty {
+            parts.append("Известные факты об этом диалоге (используй как контекст, не упоминай их существование):\n\(facts)")
         }
 
         let format = s.responseFormat.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -146,18 +219,21 @@ struct Chat: Identifiable, Codable {
     var summaryTokens: Int = 0
     var summaryCost: Double = 0
 
-    /// Компакция: messages[0..<summarizedUpTo] свёрнуты в summary и в запрос
-    /// не отправляются (в UI остаются). summary подставляется в системный промпт.
+    /// Компакция (стратегия .summary): messages[0..<summarizedUpTo] свёрнуты в
+    /// summary и в запрос не отправляются (в UI остаются).
     var summary: String = ""
     var summarizedUpTo: Int = 0
-    /// Идёт фоновая суммаризация (runtime, не сохраняется).
+    /// Блок «факты» (стратегия .stickyFacts) — ключ-значение, накапливается.
+    var facts: String = ""
+    /// Runtime-флаги фоновой обработки (не сохраняются).
     var isSummarizing: Bool = false
+    var isUpdatingFacts: Bool = false
 
     /// На диск уходят только данные диалога; runtime-состояние (isLoading,
     /// errorText, isSummarizing) не сохраняется.
     enum CodingKeys: String, CodingKey {
         case id, title, messages, settings, promptTokens, completionTokens, totalTokens, totalCost
-        case summaryTokens, summaryCost, summary, summarizedUpTo
+        case summaryTokens, summaryCost, summary, summarizedUpTo, facts
     }
 }
 
@@ -177,6 +253,7 @@ extension Chat {
         summaryCost = try c.decodeIfPresent(Double.self, forKey: .summaryCost) ?? 0
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         summarizedUpTo = try c.decodeIfPresent(Int.self, forKey: .summarizedUpTo) ?? 0
+        facts = try c.decodeIfPresent(String.self, forKey: .facts) ?? ""
     }
 }
 
