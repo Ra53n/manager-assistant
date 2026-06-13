@@ -21,6 +21,9 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
 
 - **Models.swift** — доменные типы (Chat, ChatMessage, GenerationSettings,
   MessageMetrics; все Codable) + DTO API + PromptBuilder (системный промпт).
+- **ComparisonView.swift** — режим сравнения: до 3 «дорожек» (своя модель +
+  история), общий ввод шлёт вопрос во все параллельно. Свой ComparisonViewModel,
+  переиспользует DeepSeekClient/ModelPickerView; цены берёт через vm.price(for:).
 - **Config.swift** — дефолтная модель и системный промпт.
 - **App.swift** — вход; AppDelegate чинит активацию окна/иконку при `swift run`.
 

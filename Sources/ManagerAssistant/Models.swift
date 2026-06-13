@@ -135,10 +135,13 @@ struct Chat: Identifiable, Codable {
     var errorText: String? = nil
     var settings = GenerationSettings()
 
-    /// Накопленный расход токенов по этому чату (суммарно за все запросы).
+    /// Накопленный расход токенов по этому чату (суммарно за все запросы,
+    /// ВКЛЮЧАЯ фоновые запросы саммаризации).
     var promptTokens: Int = 0
     var completionTokens: Int = 0
     var totalTokens: Int = 0
+    /// Накопленная стоимость чата в USD (ответы + саммаризация), если цена известна.
+    var totalCost: Double = 0
 
     /// Компакция: messages[0..<summarizedUpTo] свёрнуты в summary и в запрос
     /// не отправляются (в UI остаются). summary подставляется в системный промпт.
@@ -150,7 +153,7 @@ struct Chat: Identifiable, Codable {
     /// На диск уходят только данные диалога; runtime-состояние (isLoading,
     /// errorText, isSummarizing) не сохраняется.
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, settings, promptTokens, completionTokens, totalTokens
+        case id, title, messages, settings, promptTokens, completionTokens, totalTokens, totalCost
         case summary, summarizedUpTo
     }
 }
@@ -166,6 +169,7 @@ extension Chat {
         promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens) ?? 0
         completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
         totalTokens = try c.decodeIfPresent(Int.self, forKey: .totalTokens) ?? 0
+        totalCost = try c.decodeIfPresent(Double.self, forKey: .totalCost) ?? 0
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         summarizedUpTo = try c.decodeIfPresent(Int.self, forKey: .summarizedUpTo) ?? 0
     }

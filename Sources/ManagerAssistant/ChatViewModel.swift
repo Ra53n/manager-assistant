@@ -43,6 +43,11 @@ final class ChatViewModel: ObservableObject {
     /// @Published, чтобы предупреждение об усечении появлялось после загрузки.
     @Published private(set) var contextLimits: [String: Int] = ChatViewModel.seedContextLimits()
 
+    /// Цена выбранной модели (для режима сравнения и др.).
+    func price(for option: ModelOption) -> ModelPricing? {
+        pricing[option.id]
+    }
+
     private static func seedPricing() -> [String: ModelPricing] {
         var prices: [String: ModelPricing] = [:]
         for (model, price) in DeepSeekPricing.table {
@@ -242,6 +247,7 @@ final class ChatViewModel: ObservableObject {
                     chats[i].promptTokens += result.promptTokens
                     chats[i].completionTokens += result.completionTokens
                     chats[i].totalTokens += result.totalTokens
+                    chats[i].totalCost += metrics.totalCost ?? 0
                     chats[i].isLoading = false
                     maybeCompact(chatID: chatID)
                 }
@@ -272,6 +278,7 @@ final class ChatViewModel: ObservableObject {
 
         let block = Array(chat.messages[chat.summarizedUpTo ..< (chat.summarizedUpTo + overflow)])
         let previousSummary = chat.summary
+        let price = pricing["\(s.provider.rawValue)|\(s.model)"]
         chats[i].isSummarizing = true
 
         Task {
@@ -284,10 +291,14 @@ final class ChatViewModel: ObservableObject {
                 if let j = chats.firstIndex(where: { $0.id == chatID }) {
                     chats[j].summary = result.text
                     chats[j].summarizedUpTo += block.count
-                    // Суммаризация — тоже расход токенов этого чата.
+                    // Суммаризация — тоже расход токенов и денег этого чата.
                     chats[j].promptTokens += result.promptTokens
                     chats[j].completionTokens += result.completionTokens
                     chats[j].totalTokens += result.totalTokens
+                    if let price {
+                        chats[j].totalCost += Double(result.promptTokens) * price.promptPerToken
+                                            + Double(result.completionTokens) * price.completionPerToken
+                    }
                     chats[j].isSummarizing = false
                 }
             } catch {

@@ -31,6 +31,7 @@ import MarkdownUI
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
     @State private var showingKeys = false
+    @State private var showingComparison = false
 
     var body: some View {
         NavigationSplitView {
@@ -40,6 +41,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingKeys) {
             ProviderKeysView(vm: vm)
+        }
+        .sheet(isPresented: $showingComparison) {
+            ComparisonView(vm: vm)
         }
     }
 
@@ -77,6 +81,12 @@ struct ContentView: View {
                     Label("API-ключи", systemImage: "key")
                 }
                 .help("API-ключи провайдеров")
+            }
+            ToolbarItem {
+                Button { showingComparison = true } label: {
+                    Label("Сравнение моделей", systemImage: "rectangle.split.3x1")
+                }
+                .help("Сравнить до 3 моделей на одном вопросе")
             }
             ToolbarItem {
                 Button(action: vm.newChat) {
@@ -140,10 +150,13 @@ struct ChatDetailView: View {
                     HStack(spacing: 4) {
                         Image(systemName: "circle.hexagongrid")
                         Text("\(chat.totalTokens.formatted()) токенов")
+                        if chat.totalCost > 0 {
+                            Text("· \(MessageBubble.formatCost(chat.totalCost))")
+                        }
                     }
                     .font(.callout)
                     .foregroundColor(.secondary)
-                    .help("Токены в этом чате — запрос: \(chat.promptTokens.formatted()) · ответ: \(chat.completionTokens.formatted()) · всего: \(chat.totalTokens.formatted())")
+                    .help("Стоимость чата \(MessageBubble.formatCost(chat.totalCost)) (включая саммаризацию).\nТокены — запрос: \(chat.promptTokens.formatted()) · ответ: \(chat.completionTokens.formatted()) · всего: \(chat.totalTokens.formatted())")
                 }
             }
             ToolbarItem(placement: .primaryAction) {
@@ -480,8 +493,8 @@ struct ChatSettingsView: View {
         .sheet(isPresented: $showingModelPicker) {
             ModelPickerView(
                 models: vm.availableModels,
-                provider: $settings.provider,
-                model: $settings.model
+                current: ModelOption(provider: settings.provider, model: settings.model),
+                onSelect: { settings.provider = $0.provider; settings.model = $0.model }
             )
         }
     }
@@ -533,8 +546,8 @@ struct SliderRow: View {
 /// Лист выбора модели с поиском по всему списку (DeepSeek + OpenRouter).
 struct ModelPickerView: View {
     let models: [ModelOption]
-    @Binding var provider: Provider
-    @Binding var model: String
+    let current: ModelOption?
+    let onSelect: (ModelOption) -> Void
     @Environment(\.dismiss) private var dismiss
 
     @State private var search = ""
@@ -592,15 +605,14 @@ struct ModelPickerView: View {
                             Section("\(prov.displayName) (\(opts.count))") {
                                 ForEach(opts) { opt in
                                     Button {
-                                        provider = opt.provider
-                                        model = opt.model
+                                        onSelect(opt)
                                         dismiss()
                                     } label: {
                                         HStack {
                                             Text(opt.model)
                                                 .lineLimit(1)
                                             Spacer()
-                                            if opt.provider == provider && opt.model == model {
+                                            if opt == current {
                                                 Image(systemName: "checkmark")
                                                     .foregroundColor(.accentColor)
                                             }
