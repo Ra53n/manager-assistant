@@ -295,9 +295,12 @@ final class ChatViewModel: ObservableObject {
                     chats[j].promptTokens += result.promptTokens
                     chats[j].completionTokens += result.completionTokens
                     chats[j].totalTokens += result.totalTokens
+                    chats[j].summaryTokens += result.totalTokens
                     if let price {
-                        chats[j].totalCost += Double(result.promptTokens) * price.promptPerToken
-                                            + Double(result.completionTokens) * price.completionPerToken
+                        let cost = Double(result.promptTokens) * price.promptPerToken
+                                 + Double(result.completionTokens) * price.completionPerToken
+                        chats[j].totalCost += cost
+                        chats[j].summaryCost += cost
                     }
                     chats[j].isSummarizing = false
                 }

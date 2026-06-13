@@ -228,9 +228,16 @@ struct ChatDetailView: View {
                 .foregroundColor(.secondary)
                 .frame(maxWidth: .infinity, alignment: .center)
             } else if chat.summarizedUpTo > 0 {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.down.right.and.arrow.up.left")
-                    Text("\(chat.summarizedUpTo) сообщ. выше сжаты в саммари — модель видит их кратко")
+                VStack(spacing: 1) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        Text("\(chat.summarizedUpTo) сообщ. выше сжаты в саммари — модель видит их кратко")
+                    }
+                    if chat.summaryTokens > 0 {
+                        Text("на саммаризацию ушло \(chat.summaryTokens.formatted()) ток." +
+                             (chat.summaryCost > 0 ? " · \(MessageBubble.formatCost(chat.summaryCost))" : ""))
+                            .font(.caption2)
+                    }
                 }
                 .font(.caption)
                 .foregroundColor(.secondary)

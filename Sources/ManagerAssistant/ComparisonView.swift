@@ -26,12 +26,14 @@ final class ComparisonViewModel: ObservableObject {
         var errorText: String?
         var totalTokens = 0
         var totalCost = 0.0
+        var summaryTokens = 0      // вклад саммаризации (подмножество total)
+        var summaryCost = 0.0
     }
 
     @Published var tracks: [Track] = [Track(), Track()]   // старт с двух
     @Published var input = ""
 
-    static let maxTracks = 3
+    static let maxTracks = 6
 
     private let client = DeepSeekClient()
     /// Поиск цены модели — пробрасывается из ChatViewModel.
@@ -141,9 +143,12 @@ final class ComparisonViewModel: ObservableObject {
                     tracks[j].summary = result.text
                     tracks[j].summarizedUpTo += block.count
                     tracks[j].totalTokens += result.totalTokens
+                    tracks[j].summaryTokens += result.totalTokens
                     if let price {
-                        tracks[j].totalCost += Double(result.promptTokens) * price.promptPerToken
-                                             + Double(result.completionTokens) * price.completionPerToken
+                        let cost = Double(result.promptTokens) * price.promptPerToken
+                                 + Double(result.completionTokens) * price.completionPerToken
+                        tracks[j].totalCost += cost
+                        tracks[j].summaryCost += cost
                     }
                     tracks[j].isSummarizing = false
                 }
@@ -196,10 +201,15 @@ struct ComparisonView: View {
 
             Divider()
 
-            HStack(spacing: 0) {
-                ForEach(comp.tracks.indices, id: \.self) { i in
-                    trackColumn(i)
-                    if i < comp.tracks.count - 1 { Divider() }
+            // Колонки адаптивны: при 2–4 заполняют ширину, при 5–6 — горизонтальный скролл.
+            GeometryReader { geo in
+                ScrollView(.horizontal, showsIndicators: comp.tracks.count > 4) {
+                    HStack(spacing: 0) {
+                        ForEach(comp.tracks.indices, id: \.self) { i in
+                            trackColumn(i, width: columnWidth(total: geo.size.width))
+                            if i < comp.tracks.count - 1 { Divider() }
+                        }
+                    }
                 }
             }
 
@@ -221,7 +231,7 @@ struct ComparisonView: View {
             }
             .padding()
         }
-        .frame(width: 1040, height: 680)
+        .frame(width: 1180, height: 700)
         .onAppear {
             comp.priceLookup = { vm.price(for: $0) }
             vm.loadModels()
@@ -246,8 +256,15 @@ struct ComparisonView: View {
         }
     }
 
+    /// Ширина колонки: total/count, но не уже 300pt (тогда включается горизонтальный скролл).
+    private func columnWidth(total: CGFloat) -> CGFloat {
+        let count = max(1, comp.tracks.count)
+        let available = total - CGFloat(count - 1)   // вычесть разделители
+        return max(300, available / CGFloat(count))
+    }
+
     // Одна колонка: выбор модели + настройки + история + итоги.
-    private func trackColumn(_ i: Int) -> some View {
+    private func trackColumn(_ i: Int, width: CGFloat) -> some View {
         VStack(spacing: 0) {
             // Шапка: модель (пикер) + ⚙︎ + удалить.
             HStack(spacing: 4) {
@@ -307,9 +324,15 @@ struct ComparisonView: View {
                         Label("сжимаю историю…", systemImage: "arrow.down.right.and.arrow.up.left")
                             .font(.caption2).foregroundColor(.secondary)
                     } else if comp.tracks[i].summarizedUpTo > 0 {
-                        Label("\(comp.tracks[i].summarizedUpTo) сообщ. сжаты в саммари", systemImage: "arrow.down.right.and.arrow.up.left")
-                            .font(.caption2).foregroundColor(.secondary)
-                            .help(comp.tracks[i].summary)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Label("\(comp.tracks[i].summarizedUpTo) сообщ. сжаты в саммари", systemImage: "arrow.down.right.and.arrow.up.left")
+                            if comp.tracks[i].summaryTokens > 0 {
+                                Text("саммаризация: \(comp.tracks[i].summaryTokens.formatted()) ток." +
+                                     (comp.tracks[i].summaryCost > 0 ? " · \(MessageBubble.formatCost(comp.tracks[i].summaryCost))" : ""))
+                            }
+                        }
+                        .font(.caption2).foregroundColor(.secondary)
+                        .help(comp.tracks[i].summary)
                     }
                     ForEach(comp.tracks[i].messages) { msg in
                         ComparisonMessage(message: msg)
@@ -328,7 +351,7 @@ struct ComparisonView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .frame(maxWidth: .infinity)
+        .frame(width: width)
     }
 }
 

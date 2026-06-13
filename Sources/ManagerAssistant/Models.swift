@@ -142,6 +142,9 @@ struct Chat: Identifiable, Codable {
     var totalTokens: Int = 0
     /// Накопленная стоимость чата в USD (ответы + саммаризация), если цена известна.
     var totalCost: Double = 0
+    /// Из общего расхода — сколько ушло именно на саммаризацию (подмножество).
+    var summaryTokens: Int = 0
+    var summaryCost: Double = 0
 
     /// Компакция: messages[0..<summarizedUpTo] свёрнуты в summary и в запрос
     /// не отправляются (в UI остаются). summary подставляется в системный промпт.
@@ -154,7 +157,7 @@ struct Chat: Identifiable, Codable {
     /// errorText, isSummarizing) не сохраняется.
     enum CodingKeys: String, CodingKey {
         case id, title, messages, settings, promptTokens, completionTokens, totalTokens, totalCost
-        case summary, summarizedUpTo
+        case summaryTokens, summaryCost, summary, summarizedUpTo
     }
 }
 
@@ -170,6 +173,8 @@ extension Chat {
         completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
         totalTokens = try c.decodeIfPresent(Int.self, forKey: .totalTokens) ?? 0
         totalCost = try c.decodeIfPresent(Double.self, forKey: .totalCost) ?? 0
+        summaryTokens = try c.decodeIfPresent(Int.self, forKey: .summaryTokens) ?? 0
+        summaryCost = try c.decodeIfPresent(Double.self, forKey: .summaryCost) ?? 0
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         summarizedUpTo = try c.decodeIfPresent(Int.self, forKey: .summarizedUpTo) ?? 0
     }
