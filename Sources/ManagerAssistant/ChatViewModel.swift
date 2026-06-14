@@ -219,13 +219,7 @@ final class ChatViewModel: ObservableObject {
 
         // Что уходит модели — определяет выбранная стратегия контекста.
         let settings = chats[idx].settings
-        let payload = ContextManager.payload(
-            messages: chats[idx].messages,
-            settings: settings,
-            summarizedUpTo: chats[idx].summarizedUpTo,
-            summary: chats[idx].summary,
-            facts: chats[idx].facts
-        )
+        let payload = ContextManager.payload(messages: chats[idx].messages, settings: settings, facts: chats[idx].facts)
         let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
 
         Task {
@@ -234,7 +228,6 @@ final class ChatViewModel: ObservableObject {
                 let result = try await client.send(
                     messages: payload.tail,
                     settings: settings,
-                    summary: payload.summary,
                     facts: payload.facts
                 )
                 let duration = Date().timeIntervalSince(start)
@@ -253,65 +246,13 @@ final class ChatViewModel: ObservableObject {
                     chats[i].totalTokens += result.totalTokens
                     chats[i].totalCost += metrics.totalCost ?? 0
                     chats[i].isLoading = false
-                    maybeCompact(chatID: chatID)
+                    mirrorActiveBranch(i)
                     maybeUpdateFacts(chatID: chatID)
                 }
             } catch {
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
                     chats[i].errorText = error.localizedDescription
                     chats[i].isLoading = false
-                }
-            }
-        }
-    }
-
-    // MARK: - Компакция истории (саммари старых сообщений)
-
-    /// Если за пределами окна historyWindow накопилось ещё ≥ historyWindow
-    /// несжатых сообщений — сворачивает их в саммари фоновым запросом.
-    /// Триггерится после каждого ответа ассистента. При ошибке просто
-    /// попробует снова после следующего ответа.
-    private func maybeCompact(chatID: UUID) {
-        guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
-        let chat = chats[i]
-        let s = chat.settings
-        guard s.contextStrategy == .summary, !chat.isSummarizing, !chat.isLoading else { return }
-
-        let window = max(2, s.historyWindow)
-        let overflow = chat.messages.count - chat.summarizedUpTo - window
-        guard overflow >= window else { return } // копим блоками по N, не дёргаем API на каждое сообщение
-
-        let block = Array(chat.messages[chat.summarizedUpTo ..< (chat.summarizedUpTo + overflow)])
-        let previousSummary = chat.summary
-        let price = pricing["\(s.provider.rawValue)|\(s.model)"]
-        chats[i].isSummarizing = true
-
-        Task {
-            do {
-                let result = try await client.summarize(
-                    previousSummary: previousSummary,
-                    block: block,
-                    settings: s
-                )
-                if let j = chats.firstIndex(where: { $0.id == chatID }) {
-                    chats[j].summary = result.text
-                    chats[j].summarizedUpTo += block.count
-                    // Суммаризация — тоже расход токенов и денег этого чата.
-                    chats[j].promptTokens += result.promptTokens
-                    chats[j].completionTokens += result.completionTokens
-                    chats[j].totalTokens += result.totalTokens
-                    chats[j].summaryTokens += result.totalTokens
-                    if let price {
-                        let cost = Double(result.promptTokens) * price.promptPerToken
-                                 + Double(result.completionTokens) * price.completionPerToken
-                        chats[j].totalCost += cost
-                        chats[j].summaryCost += cost
-                    }
-                    chats[j].isSummarizing = false
-                }
-            } catch {
-                if let j = chats.firstIndex(where: { $0.id == chatID }) {
-                    chats[j].isSummarizing = false
                 }
             }
         }
@@ -349,6 +290,7 @@ final class ChatViewModel: ObservableObject {
                         chats[j].totalCost += cost
                         chats[j].summaryCost += cost
                     }
+                    mirrorActiveBranch(j)
                     chats[j].isUpdatingFacts = false
                 }
             } catch {
@@ -359,22 +301,49 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Ветвление (форк диалога от чекпоинта)
+    // MARK: - Ветвление (стратегия .branching)
 
-    /// Создаёт новый чат-ветку: копирует историю до сообщения messageID включительно
-    /// и настройки, вставляет рядом и делает активным. «Переключение веток» — сайдбар.
-    func branch(fromChatID chatID: UUID, atMessageID messageID: UUID) {
+    /// Чекпоинт + создание веток от сообщения messageID.
+    /// Первый вызов делает 2 ветки от одной точки: «Ветка 1» = текущее продолжение,
+    /// «Ветка 2» = копия истории до чекпоинта (для независимого продолжения).
+    /// Последующие вызовы добавляют ещё одну ветку от чекпоинта активной ветки.
+    func makeBranchFrom(chatID: UUID, messageID: UUID) {
         guard let ci = chats.firstIndex(where: { $0.id == chatID }),
               let mi = chats[ci].messages.firstIndex(where: { $0.id == messageID }) else { return }
-        let source = chats[ci]
-        let prefix = Array(source.messages[0...mi])
+        let prefix = Array(chats[ci].messages[0...mi])
 
-        var branchChat = Chat(title: source.title + " — ветка")
-        branchChat.messages = prefix
-        branchChat.settings = source.settings
-        // Состояние стратегий не наследуем — пусть пересчитается на новой ветке.
-        chats.insert(branchChat, at: ci + 1)
-        selectedChatID = branchChat.id
+        if chats[ci].branches.isEmpty {
+            let current = ChatBranch(name: "Ветка 1", messages: chats[ci].messages, facts: chats[ci].facts)
+            let fork = ChatBranch(name: "Ветка 2", messages: prefix, facts: chats[ci].facts)
+            chats[ci].branches = [current, fork]
+            chats[ci].activeBranchID = current.id   // остаёмся в текущем продолжении
+        } else {
+            mirrorActiveBranch(ci)
+            let fork = ChatBranch(name: "Ветка \(chats[ci].branches.count + 1)", messages: prefix, facts: chats[ci].facts)
+            chats[ci].branches.append(fork)
+            chats[ci].activeBranchID = fork.id      // переключаемся на новую ветку
+            chats[ci].messages = fork.messages
+            chats[ci].facts = fork.facts
+        }
+    }
+
+    /// Переключение между ветками: текущую сохраняем, целевую загружаем.
+    func switchBranch(chatID: UUID, branchID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              chats[ci].activeBranchID != branchID,
+              let ti = chats[ci].branches.firstIndex(where: { $0.id == branchID }) else { return }
+        mirrorActiveBranch(ci)
+        chats[ci].activeBranchID = branchID
+        chats[ci].messages = chats[ci].branches[ti].messages
+        chats[ci].facts = chats[ci].branches[ti].facts
+    }
+
+    /// Синхронизирует messages/facts активного чата в его ветку (инвариант зеркала).
+    private func mirrorActiveBranch(_ chatIndex: Int) {
+        guard let active = chats[chatIndex].activeBranchID,
+              let bi = chats[chatIndex].branches.firstIndex(where: { $0.id == active }) else { return }
+        chats[chatIndex].branches[bi].messages = chats[chatIndex].messages
+        chats[chatIndex].branches[bi].facts = chats[chatIndex].facts
     }
 
     // MARK: - Видимость усечения контекста
@@ -388,14 +357,8 @@ final class ChatViewModel: ObservableObject {
     /// Оценка токенов всего запроса: системный промпт (с саммари) + хвост
     /// истории после компакции + накладные.
     static func estimateHistoryTokens(_ chat: Chat) -> Int {
-        let p = ContextManager.payload(
-            messages: chat.messages,
-            settings: chat.settings,
-            summarizedUpTo: chat.summarizedUpTo,
-            summary: chat.summary,
-            facts: chat.facts
-        )
-        let system = estimateTokens(PromptBuilder.systemPrompt(for: chat.settings, summary: p.summary, facts: p.facts))
+        let p = ContextManager.payload(messages: chat.messages, settings: chat.settings, facts: chat.facts)
+        let system = estimateTokens(PromptBuilder.systemPrompt(for: chat.settings, facts: p.facts))
         let messages = p.tail.reduce(0) { $0 + estimateTokens($1.content) + 4 }
         return system + messages
     }

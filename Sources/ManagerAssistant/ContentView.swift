@@ -125,6 +125,7 @@ struct ChatDetailView: View {
     private var messages: [ChatMessage] { vm.selectedChat?.messages ?? [] }
     private var isLoading: Bool { vm.selectedChat?.isLoading ?? false }
     private var errorText: String? { vm.selectedChat?.errorText }
+    private var branchingActive: Bool { vm.selectedChat?.settings.contextStrategy == .branching }
 
     /// Binding к настройкам выбранного чата.
     private var settingsBinding: Binding<GenerationSettings> {
@@ -136,6 +137,7 @@ struct ChatDetailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            branchBar
             messagesList
             Divider()
             errorBar
@@ -187,11 +189,14 @@ struct ChatDetailView: View {
                     }
                     compactionBanner
                     ForEach(messages) { message in
-                        MessageBubble(message: message, onBranch: {
-                            if let chatID = vm.selectedChatID {
-                                vm.branch(fromChatID: chatID, atMessageID: message.id)
-                            }
-                        })
+                        MessageBubble(
+                            message: message,
+                            onBranch: branchingActive ? {
+                                if let chatID = vm.selectedChatID {
+                                    vm.makeBranchFrom(chatID: chatID, messageID: message.id)
+                                }
+                            } : nil
+                        )
                         .id(message.id)
                     }
                     if isLoading {
@@ -230,13 +235,8 @@ struct ChatDetailView: View {
                       (chat.summaryCost > 0 ? " · \(MessageBubble.formatCost(chat.summaryCost))" : "")
                     : ""
 
-                if chat.isSummarizing {
-                    bannerLine("Сжимаю старые сообщения в саммари…", system: nil, busy: true, sub: "", help: "")
-                } else if chat.isUpdatingFacts {
+                if chat.isUpdatingFacts {
                     bannerLine("Обновляю блок фактов…", system: nil, busy: true, sub: "", help: "")
-                } else if strat == .summary, chat.summarizedUpTo > 0 {
-                    bannerLine("\(chat.summarizedUpTo) сообщ. выше сжаты в саммари — модель видит их кратко",
-                               system: "arrow.down.right.and.arrow.up.left", busy: false, sub: overhead, help: chat.summary)
                 } else if strat == .stickyFacts, !chat.facts.isEmpty {
                     bannerLine("Память фактов активна — наведи, чтобы посмотреть",
                                system: "key", busy: false, sub: overhead, help: chat.facts)
@@ -295,6 +295,36 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Ветвление: панель веток над лентой
+
+    @ViewBuilder
+    private var branchBar: some View {
+        if let chat = vm.selectedChat,
+           chat.settings.contextStrategy == .branching,
+           !chat.branches.isEmpty {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundColor(.secondary)
+                ForEach(chat.branches) { b in
+                    let active = b.id == chat.activeBranchID
+                    Button(b.name) {
+                        vm.switchBranch(chatID: chat.id, branchID: b.id)
+                    }
+                    .buttonStyle(.borderless)
+                    .fontWeight(active ? .semibold : .regular)
+                    .foregroundColor(active ? .accentColor : .secondary)
+                }
+                Spacer()
+                Text("ветка отсюда — наведи на сообщение")
+                    .foregroundColor(.secondary.opacity(0.7))
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.06))
+        }
+    }
+
     // MARK: - Предупреждение об усечении контекста
 
     /// Жёлтый бар: история чата рискует не влезть в окно выбранной модели —
@@ -350,6 +380,8 @@ struct ChatSettingsView: View {
     @Binding var settings: GenerationSettings
     /// В режиме сравнения модель выбирается в шапке колонки — секцию прячем.
     var showModelSection: Bool = true
+    /// Ветвление — структурная стратегия, в сравнении недоступна.
+    var allowBranching: Bool = true
     @Environment(\.dismiss) private var dismiss
 
     /// Стоп-последовательности редактируем как строку «через запятую».
@@ -465,7 +497,7 @@ struct ChatSettingsView: View {
 
                 Section("Управление контекстом") {
                     Picker("Стратегия", selection: $settings.contextStrategy) {
-                        ForEach(ContextStrategy.allCases) { strat in
+                        ForEach(allowBranching ? ContextStrategy.allCases : ContextStrategy.sendStrategies) { strat in
                             Text(strat.label).tag(strat)
                         }
                     }

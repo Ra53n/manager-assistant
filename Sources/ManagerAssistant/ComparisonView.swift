@@ -19,10 +19,7 @@ final class ComparisonViewModel: ObservableObject {
         var model: ModelOption?
         var settings = GenerationSettings()      // параметры генерации этой модели
         var messages: [ChatMessage] = []
-        var summary = ""
-        var summarizedUpTo = 0
         var facts = ""
-        var isSummarizing = false
         var isUpdatingFacts = false
         var isLoading = false
         var errorText: String?
@@ -82,13 +79,7 @@ final class ComparisonViewModel: ObservableObject {
             tracks[index].isLoading = true
 
             let trackID = tracks[index].id
-            let payload = ContextManager.payload(
-                messages: tracks[index].messages,
-                settings: settings,
-                summarizedUpTo: tracks[index].summarizedUpTo,
-                summary: tracks[index].summary,
-                facts: tracks[index].facts
-            )
+            let payload = ContextManager.payload(messages: tracks[index].messages, settings: settings, facts: tracks[index].facts)
             let price = priceLookup(model)
 
             Task {
@@ -97,7 +88,6 @@ final class ComparisonViewModel: ObservableObject {
                     let result = try await client.send(
                         messages: payload.tail,
                         settings: settings,
-                        summary: payload.summary,
                         facts: payload.facts
                     )
                     let duration = Date().timeIntervalSince(start)
@@ -114,7 +104,6 @@ final class ComparisonViewModel: ObservableObject {
                         tracks[j].totalTokens += result.totalTokens
                         tracks[j].totalCost += metrics.totalCost ?? 0
                         tracks[j].isLoading = false
-                        maybeCompactTrack(trackID)
                         maybeUpdateFactsTrack(trackID)
                     }
                 } catch {
@@ -122,46 +111,6 @@ final class ComparisonViewModel: ObservableObject {
                         tracks[j].errorText = error.localizedDescription
                         tracks[j].isLoading = false
                     }
-                }
-            }
-        }
-    }
-
-    /// Свернуть старые сообщения дорожки в саммари (аналог ChatViewModel.maybeCompact).
-    private func maybeCompactTrack(_ trackID: UUID) {
-        guard let i = tracks.firstIndex(where: { $0.id == trackID }),
-              let settings = effectiveSettings(tracks[i]) else { return }
-        let track = tracks[i]
-        guard settings.contextStrategy == .summary, !track.isSummarizing, !track.isLoading else { return }
-
-        let window = max(2, settings.historyWindow)
-        let overflow = track.messages.count - track.summarizedUpTo - window
-        guard overflow >= window else { return }
-
-        let block = Array(track.messages[track.summarizedUpTo ..< (track.summarizedUpTo + overflow)])
-        let previousSummary = track.summary
-        let price = priceLookup(track.model!)
-        tracks[i].isSummarizing = true
-
-        Task {
-            do {
-                let result = try await client.summarize(previousSummary: previousSummary, block: block, settings: settings)
-                if let j = tracks.firstIndex(where: { $0.id == trackID }) {
-                    tracks[j].summary = result.text
-                    tracks[j].summarizedUpTo += block.count
-                    tracks[j].totalTokens += result.totalTokens
-                    tracks[j].summaryTokens += result.totalTokens
-                    if let price {
-                        let cost = Double(result.promptTokens) * price.promptPerToken
-                                 + Double(result.completionTokens) * price.completionPerToken
-                        tracks[j].totalCost += cost
-                        tracks[j].summaryCost += cost
-                    }
-                    tracks[j].isSummarizing = false
-                }
-            } catch {
-                if let j = tracks.firstIndex(where: { $0.id == trackID }) {
-                    tracks[j].isSummarizing = false
                 }
             }
         }
@@ -206,8 +155,6 @@ final class ComparisonViewModel: ObservableObject {
     func reset() {
         for i in tracks.indices {
             tracks[i].messages = []
-            tracks[i].summary = ""
-            tracks[i].summarizedUpTo = 0
             tracks[i].facts = ""
             tracks[i].errorText = nil
             tracks[i].totalTokens = 0
@@ -295,7 +242,8 @@ struct ComparisonView: View {
                 ChatSettingsView(
                     vm: vm,
                     settings: $comp.tracks[box.value].settings,
-                    showModelSection: false
+                    showModelSection: false,
+                    allowBranching: false
                 )
             }
         }
@@ -365,24 +313,19 @@ struct ComparisonView: View {
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    if comp.tracks[i].isSummarizing {
-                        Label("сжимаю историю…", systemImage: "arrow.down.right.and.arrow.up.left")
-                            .font(.caption2).foregroundColor(.secondary)
-                    } else if comp.tracks[i].isUpdatingFacts {
+                    if comp.tracks[i].isUpdatingFacts {
                         Label("обновляю факты…", systemImage: "key")
                             .font(.caption2).foregroundColor(.secondary)
-                    } else if comp.tracks[i].summarizedUpTo > 0 || !comp.tracks[i].facts.isEmpty {
-                        let isFacts = !comp.tracks[i].facts.isEmpty
+                    } else if !comp.tracks[i].facts.isEmpty {
                         VStack(alignment: .leading, spacing: 1) {
-                            Label(isFacts ? "память фактов активна" : "\(comp.tracks[i].summarizedUpTo) сообщ. сжаты",
-                                  systemImage: isFacts ? "key" : "arrow.down.right.and.arrow.up.left")
+                            Label("память фактов активна", systemImage: "key")
                             if comp.tracks[i].summaryTokens > 0 {
-                                Text("на стратегию: \(comp.tracks[i].summaryTokens.formatted()) ток." +
+                                Text("на факты: \(comp.tracks[i].summaryTokens.formatted()) ток." +
                                      (comp.tracks[i].summaryCost > 0 ? " · \(MessageBubble.formatCost(comp.tracks[i].summaryCost))" : ""))
                             }
                         }
                         .font(.caption2).foregroundColor(.secondary)
-                        .help(isFacts ? comp.tracks[i].facts : comp.tracks[i].summary)
+                        .help(comp.tracks[i].facts)
                     }
                     ForEach(comp.tracks[i].messages) { msg in
                         ComparisonMessage(message: msg)

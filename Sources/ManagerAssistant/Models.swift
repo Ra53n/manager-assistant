@@ -46,63 +46,65 @@ struct ChatMessage: Identifiable, Codable {
     var metrics: MessageMetrics? = nil
 }
 
-/// Стратегия управления контекстом — что именно уходит модели из истории.
+/// Стратегия управления контекстом (по ТЗ).
 enum ContextStrategy: String, Codable, CaseIterable, Identifiable {
-    case full           // вся история целиком
-    case summary        // саммари старой части + последние N (компакция)
+    case full           // вся история целиком (для сравнения)
     case slidingWindow  // только последние N сообщений, остальное отбрасываем
     case stickyFacts    // блок «факты» (ключ-значение) + последние N
+    case branching      // ветки диалога: чекпоинт, 2 ветки, переключение
 
     var id: String { rawValue }
+
+    /// Снисходительное декодирование: неизвестное значение (напр. удалённый
+    /// «summary» из старого файла) трактуем как .full, чтобы chats.json не падал.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ContextStrategy(rawValue: raw) ?? .full
+    }
+
+    /// Стратегии «что слать модели» — доступны и в сравнении (без ветвления,
+    /// которое структурное и в сравнении смысла не имеет).
+    static let sendStrategies: [ContextStrategy] = [.full, .slidingWindow, .stickyFacts]
 
     var label: String {
         switch self {
         case .full: return "Полная история"
-        case .summary: return "Саммари старого + окно"
         case .slidingWindow: return "Скользящее окно"
-        case .stickyFacts: return "Факты + окно"
+        case .stickyFacts: return "Факты (key-value) + окно"
+        case .branching: return "Ветвление диалога"
         }
     }
 
-    var usesWindow: Bool { self != .full }
+    var usesWindow: Bool { self == .slidingWindow || self == .stickyFacts }
 
     var hint: String {
         switch self {
         case .full: return "Шлём всю историю. Точно, но токены растут с каждым сообщением."
-        case .summary: return "Старую часть сворачиваем в саммари, последние N шлём как есть."
-        case .slidingWindow: return "Шлём только последние N сообщений, старое забываем полностью."
-        case .stickyFacts: return "Ведём блок фактов (цель, ограничения, решения) + последние N сообщений."
+        case .slidingWindow: return "Шлём только последние N сообщений, старое отбрасываем."
+        case .stickyFacts: return "Ведём блок фактов (цель, ограничения, решения, договорённости); шлём факты + последние N."
+        case .branching: return "Сохраняй чекпоинты и веди несколько веток диалога от одной точки. «Ветка отсюда» на сообщении, переключение — над лентой."
         }
     }
 }
 
-/// Что уходит в запрос при выбранной стратегии: хвост сообщений + опц. саммари/факты.
+/// Что уходит в запрос при выбранной стратегии: хвост сообщений + опц. факты.
 struct ContextPayload {
     let tail: [ChatMessage]
-    let summary: String?
     let facts: String?
 }
 
-/// Единая логика стратегий — используется и чатом, и окном сравнения.
+/// Единая логика стратегий «что слать» — используется и чатом, и окном сравнения.
 enum ContextManager {
-    static func payload(
-        messages: [ChatMessage],
-        settings: GenerationSettings,
-        summarizedUpTo: Int,
-        summary: String,
-        facts: String
-    ) -> ContextPayload {
+    static func payload(messages: [ChatMessage], settings: GenerationSettings, facts: String) -> ContextPayload {
         let n = max(1, settings.historyWindow)
         switch settings.contextStrategy {
-        case .full:
-            return ContextPayload(tail: messages, summary: nil, facts: nil)
-        case .summary:
-            let upTo = min(max(0, summarizedUpTo), messages.count)
-            return ContextPayload(tail: Array(messages[upTo...]), summary: summary.isEmpty ? nil : summary, facts: nil)
+        case .full, .branching:
+            // Ветвление шлёт активную ветку целиком (как полная история).
+            return ContextPayload(tail: messages, facts: nil)
         case .slidingWindow:
-            return ContextPayload(tail: Array(messages.suffix(n)), summary: nil, facts: nil)
+            return ContextPayload(tail: Array(messages.suffix(n)), facts: nil)
         case .stickyFacts:
-            return ContextPayload(tail: Array(messages.suffix(n)), summary: nil, facts: facts.isEmpty ? nil : facts)
+            return ContextPayload(tail: Array(messages.suffix(n)), facts: facts.isEmpty ? nil : facts)
         }
     }
 }
@@ -146,8 +148,6 @@ struct GenerationSettings: Equatable, Codable {
         case provider, model, temperature, topP, maxTokens, stop, responseFormat
         case contextStrategy, historyWindow
     }
-    /// Старый ключ для миграции (compactionEnabled → contextStrategy).
-    private enum LegacyKeys: String, CodingKey { case compactionEnabled }
 }
 
 /// Миграционно-устойчивое декодирование: поля, которых нет в старом chats.json,
@@ -164,14 +164,8 @@ extension GenerationSettings {
         stop = try c.decodeIfPresent([String].self, forKey: .stop) ?? d.stop
         responseFormat = try c.decodeIfPresent(String.self, forKey: .responseFormat) ?? d.responseFormat
         historyWindow = try c.decodeIfPresent(Int.self, forKey: .historyWindow) ?? d.historyWindow
-        if let strat = try c.decodeIfPresent(ContextStrategy.self, forKey: .contextStrategy) {
-            contextStrategy = strat
-        } else {
-            // Миграция со старого compactionEnabled.
-            let legacy = try decoder.container(keyedBy: LegacyKeys.self)
-            let compaction = try legacy.decodeIfPresent(Bool.self, forKey: .compactionEnabled)
-            contextStrategy = (compaction == true) ? .summary : .full
-        }
+        // Неизвестная/удалённая стратегия (старый «summary») → .full (см. ContextStrategy.init).
+        contextStrategy = try c.decodeIfPresent(ContextStrategy.self, forKey: .contextStrategy) ?? .full
     }
 }
 
@@ -196,6 +190,15 @@ enum PromptBuilder {
 
         return parts.joined(separator: "\n\n")
     }
+}
+
+/// Ветка диалога (стратегия .branching): независимая линия сообщений,
+/// разделяющая общий префикс до чекпоинта с другими ветками.
+struct ChatBranch: Identifiable, Codable {
+    var id = UUID()
+    var name: String
+    var messages: [ChatMessage]
+    var facts: String = ""
 }
 
 /// Отдельный чат со своим контекстом (историей), тайтлом, состоянием и настройками.
@@ -225,8 +228,12 @@ struct Chat: Identifiable, Codable {
     var summarizedUpTo: Int = 0
     /// Блок «факты» (стратегия .stickyFacts) — ключ-значение, накапливается.
     var facts: String = ""
-    /// Runtime-флаги фоновой обработки (не сохраняются).
-    var isSummarizing: Bool = false
+    /// Ветвление (.branching): все ветки + активная. activeBranchID == nil —
+    /// ветвление ещё не создано (обычная линейная история в messages).
+    /// Инвариант при ветвлении: messages == активная ветка (зеркало).
+    var branches: [ChatBranch] = []
+    var activeBranchID: UUID? = nil
+    /// Runtime-флаг обновления фактов (не сохраняется).
     var isUpdatingFacts: Bool = false
 
     /// На диск уходят только данные диалога; runtime-состояние (isLoading,
@@ -234,6 +241,7 @@ struct Chat: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, title, messages, settings, promptTokens, completionTokens, totalTokens, totalCost
         case summaryTokens, summaryCost, summary, summarizedUpTo, facts
+        case branches, activeBranchID
     }
 }
 
@@ -254,6 +262,8 @@ extension Chat {
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         summarizedUpTo = try c.decodeIfPresent(Int.self, forKey: .summarizedUpTo) ?? 0
         facts = try c.decodeIfPresent(String.self, forKey: .facts) ?? ""
+        branches = try c.decodeIfPresent([ChatBranch].self, forKey: .branches) ?? []
+        activeBranchID = try c.decodeIfPresent(UUID.self, forKey: .activeBranchID)
     }
 }
 

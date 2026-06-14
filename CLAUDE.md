@@ -31,15 +31,18 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
 
 - **API stateless** — «память» модели = повторная отправка истории чата в
   каждом запросе. Из-за этого promptTokens растут с каждым сообщением.
-- **Стратегии контекста** — GenerationSettings.contextStrategy (full / summary /
-  slidingWindow / stickyFacts). Что слать модели решает `ContextManager.payload`
-  (общий для чата и сравнения). Фоновая поддержка: summary → maybeCompact
-  (client.summarize), stickyFacts → maybeUpdateFacts (client.updateFacts);
-  обе той же моделью чата. Состояние: Chat.summary/summarizedUpTo и Chat.facts
-  персистятся; isSummarizing/isUpdatingFacts — runtime. Миграция: старый
-  compactionEnabled → contextStrategy в GenerationSettings.init(from:).
-- **Ветвление** — ChatViewModel.branch форкает чат от сообщения-чекпоинта в
-  новый чат-ветку (копия префикса + настроек); переключение веток = сайдбар.
+- **Стратегии контекста** (по ТЗ) — GenerationSettings.contextStrategy:
+  full / slidingWindow / stickyFacts / branching. Что слать решает
+  `ContextManager.payload` (full и branching → вся активная история; sliding →
+  последние N; stickyFacts → facts + последние N). Первые три — и в сравнении
+  (ContextStrategy.sendStrategies). stickyFacts фоном обновляет Chat.facts через
+  client.updateFacts (maybeUpdateFacts). ВАЖНО: стратегия декодируется
+  снисходительно (ContextStrategy.init(from:) → unknown/«summary» = .full),
+  иначе старый chats.json падает.
+- **Ветвление (branching)** — в чате: Chat.branches/activeBranchID, messages =
+  зеркало активной ветки (mirrorActiveBranch синхронизирует). makeBranchFrom
+  создаёт 2 ветки от чекпоинта, switchBranch переключает; панель веток над
+  лентой. В сравнении ветвления НЕТ (структурная стратегия).
 - **Миграция chats.json** — у Chat и GenerationSettings РУЧНЫЕ init(from:)
   в extension с decodeIfPresent+дефолтами. Новые поля добавлять ТОЛЬКО так,
   иначе старый файл перестанет декодироваться (уйдёт в .corrupt.json).
