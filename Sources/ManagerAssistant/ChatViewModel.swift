@@ -212,7 +212,7 @@ final class ChatViewModel: ObservableObject {
             chats[idx].title = Self.makeTitle(from: text)
         }
 
-        chats[idx].messages.append(ChatMessage(role: .user, content: text))
+        addMessage(idx, role: .user, content: text)
         chats[idx].errorText = nil
         chats[idx].isLoading = true
         input = ""
@@ -240,13 +240,12 @@ final class ChatViewModel: ObservableObject {
                     completionCost: price.map { Double(result.completionTokens) * $0.completionPerToken }
                 )
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
-                    chats[i].messages.append(ChatMessage(role: .assistant, content: result.text, metrics: metrics))
+                    addMessage(i, role: .assistant, content: result.text, metrics: metrics)
                     chats[i].promptTokens += result.promptTokens
                     chats[i].completionTokens += result.completionTokens
                     chats[i].totalTokens += result.totalTokens
                     chats[i].totalCost += metrics.totalCost ?? 0
                     chats[i].isLoading = false
-                    mirrorActiveBranch(i)
                     maybeUpdateFacts(chatID: chatID)
                 }
             } catch {
@@ -290,7 +289,6 @@ final class ChatViewModel: ObservableObject {
                         chats[j].totalCost += cost
                         chats[j].summaryCost += cost
                     }
-                    mirrorActiveBranch(j)
                     chats[j].isUpdatingFacts = false
                 }
             } catch {
@@ -301,81 +299,119 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Ветвление (стратегия .branching)
-
-    /// Чекпоинт + создание веток от сообщения messageID.
-    /// Первый вызов делает 2 ветки от одной точки: «Ветка 1» = текущее продолжение,
-    /// «Ветка 2» = копия истории до чекпоинта (для независимого продолжения).
-    /// Последующие вызовы добавляют ещё одну ветку от чекпоинта активной ветки.
-    func makeBranchFrom(chatID: UUID, messageID: UUID) {
-        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
-              let mi = chats[ci].messages.firstIndex(where: { $0.id == messageID }) else { return }
-        let prefix = Array(chats[ci].messages[0...mi])
-
-        if chats[ci].branches.isEmpty {
-            let current = ChatBranch(name: "Ветка 1", messages: chats[ci].messages, facts: chats[ci].facts)
-            let fork = ChatBranch(name: "Ветка 2", messages: prefix, facts: chats[ci].facts)
-            chats[ci].branches = [current, fork]
-            chats[ci].activeBranchID = current.id   // остаёмся в текущем продолжении
-        } else {
-            mirrorActiveBranch(ci)
-            let fork = ChatBranch(name: "Ветка \(chats[ci].branches.count + 1)", messages: prefix, facts: chats[ci].facts)
-            chats[ci].branches.append(fork)
-            chats[ci].activeBranchID = fork.id      // переключаемся на новую ветку
-            chats[ci].messages = fork.messages
-            chats[ci].facts = fork.facts
-        }
-    }
-
-    /// Переключение между ветками: текущую сохраняем, целевую загружаем.
-    func switchBranch(chatID: UUID, branchID: UUID) {
-        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
-              chats[ci].activeBranchID != branchID,
-              let ti = chats[ci].branches.firstIndex(where: { $0.id == branchID }) else { return }
-        mirrorActiveBranch(ci)
-        chats[ci].activeBranchID = branchID
-        chats[ci].messages = chats[ci].branches[ti].messages
-        chats[ci].facts = chats[ci].branches[ti].facts
-    }
-
     /// Ручное редактирование блока фактов (стратегия .stickyFacts).
     func setFacts(chatID: UUID, _ text: String) {
         guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
         chats[i].facts = text
-        mirrorActiveBranch(i)
     }
 
-    /// Удаляет ветку. Если удаляем активную — переключаемся на оставшуюся.
-    /// Когда веток остаётся ≤1, ветвление схлопывается обратно в линейную историю.
-    func deleteBranch(chatID: UUID, branchID: UUID) {
-        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
-              let ti = chats[ci].branches.firstIndex(where: { $0.id == branchID }) else { return }
-        mirrorActiveBranch(ci)                       // зафиксировать живую активную ветку
-        let wasActive = chats[ci].activeBranchID == branchID
-        chats[ci].branches.remove(at: ti)
+    // MARK: - Ветвление (стратегия .branching) — дерево узлов с общим префиксом
 
-        if chats[ci].branches.count <= 1 {
-            // Схлопываем: оставшаяся ветка (если есть) становится обычной историей.
-            if let only = chats[ci].branches.first {
-                chats[ci].messages = only.messages
-                chats[ci].facts = only.facts
-            }
-            chats[ci].branches = []
-            chats[ci].activeBranchID = nil
-        } else if wasActive {
-            let survivor = chats[ci].branches[0]
-            chats[ci].activeBranchID = survivor.id
-            chats[ci].messages = survivor.messages
-            chats[ci].facts = survivor.facts
+    /// Добавляет сообщение узлом под текущим tip (сохраняя дерево/ветки).
+    private func addMessage(_ ci: Int, role: ChatRole, content: String, metrics: MessageMetrics? = nil) {
+        let node = MsgNode(id: UUID(), parentID: chats[ci].currentTipID, role: role, content: content, metrics: metrics)
+        chats[ci].nodes.append(node)
+        chats[ci].currentTipID = node.id
+        // Активная ветка следует за новым сообщением.
+        if let active = chats[ci].activeLeafID,
+           let li = chats[ci].branchLeaves.firstIndex(where: { $0.id == active }) {
+            chats[ci].branchLeaves[li].tipID = node.id
         }
     }
 
-    /// Синхронизирует messages/facts активного чата в его ветку (инвариант зеркала).
-    private func mirrorActiveBranch(_ chatIndex: Int) {
-        guard let active = chats[chatIndex].activeBranchID,
-              let bi = chats[chatIndex].branches.firstIndex(where: { $0.id == active }) else { return }
-        chats[chatIndex].branches[bi].messages = chats[chatIndex].messages
-        chats[chatIndex].branches[bi].facts = chats[chatIndex].facts
+    /// Путь от узла к корню (id'ы в порядке корень→tip).
+    private func pathIDs(_ chat: Chat, tip: UUID?) -> [UUID] {
+        let byID = Dictionary(chat.nodes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var ids: [UUID] = []
+        var cur = tip
+        while let id = cur, let n = byID[id] { ids.append(id); cur = n.parentID }
+        return ids.reversed()
+    }
+
+    /// Чекпоинт + 2 ветки от сообщения messageID. Узлы общего префикса НЕ копируются —
+    /// ветки просто указывают на разные tip'ы дерева.
+    func makeBranchFrom(chatID: UUID, messageID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              chats[ci].nodes.contains(where: { $0.id == messageID }) else { return }
+
+        if chats[ci].branchLeaves.isEmpty {
+            let current = BranchLeaf(name: "Ветка 1", tipID: chats[ci].currentTipID) // текущее продолжение
+            let fork = BranchLeaf(name: "Ветка 2", tipID: messageID)                 // от чекпоинта
+            chats[ci].branchLeaves = [current, fork]
+            chats[ci].activeLeafID = current.id
+            chats[ci].currentTipID = current.tipID
+        } else {
+            let fork = BranchLeaf(name: "Ветка \(chats[ci].branchLeaves.count + 1)", tipID: messageID)
+            chats[ci].branchLeaves.append(fork)
+            chats[ci].activeLeafID = fork.id
+            chats[ci].currentTipID = messageID
+        }
+    }
+
+    /// Переключение между ветками — просто меняем активный tip.
+    func switchBranch(chatID: UUID, branchID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              let leaf = chats[ci].branchLeaves.first(where: { $0.id == branchID }) else { return }
+        chats[ci].activeLeafID = branchID
+        chats[ci].currentTipID = leaf.tipID
+    }
+
+    /// Удаляет ветку. При ≤1 оставшейся — схлопываемся в линейную историю.
+    /// Узлы, ни на одну ветку/текущий tip не ведущие, подчищаются.
+    func deleteBranch(chatID: UUID, branchID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              let ti = chats[ci].branchLeaves.firstIndex(where: { $0.id == branchID }) else { return }
+        let wasActive = chats[ci].activeLeafID == branchID
+        chats[ci].branchLeaves.remove(at: ti)
+
+        if chats[ci].branchLeaves.count <= 1 {
+            if let only = chats[ci].branchLeaves.first {
+                chats[ci].currentTipID = only.tipID
+            }
+            chats[ci].branchLeaves = []
+            chats[ci].activeLeafID = nil
+        } else if wasActive {
+            let survivor = chats[ci].branchLeaves[0]
+            chats[ci].activeLeafID = survivor.id
+            chats[ci].currentTipID = survivor.tipID
+        }
+        pruneOrphanNodes(ci)
+    }
+
+    /// Влить ветку в активную: расходящийся хвост ветки копируется в конец активной.
+    func mergeBranch(chatID: UUID, sourceBranchID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              chats[ci].activeLeafID != sourceBranchID,
+              let source = chats[ci].branchLeaves.first(where: { $0.id == sourceBranchID }) else { return }
+        let srcPath = pathIDs(chats[ci], tip: source.tipID)
+        let actPath = pathIDs(chats[ci], tip: chats[ci].currentTipID)
+        var k = 0
+        while k < srcPath.count, k < actPath.count, srcPath[k] == actPath[k] { k += 1 }
+        let tail = Array(srcPath[k...])
+        guard !tail.isEmpty else { return }
+
+        let byID = Dictionary(chats[ci].nodes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var parent = chats[ci].currentTipID
+        for tid in tail {
+            guard let n = byID[tid] else { continue }
+            let copy = MsgNode(id: UUID(), parentID: parent, role: n.role, content: n.content, metrics: n.metrics)
+            chats[ci].nodes.append(copy)
+            parent = copy.id
+        }
+        chats[ci].currentTipID = parent
+        if let active = chats[ci].activeLeafID,
+           let li = chats[ci].branchLeaves.firstIndex(where: { $0.id == active }) {
+            chats[ci].branchLeaves[li].tipID = parent
+        }
+    }
+
+    /// Оставляет только узлы, достижимые от какого-либо tip (ветки/текущий).
+    private func pruneOrphanNodes(_ ci: Int) {
+        var tips = chats[ci].branchLeaves.compactMap { $0.tipID }
+        if let cur = chats[ci].currentTipID { tips.append(cur) }
+        var keep = Set<UUID>()
+        for t in tips { for id in pathIDs(chats[ci], tip: t) { keep.insert(id) } }
+        chats[ci].nodes.removeAll { !keep.contains($0.id) }
     }
 
     // MARK: - Видимость усечения контекста

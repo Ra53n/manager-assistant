@@ -39,10 +39,15 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   client.updateFacts (maybeUpdateFacts). ВАЖНО: стратегия декодируется
   снисходительно (ContextStrategy.init(from:) → unknown/«summary» = .full),
   иначе старый chats.json падает.
-- **Ветвление (branching)** — в чате: Chat.branches/activeBranchID, messages =
-  зеркало активной ветки (mirrorActiveBranch синхронизирует). makeBranchFrom
-  создаёт 2 ветки от чекпоинта, switchBranch переключает; панель веток над
-  лентой. В сравнении ветвления НЕТ (структурная стратегия).
+- **Ветвление (branching)** — ДЕРЕВО узлов: Chat.nodes ([MsgNode] с parentID),
+  Chat.currentTipID; Chat.messages — COMPUTED путь от tip к корню (общий префикс
+  не дублируется). Именованные ветки = Chat.branchLeaves ([BranchLeaf {name,tipID}])
+  + activeLeafID. Добавление сообщения — ТОЛЬКО через addMessage (узел под tip),
+  не messages.append (сеттер messages перестроил бы дерево линейно и снёс ветки!).
+  makeBranchFrom (2 ветки от чекпоинта), switchBranch (сменить tip), deleteBranch
+  (+pruneOrphanNodes), mergeBranch (копирует расходящийся хвост). Миграция старого
+  линейного messages → дерево в Chat.init(from:) (LegacyKeys.messages). В сравнении
+  ветвления НЕТ.
 - **Миграция chats.json** — у Chat и GenerationSettings РУЧНЫЕ init(from:)
   в extension с decodeIfPresent+дефолтами. Новые поля добавлять ТОЛЬКО так,
   иначе старый файл перестанет декодироваться (уйдёт в .corrupt.json).

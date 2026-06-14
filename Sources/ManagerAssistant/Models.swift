@@ -192,13 +192,21 @@ enum PromptBuilder {
     }
 }
 
-/// Ветка диалога (стратегия .branching): независимая линия сообщений,
-/// разделяющая общий префикс до чекпоинта с другими ветками.
-struct ChatBranch: Identifiable, Codable {
+/// Узел дерева сообщений (стратегия .branching). Ветки разделяют общие узлы:
+/// общий префикс хранится один раз, ветки расходятся дочерними узлами.
+struct MsgNode: Identifiable, Codable {
+    var id = UUID()
+    var parentID: UUID?
+    var role: ChatRole
+    var content: String
+    var metrics: MessageMetrics?
+}
+
+/// Именованная ветка = указатель на «кончик» (leaf) ветки в дереве узлов.
+struct BranchLeaf: Identifiable, Codable {
     var id = UUID()
     var name: String
-    var messages: [ChatMessage]
-    var facts: String = ""
+    var tipID: UUID?       // последний узел этой ветки
 }
 
 /// Отдельный чат со своим контекстом (историей), тайтлом, состоянием и настройками.
@@ -206,10 +214,38 @@ struct ChatBranch: Identifiable, Codable {
 struct Chat: Identifiable, Codable {
     var id = UUID()
     var title: String
-    var messages: [ChatMessage] = []
+    /// Сообщения хранятся как дерево узлов; активная история — путь от tip к корню.
+    var nodes: [MsgNode] = []
+    var currentTipID: UUID? = nil
     var isLoading: Bool = false
     var errorText: String? = nil
     var settings = GenerationSettings()
+
+    /// Активная история (вычисляется из дерева): путь от currentTipID к корню.
+    var messages: [ChatMessage] {
+        get {
+            guard !nodes.isEmpty else { return [] }
+            let byID = Dictionary(nodes.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            var result: [ChatMessage] = []
+            var cur = currentTipID
+            while let id = cur, let n = byID[id] {
+                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics))
+                cur = n.parentID
+            }
+            return result.reversed()
+        }
+        set {
+            // Перестроить дерево из линейного массива (используется при создании чата).
+            nodes = []
+            var parent: UUID? = nil
+            for m in newValue {
+                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics)
+                nodes.append(node)
+                parent = node.id
+            }
+            currentTipID = parent
+        }
+    }
 
     /// Накопленный расход токенов по этому чату (суммарно за все запросы,
     /// ВКЛЮЧАЯ фоновые запросы саммаризации).
@@ -228,21 +264,21 @@ struct Chat: Identifiable, Codable {
     var summarizedUpTo: Int = 0
     /// Блок «факты» (стратегия .stickyFacts) — ключ-значение, накапливается.
     var facts: String = ""
-    /// Ветвление (.branching): все ветки + активная. activeBranchID == nil —
-    /// ветвление ещё не создано (обычная линейная история в messages).
-    /// Инвариант при ветвлении: messages == активная ветка (зеркало).
-    var branches: [ChatBranch] = []
-    var activeBranchID: UUID? = nil
+    /// Ветвление (.branching): именованные ветки (указатели на узлы дерева) +
+    /// активная. Пусто — ветвление ещё не создано (линейная история).
+    var branchLeaves: [BranchLeaf] = []
+    var activeLeafID: UUID? = nil
     /// Runtime-флаг обновления фактов (не сохраняется).
     var isUpdatingFacts: Bool = false
 
-    /// На диск уходят только данные диалога; runtime-состояние (isLoading,
-    /// errorText, isSummarizing) не сохраняется.
+    /// На диск — данные диалога (дерево узлов); runtime-состояние не сохраняется.
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, settings, promptTokens, completionTokens, totalTokens, totalCost
+        case id, title, nodes, currentTipID, settings, promptTokens, completionTokens, totalTokens, totalCost
         case summaryTokens, summaryCost, summary, summarizedUpTo, facts
-        case branches, activeBranchID
+        case branchLeaves, activeLeafID
     }
+    /// Старый ключ — линейный массив сообщений (миграция в дерево).
+    enum LegacyKeys: String, CodingKey { case messages }
 }
 
 /// Миграционно-устойчивое декодирование (см. комментарий у GenerationSettings).
@@ -251,7 +287,6 @@ extension Chat {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? "Новый чат"
-        messages = try c.decodeIfPresent([ChatMessage].self, forKey: .messages) ?? []
         settings = try c.decodeIfPresent(GenerationSettings.self, forKey: .settings) ?? GenerationSettings()
         promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens) ?? 0
         completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
@@ -262,8 +297,17 @@ extension Chat {
         summary = try c.decodeIfPresent(String.self, forKey: .summary) ?? ""
         summarizedUpTo = try c.decodeIfPresent(Int.self, forKey: .summarizedUpTo) ?? 0
         facts = try c.decodeIfPresent(String.self, forKey: .facts) ?? ""
-        branches = try c.decodeIfPresent([ChatBranch].self, forKey: .branches) ?? []
-        activeBranchID = try c.decodeIfPresent(UUID.self, forKey: .activeBranchID)
+        branchLeaves = try c.decodeIfPresent([BranchLeaf].self, forKey: .branchLeaves) ?? []
+        activeLeafID = try c.decodeIfPresent(UUID.self, forKey: .activeLeafID)
+
+        if let nodes = try c.decodeIfPresent([MsgNode].self, forKey: .nodes) {
+            self.nodes = nodes
+            currentTipID = try c.decodeIfPresent(UUID.self, forKey: .currentTipID) ?? nodes.last?.id
+        } else if let legacy = try? decoder.container(keyedBy: LegacyKeys.self),
+                  let old = try? legacy.decodeIfPresent([ChatMessage].self, forKey: .messages) {
+            // Миграция старого линейного массива в дерево.
+            self.messages = old
+        }
     }
 }
 

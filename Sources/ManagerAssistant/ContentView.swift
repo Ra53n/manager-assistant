@@ -318,12 +318,12 @@ struct ChatDetailView: View {
     private var branchBar: some View {
         if let chat = vm.selectedChat,
            chat.settings.contextStrategy == .branching,
-           !chat.branches.isEmpty {
+           !chat.branchLeaves.isEmpty {
             HStack(spacing: 6) {
                 Image(systemName: "arrow.triangle.branch")
                     .foregroundColor(.secondary)
-                ForEach(chat.branches) { b in
-                    let active = b.id == chat.activeBranchID
+                ForEach(chat.branchLeaves) { b in
+                    let active = b.id == chat.activeLeafID
                     HStack(spacing: 2) {
                         Button(b.name) {
                             vm.switchBranch(chatID: chat.id, branchID: b.id)
@@ -331,6 +331,16 @@ struct ChatDetailView: View {
                         .buttonStyle(.borderless)
                         .fontWeight(active ? .semibold : .regular)
                         .foregroundColor(active ? .accentColor : .secondary)
+                        if !active {
+                            Button {
+                                vm.mergeBranch(chatID: chat.id, sourceBranchID: b.id)
+                            } label: {
+                                Image(systemName: "arrow.triangle.merge")
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.secondary.opacity(0.6))
+                            .help("Влить ветку «\(b.name)» в активную")
+                        }
                         Button {
                             vm.deleteBranch(chatID: chat.id, branchID: b.id)
                         } label: {
