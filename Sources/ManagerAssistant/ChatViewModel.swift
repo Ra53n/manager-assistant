@@ -338,6 +338,38 @@ final class ChatViewModel: ObservableObject {
         chats[ci].facts = chats[ci].branches[ti].facts
     }
 
+    /// Ручное редактирование блока фактов (стратегия .stickyFacts).
+    func setFacts(chatID: UUID, _ text: String) {
+        guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
+        chats[i].facts = text
+        mirrorActiveBranch(i)
+    }
+
+    /// Удаляет ветку. Если удаляем активную — переключаемся на оставшуюся.
+    /// Когда веток остаётся ≤1, ветвление схлопывается обратно в линейную историю.
+    func deleteBranch(chatID: UUID, branchID: UUID) {
+        guard let ci = chats.firstIndex(where: { $0.id == chatID }),
+              let ti = chats[ci].branches.firstIndex(where: { $0.id == branchID }) else { return }
+        mirrorActiveBranch(ci)                       // зафиксировать живую активную ветку
+        let wasActive = chats[ci].activeBranchID == branchID
+        chats[ci].branches.remove(at: ti)
+
+        if chats[ci].branches.count <= 1 {
+            // Схлопываем: оставшаяся ветка (если есть) становится обычной историей.
+            if let only = chats[ci].branches.first {
+                chats[ci].messages = only.messages
+                chats[ci].facts = only.facts
+            }
+            chats[ci].branches = []
+            chats[ci].activeBranchID = nil
+        } else if wasActive {
+            let survivor = chats[ci].branches[0]
+            chats[ci].activeBranchID = survivor.id
+            chats[ci].messages = survivor.messages
+            chats[ci].facts = survivor.facts
+        }
+    }
+
     /// Синхронизирует messages/facts активного чата в его ветку (инвариант зеркала).
     private func mirrorActiveBranch(_ chatIndex: Int) {
         guard let active = chats[chatIndex].activeBranchID,

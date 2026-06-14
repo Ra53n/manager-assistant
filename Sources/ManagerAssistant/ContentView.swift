@@ -121,11 +121,13 @@ struct ContentView: View {
 struct ChatDetailView: View {
     @ObservedObject var vm: ChatViewModel
     @State private var showingSettings = false
+    @State private var showingFacts = false
 
     private var messages: [ChatMessage] { vm.selectedChat?.messages ?? [] }
     private var isLoading: Bool { vm.selectedChat?.isLoading ?? false }
     private var errorText: String? { vm.selectedChat?.errorText }
     private var branchingActive: Bool { vm.selectedChat?.settings.contextStrategy == .branching }
+    private var factsActive: Bool { vm.selectedChat?.settings.contextStrategy == .stickyFacts }
 
     /// Binding к настройкам выбранного чата.
     private var settingsBinding: Binding<GenerationSettings> {
@@ -162,6 +164,16 @@ struct ChatDetailView: View {
                 }
             }
             ToolbarItem(placement: .primaryAction) {
+                if factsActive {
+                    Button {
+                        showingFacts = true
+                    } label: {
+                        Image(systemName: "key")
+                    }
+                    .help("Память фактов: показать и изменить")
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
                 Button {
                     showingSettings = true
                 } label: {
@@ -172,6 +184,11 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingSettings) {
             ChatSettingsView(vm: vm, settings: settingsBinding)
+        }
+        .sheet(isPresented: $showingFacts) {
+            FactsEditorView(text: vm.selectedChat?.facts ?? "") { edited in
+                if let id = vm.selectedChatID { vm.setFacts(chatID: id, edited) }
+            }
         }
     }
 
@@ -238,7 +255,7 @@ struct ChatDetailView: View {
                 if chat.isUpdatingFacts {
                     bannerLine("Обновляю блок фактов…", system: nil, busy: true, sub: "", help: "")
                 } else if strat == .stickyFacts, !chat.facts.isEmpty {
-                    bannerLine("Память фактов активна — наведи, чтобы посмотреть",
+                    bannerLine("Память фактов активна — кнопка 🔑 в шапке, чтобы посмотреть/изменить",
                                system: "key", busy: false, sub: overhead, help: chat.facts)
                 } else if strat == .slidingWindow, chat.messages.count > chat.settings.historyWindow {
                     bannerLine("Скользящее окно: модель видит только последние \(chat.settings.historyWindow) сообщ.",
@@ -307,12 +324,23 @@ struct ChatDetailView: View {
                     .foregroundColor(.secondary)
                 ForEach(chat.branches) { b in
                     let active = b.id == chat.activeBranchID
-                    Button(b.name) {
-                        vm.switchBranch(chatID: chat.id, branchID: b.id)
+                    HStack(spacing: 2) {
+                        Button(b.name) {
+                            vm.switchBranch(chatID: chat.id, branchID: b.id)
+                        }
+                        .buttonStyle(.borderless)
+                        .fontWeight(active ? .semibold : .regular)
+                        .foregroundColor(active ? .accentColor : .secondary)
+                        Button {
+                            vm.deleteBranch(chatID: chat.id, branchID: b.id)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundColor(.secondary.opacity(0.5))
+                        .help("Удалить ветку «\(b.name)»")
                     }
-                    .buttonStyle(.borderless)
-                    .fontWeight(active ? .semibold : .regular)
-                    .foregroundColor(active ? .accentColor : .secondary)
+                    .padding(.trailing, 4)
                 }
                 Spacer()
                 Text("ветка отсюда — наведи на сообщение")
@@ -694,6 +722,53 @@ struct ModelPickerView: View {
             }
         }
         .frame(width: 480, height: 560)
+    }
+}
+
+/// Просмотр и редактирование блока «факты» (стратегия Sticky Facts).
+struct FactsEditorView: View {
+    @State var text: String
+    let onSave: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Память фактов")
+                    .font(.headline)
+                Spacer()
+                Button("Очистить") { text = "" }
+                Button("Сохранить") {
+                    onSave(text)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+
+            Divider()
+
+            if text.isEmpty {
+                Text("Пока фактов нет — они появятся после первых сообщений в режиме «Факты + окно».")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+
+            TextEditor(text: $text)
+                .font(.system(.body, design: .monospaced))
+                .padding(8)
+
+            Divider()
+
+            Label("Факты обновляются автоматически после каждого обмена. Твои правки сохранятся, но следующее автообновление может их переписать.",
+                  systemImage: "info.circle")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding()
+        }
+        .frame(width: 520, height: 460)
     }
 }
 
