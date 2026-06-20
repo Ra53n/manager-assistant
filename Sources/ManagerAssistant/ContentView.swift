@@ -219,6 +219,7 @@ struct ChatDetailView: View {
     @State private var showingFacts = false
     @State private var showingMemory = false
     @State private var showingProjectPanel = false
+    @State private var showingInvariants = false
     /// Черновик записи памяти (сохранение из сообщения / добавление вручную).
     @State private var memoryDraft: MemoryDraft?
     /// Черновик секции проекта (сохранение сообщения «В проект»).
@@ -252,6 +253,7 @@ struct ChatDetailView: View {
             messagesList
             Divider()
             errorBar
+            invariantConflictBar
             truncationBar
             pipelineModeBar
             inputBar
@@ -292,6 +294,15 @@ struct ChatDetailView: View {
                     .help("Проект: инструкции, секции, «Собрать»")
                 }
                 Button {
+                    showingInvariants = true
+                } label: {
+                    Image(systemName: "checkmark.shield")
+                        .foregroundStyle((vm.selectedChat.map { vm.effectiveInvariants(for: $0).isEmpty } ?? true)
+                                         ? Color.secondary : Color.accentColor)
+                }
+                .help("Инварианты: ограничения (стек/архитектура/бюджет/запреты/правила)")
+
+                Button {
                     showingMemory = true
                 } label: {
                     Image(systemName: "brain")
@@ -318,6 +329,9 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingMemory) {
             MemoryPanelView(vm: vm)
+        }
+        .sheet(isPresented: $showingInvariants) {
+            InvariantsPanelView(vm: vm)
         }
         .sheet(isPresented: $showingProjectPanel) {
             if let p = attachedProject {
@@ -506,6 +520,34 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Баннер конфликта инвариантов
+
+    /// Запрос пользователя нарушает инвариант — агент отказал и предложил альтернативу.
+    @ViewBuilder
+    private var invariantConflictBar: some View {
+        if let chat = vm.selectedChat, let conflict = chat.invariantConflict {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .foregroundColor(.orange)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Конфликт с инвариантом — решение, нарушающее ограничение, не предложено.")
+                        .fontWeight(.medium)
+                    Text(conflict).foregroundColor(.secondary)
+                }
+                Spacer()
+                Button {
+                    if let id = vm.selectedChatID { vm.clearInvariantConflict(chatID: id) }
+                } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless)
+                .foregroundColor(.secondary.opacity(0.6))
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.orange.opacity(0.12))
+        }
+    }
+
     // MARK: - Ветвление: панель веток над лентой
 
     @ViewBuilder
@@ -563,24 +605,43 @@ struct ChatDetailView: View {
     /// текущего + кнопки управления (пауза/продолжить/принять план/…).
     @ViewBuilder
     private var pipelineBar: some View {
-        if let chat = vm.selectedChat, let run = chat.taskRun {
+        if let chat = vm.selectedChat, let run = chat.taskContext {
             VStack(spacing: 4) {
                 HStack(spacing: 6) {
                     Image(systemName: "list.number")
                         .foregroundColor(.secondary)
-                    ForEach(Array(TaskPhase.allCases.enumerated()), id: \.element) { idx, ph in
-                        phaseChip(ph, run: run)
-                        if idx < TaskPhase.allCases.count - 1 {
+                    ForEach(Array(TaskState.allCases.enumerated()), id: \.element) { idx, st in
+                        stateChip(st, run: run)
+                        if idx < TaskState.allCases.count - 1 {
                             Image(systemName: "arrow.right")
                                 .font(.caption2)
                                 .foregroundColor(.secondary.opacity(0.4))
                         }
+                    }
+                    // Прогресс шагов внутри Выполнения.
+                    if run.state == .execution, run.total > 0 {
+                        Text("шаг \(min(run.step + 1, run.total))/\(run.total)")
+                            .font(.caption2)
+                            .foregroundColor(.accentColor)
+                            .help("Текущий шаг плана")
                     }
                     if run.executionRetries > 0 {
                         Text("↻\(run.executionRetries)")
                             .font(.caption2)
                             .foregroundColor(.orange)
                             .help("Возвратов «Проверка → Выполнение»: \(run.executionRetries)")
+                    }
+                    if run.planRetries > 0 {
+                        Text("⤺\(run.planRetries)")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                            .help("Возвратов «Выполнение → Планирование»: \(run.planRetries)")
+                    }
+                    if run.invariantRetries > 0 {
+                        Text("⚠\(run.invariantRetries)")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                            .help("Перегенераций из-за нарушения инвариантов: \(run.invariantRetries)")
                     }
                     Spacer()
                     pipelineControls(chat: chat, run: run)
@@ -601,34 +662,34 @@ struct ChatDetailView: View {
 
     private enum PhaseChipState { case done, current, upcoming }
 
-    private func phaseChipState(_ phase: TaskPhase, run: TaskRun) -> PhaseChipState {
+    private func stateChipState(_ s: TaskState, run: TaskContext) -> PhaseChipState {
         if run.status == .finished { return .done }
-        let order = TaskPhase.allCases
-        guard let pi = order.firstIndex(of: phase),
-              let ci = order.firstIndex(of: run.phase) else { return .upcoming }
+        let order = TaskState.allCases
+        guard let pi = order.firstIndex(of: s),
+              let ci = order.firstIndex(of: run.state) else { return .upcoming }
         if pi < ci { return .done }
         if pi == ci { return .current }
         return .upcoming
     }
 
     @ViewBuilder
-    private func phaseChip(_ phase: TaskPhase, run: TaskRun) -> some View {
-        let state = phaseChipState(phase, run: run)
+    private func stateChip(_ s: TaskState, run: TaskContext) -> some View {
+        let cs = stateChipState(s, run: run)
         HStack(spacing: 3) {
-            if state == .done {
+            if cs == .done {
                 Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-            } else if state == .current, run.status == .running {
+            } else if cs == .current, run.status == .running {
                 ProgressView().controlSize(.mini)
             }
-            Text(phase.label)
-                .fontWeight(state == .current ? .semibold : .regular)
-                .foregroundColor(state == .current ? .accentColor
-                                 : (state == .done ? .primary : .secondary))
+            Text(s.label)
+                .fontWeight(cs == .current ? .semibold : .regular)
+                .foregroundColor(cs == .current ? .accentColor
+                                 : (cs == .done ? .primary : .secondary))
         }
     }
 
     @ViewBuilder
-    private func pipelineControls(chat: Chat, run: TaskRun) -> some View {
+    private func pipelineControls(chat: Chat, run: TaskContext) -> some View {
         HStack(spacing: 10) {
             switch run.status {
             case .running:
@@ -664,6 +725,15 @@ struct ChatDetailView: View {
                     Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
                     Text("Готово").foregroundColor(.green)
                 }
+            }
+            // Ручной шаг назад «Выполнение → Планирование» (легальный переход по таблице).
+            if run.state == .execution, run.status == .running || run.status == .paused,
+               run.planRetries < TaskContext.maxPlanRetries {
+                Button { vm.requestReplan(chatID: chat.id) } label: {
+                    Label("Перепланировать", systemImage: "arrow.uturn.backward")
+                }
+                .buttonStyle(.borderless)
+                .help("Шаг назад: вернуться к планированию")
             }
             Button { vm.cancelRun(chatID: chat.id) } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -969,7 +1039,18 @@ struct ChatSettingsView: View {
                             Text(m.label).tag(m)
                         }
                     }
-                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskRun.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент.")
+                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskContext.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("Инварианты — проверка ответа") {
+                    Picker("Метод валидации", selection: $settings.invariantValidation) {
+                        ForEach(InvariantValidationMode.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
+                    }
+                    Text("Сами ограничения — кнопка «щит» в шапке (стек/архитектура/бюджет/запреты/правила). Выкл — инварианты только в промпте. Код — проверка по вхождению запрещённых слов + маркер модели. LLM — доп. запрос-проверяющий. Оба — и то, и другое. Валидируется каждый ответ; при нарушении модели — перегенерация (до \(TaskContext.maxInvariantRetries) раз).")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1705,6 +1786,182 @@ struct ProjectEntryEditorView: View {
     }
 }
 
+// MARK: - Инварианты (ограничения) — панель и редактор
+
+struct InvariantsPanelView: View {
+    @ObservedObject var vm: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var editTarget: Invariant?
+
+    private var chat: Chat? { vm.selectedChat }
+    private var hasProject: Bool { chat?.projectID != nil }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Инварианты").font(.headline)
+                Spacer()
+                Menu {
+                    ForEach(Invariant.templates()) { t in
+                        Button("\(t.kind.title): \(t.name)") {
+                            var inv = t
+                            inv.id = UUID(); inv.scope = .global; inv.ownerID = nil
+                            editTarget = inv
+                        }
+                    }
+                } label: { Label("Шаблон", systemImage: "square.grid.2x2") }
+                Button { editTarget = Invariant() } label: { Label("Новый", systemImage: "plus") }
+                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                scopeSection("Глобальные — во всех чатах", scope: .global)
+                if hasProject { scopeSection("Проект — во всех чатах проекта", scope: .project) }
+                scopeSection("Этот чат", scope: .chat)
+                Section {
+                    Text("Инварианты обязательны: агент учитывает их в рассуждениях и отказывается предлагать нарушающие решения. Метод проверки ответа — в ⚙ настройках чата (Выкл/Код/LLM/Оба). Хранятся отдельно от диалога (invariants.json).")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 600, height: 600)
+        .sheet(item: $editTarget) { inv in
+            InvariantEditorView(invariant: inv, hasProject: hasProject) { edited in
+                var e = edited
+                e.ownerID = ownerID(for: e.scope)
+                if vm.invariants.contains(where: { $0.id == e.id }) { vm.updateInvariant(e) }
+                else { vm.addInvariant(e) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func scopeSection(_ title: String, scope: InvariantScope) -> some View {
+        let items = vm.invariants.filter { $0.scope == scope && ownerMatches($0, scope) }
+        Section(title) {
+            if items.isEmpty {
+                Text("—").foregroundColor(.secondary).font(.caption)
+            }
+            ForEach(items) { inv in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: inv.enabled ? "checkmark.shield.fill" : "shield.slash")
+                        .foregroundColor(inv.enabled ? .accentColor : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(inv.name.isEmpty ? inv.kind.title : inv.name).fontWeight(.medium)
+                        Text(inv.description).font(.caption).foregroundColor(.secondary).lineLimit(3)
+                        Text("\(inv.kind.title) · защита: \(inv.enforcement.label)")
+                            .font(.caption2).foregroundColor(.secondary.opacity(0.8))
+                    }
+                    Spacer()
+                    Button("Править") { editTarget = inv }.buttonStyle(.borderless)
+                    Button { vm.removeInvariant(id: inv.id) } label: { Image(systemName: "trash") }
+                        .buttonStyle(.borderless).foregroundColor(.secondary)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
+    private func ownerMatches(_ inv: Invariant, _ scope: InvariantScope) -> Bool {
+        switch scope {
+        case .global: return true
+        case .project: return inv.ownerID == chat?.projectID
+        case .chat: return inv.ownerID == chat?.id
+        }
+    }
+    private func ownerID(for scope: InvariantScope) -> UUID? {
+        switch scope {
+        case .global: return nil
+        case .project: return chat?.projectID
+        case .chat: return chat?.id
+        }
+    }
+}
+
+struct InvariantEditorView: View {
+    @State var invariant: Invariant
+    var hasProject: Bool = false
+    let onSave: (Invariant) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var allowedStr = ""
+    @State private var bannedStr = ""
+
+    private var needsBanned: Bool { [.stack, .noBanned, .custom].contains(invariant.kind) }
+    private var needsNote: Bool { [.arch, .budget, .techDecision, .businessRule, .custom].contains(invariant.kind) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Инвариант").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") {
+                    invariant.allowed = parseList(allowedStr)
+                    invariant.banned = parseList(bannedStr)
+                    onSave(invariant); dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Тип и область") {
+                    Picker("Тип", selection: $invariant.kind) {
+                        ForEach(InvariantKind.allCases) { Text($0.title).tag($0) }
+                    }
+                    Picker("Область", selection: $invariant.scope) {
+                        ForEach(InvariantScope.allCases) { sc in
+                            if sc != .project || hasProject { Text(sc.label).tag(sc) }
+                        }
+                    }
+                    Picker("Защита", selection: $invariant.enforcement) {
+                        ForEach(InvariantEnforcement.allCases) { Text($0.label).tag($0) }
+                    }
+                    Toggle("Включён", isOn: $invariant.enabled)
+                }
+                Section("Параметры") {
+                    TextField("Название", text: $invariant.name, prompt: Text("StackOnly / NoRxJava / Auth=JWT"))
+                    if invariant.kind == .stack {
+                        TextField("Разрешено (через запятую)", text: $allowedStr, prompt: Text("Kotlin, Ktor"))
+                    }
+                    if needsBanned {
+                        TextField("Запрещённые слова — код-проверка (через запятую)", text: $bannedStr,
+                                  prompt: Text("Spring Boot, Java, RxJava"))
+                    }
+                    if invariant.kind == .maxDeps {
+                        Stepper(value: $invariant.maxDeps, in: 1...50) {
+                            HStack { Text("Максимум зависимостей"); Spacer()
+                                Text("\(invariant.maxDeps)").foregroundColor(.secondary).monospacedDigit() }
+                        }
+                    }
+                    if needsNote {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Описание правила").font(.caption).foregroundColor(.secondary)
+                            TextEditor(text: $invariant.note).frame(minHeight: 80).font(.body)
+                        }
+                    }
+                }
+                Section("Как увидит агент") {
+                    Text(invariant.description).font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 560, height: 560)
+        .onAppear {
+            allowedStr = invariant.allowed.joined(separator: ", ")
+            bannedStr = invariant.banned.joined(separator: ", ")
+        }
+    }
+
+    private func parseList(_ s: String) -> [String] {
+        s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+}
+
 /// Лист создания проекта: только название + необязательные инструкции.
 /// Никакого «ИИ предлагает бриф» — назвал и сразу пишешь.
 struct ProjectCreateView: View {
@@ -1907,10 +2164,19 @@ struct MessageBubble: View {
 
     private var isUser: Bool { message.role == .user }
 
+    /// Текст метки этапа; для «Выполнения» добавляет номер шага.
+    private func stateBadge(state: TaskState, step: Int?, total: Int?) -> String {
+        if state == .execution, let step, let total, total > 0 {
+            return "\(state.label) · шаг \(step + 1)/\(total)"
+        }
+        return state.label
+    }
+
     var body: some View {
         VStack(alignment: isUser ? .trailing : .leading, spacing: 3) {
-            if !isUser, let phase = message.phase {
-                Text(phase.label)
+            if !isUser, let state = message.state {
+                // Метка этапа FSM; для «Выполнения» — с номером шага.
+                Text(stateBadge(state: state, step: message.step, total: message.total))
                     .font(.caption2)
                     .fontWeight(.medium)
                     .foregroundColor(.accentColor)

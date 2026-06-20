@@ -76,6 +76,39 @@ struct DeepSeekClient {
         )
     }
 
+    /// Доп. запрос-валидатор инвариантов: проверяет ОТВЕТ на список ограничений и
+    /// возвращает нарушенные (парсит строки «НАРУШЕН: <название>»). Best-effort.
+    func checkInvariants(response: String, invariants: [Invariant], settings: GenerationSettings) async throws -> [InvariantViolation] {
+        let checkable = invariants.filter { $0.enabled }
+        guard !checkable.isEmpty, !response.isEmpty else { return [] }
+        let list = checkable.map { inv in
+            "- \(inv.name.isEmpty ? inv.kind.title : inv.name): \(inv.description)"
+        }.joined(separator: "\n")
+        let system = """
+        Ты — проверяющий инвариантов (ограничений). Дан ОТВЕТ и список ИНВАРИАНТОВ. \
+        Определи, какие инварианты НАРУШЕНЫ этим ответом. Для КАЖДОГО нарушенного выведи \
+        ОТДЕЛЬНОЙ строкой «НАРУШЕН: <название>». Если все соблюдены — выведи ровно \
+        «ВСЕ СОБЛЮДЕНЫ». Без пояснений и лишнего текста.
+        """
+        let user = "ИНВАРИАНТЫ:\n\(list)\n\nОТВЕТ:\n\(response)"
+        let payload: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: system),
+            .init(role: ChatRole.user.rawValue, content: user),
+        ]
+        let result = try await post(payloadMessages: payload, settings: settings,
+                                    temperature: 0.1, maxTokens: 512, stop: [])
+        var violations: [InvariantViolation] = []
+        for raw in result.text.split(whereSeparator: \.isNewline) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard let r = line.range(of: "НАРУШЕН:", options: [.caseInsensitive]) else { continue }
+            let nm = line[r.upperBound...].trimmingCharacters(in: CharacterSet(charactersIn: " «»\"<>"))
+            guard !nm.isEmpty else { continue }
+            let inv = checkable.first { $0.name.caseInsensitiveCompare(nm) == .orderedSame }
+            violations.append(InvariantViolation(name: nm, description: inv?.description ?? nm))
+        }
+        return violations
+    }
+
     /// Сворачивает блок старых сообщений в саммари (обновляя предыдущее).
     /// Используется компакцией истории (ChatViewModel.maybeCompact).
     func summarize(previousSummary: String, block: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {

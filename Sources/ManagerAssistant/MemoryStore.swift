@@ -58,6 +58,14 @@ enum ProfileStore {
     static func save(_ profiles: [ResponseProfile]) { saveJSON(profiles, to: fileURL) }
 }
 
+/// Инварианты (ограничения: стек/арх/бюджет/зависимости/запреты/техрешения/правила) —
+/// invariants.json. ОТДЕЛЬНО от диалога (chats.json). Скоупы внутри самих инвариантов.
+enum InvariantStore {
+    static var fileURL: URL { appSupportFile("invariants.json") }
+    static func load() -> [Invariant] { loadJSON([Invariant].self, from: fileURL) ?? [] }
+    static func save(_ invariants: [Invariant]) { saveJSON(invariants, to: fileURL) }
+}
+
 /// Проекты (контейнеры рабочей памяти: бриф + полнотекстовые секции).
 enum ProjectStore {
     static var fileURL: URL { appSupportFile("projects.json") }

@@ -57,35 +57,66 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   (+pruneOrphanNodes), mergeBranch (копирует расходящийся хвост). Миграция старого
   линейного messages → дерево в Chat.init(from:) (LegacyKeys.messages). В сравнении
   ветвления НЕТ.
-- **Конечный автомат задачи (FSM)** — задача проходит этапы planning → execution →
-  validation → **answer** НА УРОВНЕ КОДА (как Claude Code), а не одним промптом.
-  Переходы решает оркестратор `ChatViewModel.runPhaseLoop`, КАЖДЫЙ этап — отдельный
-  `client.runPhase` с захардкоженным под этап системным промптом (`PipelinePrompts`
-  в Models.swift). ВАЖНО: последний этап `.answer` (`TaskPhase`, метка «Ответ») —
-  это САМ ОТВЕТ пользователю на исходную задачу (решение + полезная информация,
-  `TaskRun.answer`), а НЕ отчёт «задача выполнена/проверено» (это была ошибка раннего
-  дизайна — этап назывался `done`/«Итог» и выдавал мета-резюме). Состояние —
-  `Chat.taskRun: TaskRun?` (Codable, мигрируется как всё; `TaskPhase`/`TaskRunStatus`/
-  `PipelineMode` декодируются снисходительно). Режим в `GenerationSettings.pipelineMode`
-  (off/auto/plan): **auto** — все этапы подряд; **plan** — стоп после планирования
-  (`status=.awaitingPlan`, кнопка «Принять план» → `approvePlan`, «Заново» → `replan`).
-  **Проверка** выводит маркер `ВЕРДИКТ: ВЫПОЛНЕНО|НЕ ВЫПОЛНЕНО`
-  (`PipelinePrompts.parseVerdict`); при провале код возвращает автомат к execution
-  (лимит `TaskRun.maxExecutionRetries=2`, замечания прокидываются в повтор), иначе →
-  answer. Этапы самодостаточны — строятся ТОЛЬКО из артефактов TaskRun
-  (task/plan/executionResult/validationResult; answer видит все четыре), НЕ из истории
-  чата → не зависят от contextStrategy; вывод кладётся в ленту через
-  `addMessage(..., phase:)` (метка этапа на пузыре). **Пауза/возобновление**:
-  `pausePipeline` отменяет Task; отмена приходит как `URLError.cancelled` ИЛИ
-  `CancellationError` ИЛИ `Task.isCancelled` → трактуется как ПАУЗА (не ошибка!),
-  `status=.paused` на ТОМ ЖЕ этапе; `resumePipeline` входит в цикл с `run.phase`.
-  Инвариант: `phase` сдвигается ТОЛЬКО при успехе → resume повторяет незавершённый
+- **Конечный автомат задачи (FSM) — формальная детерминированная модель** — задача
+  проходит этапы planning → execution → validation → **answer** НА УРОВНЕ КОДА.
+  Формализация (под референс пользователя), всё в Models.swift одним блоком «FSM»:
+  • **`TaskState`** — состояние/этап (planning/execution/validation/answer).
+  • **`TaskFSM.transitions`** — ЯВНАЯ таблица переходов (`planning→[execution]`,
+    `execution→[validation,planning]`, `validation→[answer,execution]`, `answer→[]`)
+    + `allows(_:to:)`. ЕДИНСТВЕННЫЙ источник истины «откуда куда можно».
+  • **`TaskContext.transitioned(to:)`** — страж: меняет `state` ТОЛЬКО через
+    `precondition(TaskFSM.allows(...))`. Оркестратор НИКОГДА не пишет `state` напрямую
+    → нелегальный скачок (planning→answer и т.п.) невозможен.
+  • **`TaskContext`** (бывш. `TaskRun`) — сущность: task/state/step/total/plan(`[String]`)/
+    done(`[String]`)/current (+ служебные mode/status/answer/retries…). В `Chat.taskContext`.
+  • **`PipelinePrompts.buildPrompt(query:ctx:profile:)`** — user-сообщение из контекста
+    (`[STATE]/[CURRENT]/[PLAN]/[DONE]/[PROFILE]/[QUERY]` + Правила); системный промпт =
+    роль этапа `systemPrompt(for:)`. Профиль ответа инжектится и в FSM.
+  Оркестратор — `ChatViewModel.runStateMachine`. **Пошаговость**: этап `.execution`
+  идёт ПО ШАГАМ плана — один `client.runPhase` на шаг, `current=plan[step]`,
+  `done.append`, `step+=1`; к `.validation` только когда `step>=total` (маркер
+  `NEXT_STEP`). Каждый шаг — сообщение «Выполнение · шаг N/total». ВАЖНО: `.answer` —
+  САМ ОТВЕТ пользователю (`TaskContext.answer`), а НЕ отчёт о работе FSM. Режим в
+  `GenerationSettings.pipelineMode` (off/auto/plan): **auto** — подряд; **plan** — стоп
+  после планирования (`status=.awaitingPlan` → `approvePlan`/`replan`). **Шаги назад**
+  (легальны по таблице): validation→execution по вердикту `parseVerdict`
+  (лимит `maxExecutionRetries=2`); execution→planning — авто по маркеру `REPLAN` ИЛИ
+  кнопкой «Перепланировать» (`requestReplan`, лимит `maxPlanRetries=2`). Этапы
+  самодостаточны (только из артефактов `TaskContext`), не зависят от contextStrategy;
+  вывод в ленту через `addMessage(..., state:step:total:)`. **Краш-устойчивость**:
+  `persistNow()` СИНХРОННО пишет `chats` на диск после КАЖДОГО шага/перехода/паузы/
+  ошибки (аналог `repo.save(ctx)`) — переживает выключение питания/`kill -9`/нехватку
+  токенов. **Пауза/возобновление**: `pausePipeline` отменяет Task; отмена приходит как
+  `URLError.cancelled` ИЛИ `CancellationError` ИЛИ `Task.isCancelled` → ПАУЗА (не ошибка!),
+  `status=.paused`; при старте `ChatStore.load` + `normalizeTaskRuns` (висящий running→
+  paused) + `resumePipeline` входят в `runStateMachine` и продолжают с сохранённого
+  `state/step`. Инвариант: `state`/`step` сдвигаются и сохраняются ТОЛЬКО при успехе →
+  resume повторяет незавершённый
   этап, не рестартит. Гонку пауза→быстрое продолжение гасит `pipelineGen[chatID]`
   (старый Task с устаревшим gen состояние не трогает). При старте `normalizeTaskRuns`
   переводит «висящие» running → paused. Вторичные вызовы памяти/фактов на этапах НЕ
   запускаются. UI — `pipelineBar` (полоса этапов) над лентой + быстрый сегмент-
   переключатель режима `pipelineModeBar` ПРЯМО НАД полем ввода (Выкл|Авто|План, один
   клик) + секция в `ChatSettingsView`. В сравнении FSM НЕТ.
+- **Инварианты (ограничения)** — валидируемые правила, которым ОБЯЗАН соответствовать
+  ответ модели (Invariant.swift): стек/запрет(noBanned)/maxDeps/архитектура/бюджет/
+  техрешения/бизнес-правила. ХРАНЯТСЯ ОТДЕЛЬНО ОТ ДИАЛОГА — `InvariantStore`→
+  `invariants.json` (НЕ в chats.json!); привязка через поля `scope`(global/project/chat)+
+  `ownerID` внутри инварианта. Эффективный набор чата = глобальные + инварианты его
+  проекта + инварианты чата (`vm.effectiveInvariants(for:)`). Инжектятся в КАЖДЫЙ
+  промпт FSM через `PipelinePrompts.buildPrompt(... invariants:)` (блок `[INVARIANTS]`:
+  «обязательны, явно учитывай, НЕ предлагай нарушающие решения; если запрос юзера
+  требует нарушения — ОТКАЖИСЬ, выведи маркер `НАРУШЕН ИНВАРИАНТ`, предложи альтернативу»).
+  Валидация КАЖДОГО ответа в `runStateMachine` (метод в `GenerationSettings.
+  invariantValidation`: off/code/llm/both): **code** — вхождение `banned`-терминов
+  (`InvariantValidator.codeViolations`) + маркер-самопометка; **llm** — доп. запрос
+  `client.checkInvariants`. Нарушение МОДЕЛИ (запрещённое вошло в ответ) → retry того же
+  этапа/шага с нарушениями в промпте (`TaskContext.invariantRetries/invariantViolations`,
+  лимит `maxInvariantRetries=2`). КОНФЛИКТ С ЮЗЕРОМ (маркер `modelFlaggedConflict`) →
+  НЕ retry, баннер `Chat.invariantConflict` (runtime). Защита у каждого инварианта:
+  `enforcement` prompt/code/both. UI: кнопка-щит → `InvariantsPanelView`/`InvariantEditorView`
+  (секции по скоупам + шаблоны `Invariant.templates()`); метод валидации — секция в
+  `ChatSettingsView`; бейдж «⚠N» в `pipelineBar`. В сравнении инвариантов НЕТ.
 - **Вкладки сайдбара: Чаты | Проекты** (cowork) — `ContentView` держит `mode`
   (SidebarMode) + сегмент-переключатель в шапке сайдбара. Чаты-вкладка = обычные
   чаты (`vm.looseChats`, projectID==nil). Проекты-вкладка = список проектов,

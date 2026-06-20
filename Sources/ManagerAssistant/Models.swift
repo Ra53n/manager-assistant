@@ -44,8 +44,10 @@ struct ChatMessage: Identifiable, Codable {
     let content: String
     /// Метрики ответа (только у сообщений ассистента).
     var metrics: MessageMetrics? = nil
-    /// Этап конечного автомата задачи (FSM), если сообщение — вывод этапа. nil — обычное.
-    var phase: TaskPhase? = nil
+    /// Этап FSM (если сообщение — вывод этапа) + прогресс шага (для .execution). nil — обычное.
+    var state: TaskState? = nil
+    var step: Int? = nil
+    var total: Int? = nil
 }
 
 /// Стратегия управления контекстом (по ТЗ).
@@ -161,6 +163,10 @@ struct GenerationSettings: Equatable, Codable {
     /// планирования (нужно «Принять план», как в Claude Code).
     var pipelineMode: PipelineMode = .off
 
+    /// Как валидировать ответы на соответствие инвариантам (см. Invariant.swift):
+    /// off — только промпт; code — вхождение запрещённых слов; llm — доп. запрос; both.
+    var invariantValidation: InvariantValidationMode = .code
+
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -177,6 +183,7 @@ struct GenerationSettings: Equatable, Codable {
         case injectLongTermMemory, injectChatMemory, memoryTokenBudget
         case memoryAssistEnabled, autoMemory, autoProjectSections
         case pipelineMode
+        case invariantValidation
     }
 }
 
@@ -203,6 +210,7 @@ extension GenerationSettings {
         autoMemory = try c.decodeIfPresent(Bool.self, forKey: .autoMemory) ?? d.autoMemory
         autoProjectSections = try c.decodeIfPresent(Bool.self, forKey: .autoProjectSections) ?? d.autoProjectSections
         pipelineMode = try c.decodeIfPresent(PipelineMode.self, forKey: .pipelineMode) ?? d.pipelineMode
+        invariantValidation = try c.decodeIfPresent(InvariantValidationMode.self, forKey: .invariantValidation) ?? d.invariantValidation
     }
 }
 
@@ -241,14 +249,20 @@ enum PromptBuilder {
     }
 }
 
-// MARK: - Конечный автомат задачи (FSM)
+// MARK: - Конечный автомат задачи (FSM) — формальная детерминированная модель
 //
-// Каждая «задача» (запрос пользователя в режиме FSM) проходит фиксированные этапы
-// планирование → выполнение → проверка → ОТВЕТ. Переходы решает КОД (оркестратор
-// в ChatViewModel), а не модель: каждый этап — отдельный запрос с захардкоженным
-// под этап промптом (PipelinePrompts). Состояние прогона — TaskRun в Chat.taskRun.
-// ВАЖНО: последний этап (.answer) — это сам ОТВЕТ пользователю на исходную задачу
-// (решение + полезная информация), а НЕ отчёт «задача выполнена/проверено».
+// Формализация (под референс):
+//  • TaskState   — состояние автомата (этап): planning/execution/validation/answer.
+//  • TaskFSM     — ТАБЛИЦА переходов + проверка `allows`: единственный источник
+//                  истины «из какого этапа в какие можно». Нелегальный скачок
+//                  (planning→answer и т.п.) невозможен.
+//  • TaskContext — сущность задачи: task/state/step/total/plan/done/current (+ служебные).
+//  • PipelinePrompts.buildPrompt — сборка промпта из контекста ([STATE]/[CURRENT]/
+//                  [PLAN]/[DONE]/[PROFILE]/[QUERY] + Правила).
+// Переходы решает КОД (оркестратор ChatViewModel.runStateMachine) — ТОЛЬКО через
+// `TaskContext.transitioned(to:)`, который сверяется с таблицей. Этап «Выполнение»
+// идёт ПО ШАГАМ плана (step/total). Финальный этап .answer — это сам ОТВЕТ
+// пользователю (а НЕ отчёт «задача выполнена/проверено»).
 
 /// Режим прогона задачи через конечный автомат.
 enum PipelineMode: String, Codable, CaseIterable, Identifiable {
@@ -273,9 +287,10 @@ enum PipelineMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-/// Этап конечного автомата задачи. Порядок переходов зашит в `next`.
-/// `.answer` — финальный этап: ОТВЕТ на исходную задачу (а не отчёт о работе FSM).
-enum TaskPhase: String, Codable, CaseIterable, Identifiable {
+/// Состояние (этап) конечного автомата задачи — поле `state` в TaskContext.
+/// Допустимость переходов задаёт ТАБЛИЦА `TaskFSM.transitions`, НЕ сам enum.
+/// `.answer` — терминал (в референсе DONE), но этап выдаёт ОТВЕТ на задачу.
+enum TaskState: String, Codable, CaseIterable, Identifiable {
     case planning, execution, validation, answer
 
     var id: String { rawValue }
@@ -283,7 +298,7 @@ enum TaskPhase: String, Codable, CaseIterable, Identifiable {
     /// Снисходительное декодирование: неизвестное → .planning.
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
-        self = TaskPhase(rawValue: raw) ?? .planning
+        self = TaskState(rawValue: raw) ?? .planning
     }
 
     var label: String {
@@ -294,15 +309,22 @@ enum TaskPhase: String, Codable, CaseIterable, Identifiable {
         case .answer: return "Ответ"
         }
     }
+}
 
-    /// Следующий этап (линейный порядок); у .answer — nil (терминал).
-    var next: TaskPhase? {
-        switch self {
-        case .planning: return .execution
-        case .execution: return .validation
-        case .validation: return .answer
-        case .answer: return nil
-        }
+/// Детерминированный конечный автомат: ЕДИНСТВЕННЫЙ источник истины о том, из какого
+/// состояния в какие МОЖНО перейти. Любой переход вне таблицы запрещён — это и есть
+/// «детерминизм на уровне кода» (аналог `val transitions = mapOf(...)`).
+enum TaskFSM {
+    static let transitions: [TaskState: [TaskState]] = [
+        .planning:   [.execution],                 // только вперёд
+        .execution:  [.validation, .planning],     // вперёд ИЛИ шаг назад (перепланировать)
+        .validation: [.answer, .execution],        // вперёд ИЛИ шаг назад (переделать)
+        .answer:     []                             // терминал
+    ]
+
+    /// Разрешён ли переход from → to по таблице.
+    static func allows(_ from: TaskState, to: TaskState) -> Bool {
+        transitions[from, default: []].contains(to)
     }
 }
 
@@ -321,125 +343,209 @@ enum TaskRunStatus: String, Codable {
     }
 }
 
-/// Состояние прогона одной задачи через конечный автомат.
-/// Имя НЕ `Task` — конфликт со Swift Concurrency `Task{}` (как `Project` вместо `Task`).
-struct TaskRun: Codable, Identifiable {
+/// Формализованная сущность задачи (контекст автомата) — аналог `data class TaskContext`.
+/// Поля task/state/step/total/plan/done/current — как в референсе; остальные —
+/// служебные для оркестрации/персистентности. Имя НЕ `Task` (конфликт с `Task{}`).
+struct TaskContext: Codable, Identifiable {
     var id = UUID()
-    var task: String                    // исходный текст задачи (verbatim)
-    var mode: PipelineMode = .auto       // .auto или .plan (копируется на старте)
-    var phase: TaskPhase = .planning     // КАКОЙ этап выполнять/возобновлять
+    // --- поля формальной модели (референс TaskContext) ---
+    var task: String                    // суть задачи (исходный запрос)
+    var state: TaskState = .planning     // текущий этап автомата
+    var step: Int = 0                    // прогресс ВНУТРИ этапа (индекс текущего шага, 0-based)
+    var total: Int = 0                   // всего шагов на этапе (= plan.count для выполнения)
+    var plan: [String] = []              // утверждённый план — СПИСОК шагов
+    var done: [String] = []              // что уже сделано — результаты выполненных шагов
+    var current: String = ""             // что делаем сейчас — текущий шаг
+    // --- служебные поля оркестрации ---
+    var mode: PipelineMode = .auto        // .auto / .plan (копируется на старте)
     var status: TaskRunStatus = .running
-    var plan: String = ""                // вывод Планирования
-    var executionResult: String = ""     // вывод Выполнения (последний)
-    var validationResult: String = ""    // вывод Проверки (последний)
-    var answer: String = ""              // вывод этапа Ответ — финальный ответ пользователю
-    var validationPassed: Bool? = nil    // распарсенный вердикт последней Проверки
-    var executionRetries: Int = 0        // сколько раз вернулись к Выполнению
-    var planFeedback: String = ""        // опц. правки пользователя для «Перепланировать»
+    var validationResult: String = ""     // вывод последней Проверки
+    var validationPassed: Bool? = nil     // распарсенный вердикт
+    var answer: String = ""               // вывод этапа Ответ — финальный ответ пользователю
+    var executionRetries: Int = 0         // возвраты Проверка→Выполнение
+    var planRetries: Int = 0              // возвраты Выполнение→Планирование
+    var planFeedback: String = ""         // правки к плану (кнопка/маркер REPLAN)
+    var invariantRetries: Int = 0         // перегенерации текущего ответа из-за нарушения инвариантов
+    var invariantViolations: [String] = [] // нарушения для прокидывания в retry-промпт
     var errorText: String? = nil
     var startedAt: Date = Date()
 
-    /// Лимит возвратов «Проверка → Выполнение».
+    /// Лимиты возвратов (шагов назад).
     static let maxExecutionRetries = 2
+    static let maxPlanRetries = 2
+    static let maxInvariantRetries = 2
 
     enum CodingKeys: String, CodingKey {
-        case id, task, mode, phase, status
-        case plan, executionResult, validationResult, answer
-        case validationPassed, executionRetries, planFeedback, errorText, startedAt
+        case id, task, state, step, total, plan, done, current
+        case mode, status, validationResult, validationPassed, answer
+        case executionRetries, planRetries, planFeedback, errorText, startedAt
+        case invariantRetries, invariantViolations
     }
 }
 
-/// Миграционно-устойчивое декодирование (как у GenerationSettings/Chat).
-extension TaskRun {
+/// Миграционно-устойчивое декодирование + детерминированный переход.
+extension TaskContext {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         task = try c.decodeIfPresent(String.self, forKey: .task) ?? ""
+        state = try c.decodeIfPresent(TaskState.self, forKey: .state) ?? .planning
+        step = try c.decodeIfPresent(Int.self, forKey: .step) ?? 0
+        total = try c.decodeIfPresent(Int.self, forKey: .total) ?? 0
+        // plan: новый формат — [String]; старый тестовый — String (разобьём по шагам).
+        if let arr = try? c.decode([String].self, forKey: .plan) {
+            plan = arr
+        } else if let s = try? c.decode(String.self, forKey: .plan) {
+            plan = PipelinePrompts.parsePlanSteps(s)
+        } else {
+            plan = []
+        }
+        done = try c.decodeIfPresent([String].self, forKey: .done) ?? []
+        current = try c.decodeIfPresent(String.self, forKey: .current) ?? ""
         mode = try c.decodeIfPresent(PipelineMode.self, forKey: .mode) ?? .auto
-        phase = try c.decodeIfPresent(TaskPhase.self, forKey: .phase) ?? .planning
         status = try c.decodeIfPresent(TaskRunStatus.self, forKey: .status) ?? .paused
-        plan = try c.decodeIfPresent(String.self, forKey: .plan) ?? ""
-        executionResult = try c.decodeIfPresent(String.self, forKey: .executionResult) ?? ""
         validationResult = try c.decodeIfPresent(String.self, forKey: .validationResult) ?? ""
-        answer = try c.decodeIfPresent(String.self, forKey: .answer) ?? ""
         validationPassed = try c.decodeIfPresent(Bool.self, forKey: .validationPassed)
+        answer = try c.decodeIfPresent(String.self, forKey: .answer) ?? ""
         executionRetries = try c.decodeIfPresent(Int.self, forKey: .executionRetries) ?? 0
+        planRetries = try c.decodeIfPresent(Int.self, forKey: .planRetries) ?? 0
         planFeedback = try c.decodeIfPresent(String.self, forKey: .planFeedback) ?? ""
+        invariantRetries = try c.decodeIfPresent(Int.self, forKey: .invariantRetries) ?? 0
+        invariantViolations = try c.decodeIfPresent([String].self, forKey: .invariantViolations) ?? []
         errorText = try c.decodeIfPresent(String.self, forKey: .errorText)
         startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
     }
+
+    /// Детерминированный переход по таблице TaskFSM — аналог `fun transition(ctx, target)`.
+    /// Нелегальный скачок (например planning → answer) — ошибка программиста
+    /// (precondition = их `require`): такого перехода в рантайме быть не может.
+    func transitioned(to target: TaskState) -> TaskContext {
+        precondition(TaskFSM.allows(state, to: target),
+                     "Недопустимый переход \(state.rawValue) → \(target.rawValue)")
+        var c = self
+        c.state = target
+        return c
+    }
 }
 
-/// Захардкоженные промпты этапов FSM. Это и есть «уровень кода»: что делает модель
-/// на каждом шаге, задаёт код, а не пользовательский промпт.
+/// Сборка промптов из контекста — «уровень кода»: ЧТО делает модель на каждом
+/// шаге/этапе, задаёт код. Системный промпт = роль этапа; user-сообщение =
+/// `buildPrompt` (блок [STATE]/[CURRENT]/[PLAN]/[DONE]/[PROFILE]/[QUERY] + Правила).
 enum PipelinePrompts {
-    static func systemPrompt(for phase: TaskPhase) -> String {
-        switch phase {
+    static let nextStepMarker = "NEXT_STEP"   // модель сообщает: текущий шаг выполнен
+    static let replanMarker   = "REPLAN"      // модель сообщает: план непригоден, нужен возврат
+
+    /// Системный промпт = РОЛЬ этапа.
+    static func systemPrompt(for state: TaskState) -> String {
+        switch state {
         case .planning:
             return """
-            Ты — планировщик. По поставленной задаче составь чёткий, выполнимый \
-            пошаговый план решения: пронумерованные шаги, без воды. Не выполняй \
-            задачу — только спланируй. Верни ТОЛЬКО план.
+            Ты — планировщик. По задаче из [QUERY] составь чёткий пошаговый план: \
+            пронумерованные шаги (1., 2., 3., …), каждый шаг — одно конкретное \
+            действие, без воды. Не выполняй задачу — только спланируй. Верни ТОЛЬКО план.
             """
         case .execution:
             return """
-            Ты — исполнитель. Выполни задачу строго по приведённому плану, шаг за \
-            шагом. Дай полный, самодостаточный результат выполнения. Если какой-то \
-            шаг невыполним — отметь это и предложи обходной путь.
+            Ты — исполнитель. Выполни ТОЛЬКО текущий шаг [CURRENT] (НЕ весь план сразу). \
+            Уже сделанное в [DONE] используй как контекст. Дай полный результат этого \
+            шага. Когда шаг выполнен — заверши ответ ОТДЕЛЬНОЙ ПОСЛЕДНЕЙ строкой \
+            «\(nextStepMarker)». Если по ходу стало ясно, что план непригоден и нужно \
+            перепланировать — вместо этого заверши ответ строкой «\(replanMarker)».
             """
         case .validation:
             return """
-            Ты — проверяющий. Сверь результат выполнения с планом и исходной задачей. \
-            Перечисли, что выполнено, а что нет, и какие есть проблемы. ПОСЛЕДНЕЙ \
-            строкой ответа выведи РОВНО одно из двух: «ВЕРДИКТ: ВЫПОЛНЕНО» либо \
+            Ты — проверяющий. Сверь сделанное ([DONE]) с планом и исходной задачей \
+            ([QUERY]). Перечисли, что выполнено, что нет, и какие есть проблемы. \
+            ПОСЛЕДНЕЙ строкой выведи РОВНО одно из двух: «ВЕРДИКТ: ВЫПОЛНЕНО» либо \
             «ВЕРДИКТ: НЕ ВЫПОЛНЕНО».
             """
         case .answer:
             return """
-            Сформируй ФИНАЛЬНЫЙ ОТВЕТ на исходную задачу — именно его получит \
-            пользователь как результат всей работы. Опираясь на план, выполнение и \
-            проверку, дай полный, готовый к использованию ответ ПО СУЩЕСТВУ задачи: \
-            само решение (код / текст / вывод / результат) и всю полезную \
-            сопутствующую информацию — как это работает, важные детали, примеры \
-            использования, ограничения и оговорки. Пиши так, будто отвечаешь на \
-            исходный запрос напрямую. КАТЕГОРИЧЕСКИ НЕ описывай процесс и этапы \
-            конвейера и НЕ пиши мета-фразы вроде «задача выполнена», «всё проверено», \
-            «план реализован» — выдай только сам ответ/результат.
+            Сформируй ФИНАЛЬНЫЙ ОТВЕТ на исходную задачу ([QUERY]) — именно его получит \
+            пользователь как результат. Опираясь на план и сделанное ([DONE]), дай \
+            полный, готовый к использованию ответ ПО СУЩЕСТВУ: само решение (код / \
+            текст / вывод) и всю полезную информацию — как работает, важные детали, \
+            примеры использования, ограничения. Пиши так, будто отвечаешь на запрос \
+            напрямую. КАТЕГОРИЧЕСКИ НЕ описывай процесс/этапы и НЕ пиши мета-фразы \
+            вроде «задача выполнена», «всё проверено» — выдай только сам ответ.
             """
         }
     }
 
-    /// User-сообщение этапа: прокидывает накопленные артефакты в следующий запрос,
-    /// делая каждый этап самодостаточным (без истории чата/стратегий контекста).
-    static func userMessage(for phase: TaskPhase, run: TaskRun) -> String {
-        switch phase {
-        case .planning:
-            var t = "Задача:\n\(run.task)"
-            let fb = run.planFeedback.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !fb.isEmpty { t += "\n\nУчти правки к плану:\n\(fb)" }
-            return t
-        case .execution:
-            var t = "Задача:\n\(run.task)\n\nПлан:\n\(run.plan)"
-            let v = run.validationResult.trimmingCharacters(in: .whitespacesAndNewlines)
-            if run.executionRetries > 0, !v.isEmpty {
-                t += "\n\nПредыдущая проверка нашла недочёты — исправь их:\n\(v)"
-            }
-            return t
-        case .validation:
-            return "Задача:\n\(run.task)\n\nПлан:\n\(run.plan)\n\nРезультат выполнения:\n\(run.executionResult)"
-        case .answer:
-            return "Исходная задача:\n\(run.task)\n\nПлан:\n\(run.plan)\n\nРезультат выполнения:\n\(run.executionResult)\n\nИтог проверки:\n\(run.validationResult)\n\nТеперь дай финальный ответ пользователю на исходную задачу."
+    /// User-сообщение = структурный блок контекста (аналог тела `buildPrompt(query, ctx, profile, invariants)`).
+    static func buildPrompt(query: String, ctx: TaskContext, profile: String, invariants: [Invariant] = []) -> String {
+        func numbered(_ items: [String]) -> String {
+            items.isEmpty ? "—"
+                : items.enumerated().map { "\($0.offset + 1). \($0.element)" }
+                       .joined(separator: "\n           ")
         }
+        let stepInfo = (ctx.state == .execution && ctx.total > 0) ? ", шаг \(ctx.step + 1)/\(ctx.total)" : ""
+        let prof = profile.trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = """
+        [STATE]    \(ctx.state.rawValue)\(stepInfo)
+        [CURRENT]  \(ctx.current.isEmpty ? "—" : ctx.current)
+        [PLAN]     \(numbered(ctx.plan))
+        [DONE]     \(numbered(ctx.done))
+        [PROFILE]  \(prof.isEmpty ? "—" : prof)
+        [QUERY]    \(query)
+
+        Правила:
+        - Работай только в рамках текущего шага [CURRENT]; не перепрыгивай этапы и шаги.
+        - Если текущий шаг выполнен — заверши ответ строкой «\(nextStepMarker)».
+        - Если план непригоден — заверши ответ строкой «\(replanMarker)».
+        """
+        // Инварианты (ограничения) — агент ОБЯЗАН их учитывать и отказывать в нарушениях.
+        let invBlock = InvariantValidator.promptBlock(invariants)
+        if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        // Уже выявленные нарушения инвариантов — исправить в перегенерации.
+        if !ctx.invariantViolations.isEmpty {
+            s += "\n\n[НАРУШЕНЫ ИНВАРИАНТЫ — ИСПРАВЬ, перегенерируй без нарушений]\n"
+                + ctx.invariantViolations.map { "- \($0)" }.joined(separator: "\n")
+        }
+        // Замечания проверки прокидываем в повтор выполнения.
+        let v = ctx.validationResult.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ctx.state == .execution, ctx.executionRetries > 0, !v.isEmpty {
+            s += "\n\n[ЗАМЕЧАНИЯ ПРОВЕРКИ — учти при переделке]\n\(v)"
+        }
+        // Причину перепланирования прокидываем в планирование.
+        let fb = ctx.planFeedback.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ctx.state == .planning, !fb.isEmpty {
+            s += "\n\n[ПРИЧИНА ПЕРЕПЛАНИРОВАНИЯ / ПРАВКИ]\n\(fb)"
+        }
+        return s
     }
 
-    /// Парсит вердикт этапа Проверки. true = выполнено. Смотрит ПОСЛЕДНИЙ маркер
-    /// «ВЕРДИКТ:»; при отсутствии/неоднозначности → true (чтобы не зациклить —
-    /// число повторов всё равно ограничено maxExecutionRetries).
+    /// Текст плана → список шагов: снимает нумерацию/маркеры; пустой план → весь текст одним шагом.
+    static func parsePlanSteps(_ text: String) -> [String] {
+        var steps: [String] = []
+        for raw in text.split(whereSeparator: \.isNewline) {
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            if let r = line.range(of: #"^\s*(\d+[.)]|[-–•*])\s+"#, options: .regularExpression) {
+                line.removeSubrange(r)
+                line = line.trimmingCharacters(in: .whitespaces)
+            }
+            if !line.isEmpty { steps.append(line) }
+        }
+        return steps.isEmpty ? [text.trimmingCharacters(in: .whitespacesAndNewlines)] : steps
+    }
+
+    static func wantsNextStep(_ text: String) -> Bool { text.uppercased().contains(nextStepMarker) }
+    static func wantsReplan(_ text: String)   -> Bool { text.uppercased().contains(replanMarker) }
+
+    /// Убирает служебные маркеры из текста перед показом/сохранением.
+    static func stripMarkers(_ text: String) -> String {
+        var t = text
+        for m in [nextStepMarker, replanMarker] { t = t.replacingOccurrences(of: m, with: "") }
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Парсит вердикт Проверки. true = выполнено. Смотрит ПОСЛЕДНИЙ «ВЕРДИКТ:»;
+    /// при отсутствии/неоднозначности → true (число повторов ограничено лимитом).
     static func parseVerdict(_ text: String) -> Bool {
         let upper = text.uppercased()
         if let r = upper.range(of: "ВЕРДИКТ:", options: .backwards) {
             let tail = upper[r.upperBound...]
-            // «НЕ ВЫПОЛНЕНО» содержит «ВЫПОЛНЕНО» как подстроку — проверяем первым.
             if tail.contains("НЕ ВЫПОЛНЕНО") { return false }
             if tail.contains("ВЫПОЛНЕНО") { return true }
         }
@@ -455,8 +561,10 @@ struct MsgNode: Identifiable, Codable {
     var role: ChatRole
     var content: String
     var metrics: MessageMetrics?
-    /// Этап конечного автомата задачи (FSM), если узел — вывод этапа. nil — обычное.
-    var phase: TaskPhase? = nil
+    /// Этап FSM (если узел — вывод этапа) + прогресс шага (для .execution). nil — обычное.
+    var state: TaskState? = nil
+    var step: Int? = nil
+    var total: Int? = nil
 }
 
 /// Именованная ветка = указатель на «кончик» (leaf) ветки в дереве узлов.
@@ -486,7 +594,7 @@ struct Chat: Identifiable, Codable {
             var result: [ChatMessage] = []
             var cur = currentTipID
             while let id = cur, let n = byID[id] {
-                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics, phase: n.phase))
+                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics, state: n.state, step: n.step, total: n.total))
                 cur = n.parentID
             }
             return result.reversed()
@@ -496,7 +604,7 @@ struct Chat: Identifiable, Codable {
             nodes = []
             var parent: UUID? = nil
             for m in newValue {
-                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics, phase: m.phase)
+                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics, state: m.state, step: m.step, total: m.total)
                 nodes.append(node)
                 parent = node.id
             }
@@ -539,9 +647,13 @@ struct Chat: Identifiable, Codable {
     /// Runtime-флаг обновления фактов (не сохраняется).
     var isUpdatingFacts: Bool = false
 
-    /// Активный/последний прогон задачи через конечный автомат (FSM). nil — нет.
+    /// Runtime: текст баннера о конфликте инвариантов (модель отказала из-за запроса
+    /// пользователя). Не сохраняется (см. CodingKeys).
+    var invariantConflict: String? = nil
+
+    /// Активный/последний контекст задачи (конечный автомат FSM). nil — нет.
     /// Сохраняется (нужен для возобновления после перезапуска).
-    var taskRun: TaskRun? = nil
+    var taskContext: TaskContext? = nil
 
     /// На диск — данные диалога (дерево узлов); runtime-состояние не сохраняется.
     enum CodingKeys: String, CodingKey {
@@ -551,7 +663,7 @@ struct Chat: Identifiable, Codable {
         case memory
         case projectID = "taskID"   // старый ключ — читаем прозрачно
         case profileID
-        case taskRun
+        case taskContext
     }
     /// Старый ключ — линейный массив сообщений (миграция в дерево).
     enum LegacyKeys: String, CodingKey { case messages }
@@ -578,7 +690,7 @@ extension Chat {
         memory = try c.decodeIfPresent([MemoryItem].self, forKey: .memory) ?? []
         projectID = try c.decodeIfPresent(UUID.self, forKey: .projectID)
         profileID = try c.decodeIfPresent(UUID.self, forKey: .profileID)
-        taskRun = try c.decodeIfPresent(TaskRun.self, forKey: .taskRun)
+        taskContext = try c.decodeIfPresent(TaskContext.self, forKey: .taskContext)
 
         if let nodes = try c.decodeIfPresent([MsgNode].self, forKey: .nodes) {
             self.nodes = nodes
