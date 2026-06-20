@@ -37,6 +37,9 @@ final class ComparisonViewModel: ObservableObject {
     private let client = DeepSeekClient()
     /// Поиск цены модели — пробрасывается из ChatViewModel.
     var priceLookup: (ModelOption) -> ModelPricing? = { _ in nil }
+    /// Долговременная (глобальная) память — пробрасывается из ChatViewModel.
+    /// В сравнении инжектится во все дорожки read-only (одинаковый профиль всем).
+    var globalMemoryLookup: () -> [MemoryItem] = { [] }
 
     var canAddTrack: Bool { tracks.count < Self.maxTracks }
     var canRemoveTrack: Bool { tracks.count > 2 }
@@ -80,6 +83,7 @@ final class ComparisonViewModel: ObservableObject {
 
             let trackID = tracks[index].id
             let payload = ContextManager.payload(messages: tracks[index].messages, settings: settings, facts: tracks[index].facts)
+            let memoryText = MemoryContext.assembleLongTermOnly(longTerm: globalMemoryLookup(), settings: settings)
             let price = priceLookup(model)
 
             Task {
@@ -88,7 +92,8 @@ final class ComparisonViewModel: ObservableObject {
                     let result = try await client.send(
                         messages: payload.tail,
                         settings: settings,
-                        facts: payload.facts
+                        facts: payload.facts,
+                        memory: memoryText
                     )
                     let duration = Date().timeIntervalSince(start)
                     let metrics = MessageMetrics(
@@ -178,6 +183,12 @@ struct ComparisonView: View {
             HStack {
                 Text("Сравнение моделей")
                     .font(.headline)
+                if !vm.memory.isEmpty {
+                    Label("долговременная память: \(vm.memory.count)", systemImage: "brain")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .help("Глобальная память подставляется во все дорожки одинаково")
+                }
                 Spacer()
                 Button {
                     comp.addTrack()
@@ -226,6 +237,7 @@ struct ComparisonView: View {
         .frame(width: 1180, height: 700)
         .onAppear {
             comp.priceLookup = { vm.price(for: $0) }
+            comp.globalMemoryLookup = { vm.memory }
             vm.loadModels()
         }
         .sheet(item: $pickingTrack) { box in
@@ -243,7 +255,9 @@ struct ComparisonView: View {
                     vm: vm,
                     settings: $comp.tracks[box.value].settings,
                     showModelSection: false,
-                    allowBranching: false
+                    allowBranching: false,
+                    showMemorySection: false,
+                    showProfileSection: false
                 )
             }
         }
@@ -328,7 +342,9 @@ struct ComparisonView: View {
                         .help(comp.tracks[i].facts)
                     }
                     ForEach(comp.tracks[i].messages) { msg in
-                        ComparisonMessage(message: msg)
+                        // .equatable() — не пересоздавать Markdown при стриминге
+                        // других дорожек, иначе слетает выделение текста.
+                        ComparisonMessage(message: msg).equatable()
                     }
                     if comp.tracks[i].isLoading {
                         HStack(spacing: 6) {
@@ -349,8 +365,14 @@ struct ComparisonView: View {
 }
 
 /// Сообщение в колонке сравнения: вопрос — серым, ответ — Markdown + метрики.
-private struct ComparisonMessage: View {
+/// Equatable (см. .equatable() в ленте) — чтобы выделение текста не сбрасывалось
+/// при перерисовке колонки во время стриминга соседних дорожек.
+private struct ComparisonMessage: View, Equatable {
     let message: ChatMessage
+
+    static func == (a: ComparisonMessage, b: ComparisonMessage) -> Bool {
+        a.message.id == b.message.id && a.message.content == b.message.content
+    }
 
     var body: some View {
         if message.role == .user {
@@ -360,7 +382,8 @@ private struct ComparisonMessage: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 3) {
-                Markdown(message.content)
+                Text(MarkdownText.attributed(message.content))
+                    .tint(.accentColor)
                     .textSelection(.enabled)
                 if let m = message.metrics {
                     Text(MessageBubble.metricsText(m))

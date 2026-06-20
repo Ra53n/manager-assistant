@@ -28,10 +28,21 @@ import SwiftUI
 import AppKit
 import MarkdownUI
 
+/// Вкладки сайдбара: обычные чаты vs проекты (cowork).
+enum SidebarMode: String, CaseIterable, Identifiable {
+    case chats, projects
+    var id: String { rawValue }
+    var label: String { self == .chats ? "Чаты" : "Проекты" }
+}
+
 struct ContentView: View {
     @StateObject private var vm = ChatViewModel()
     @State private var showingKeys = false
     @State private var showingComparison = false
+    @State private var mode: SidebarMode = .chats
+    @State private var showingCreateProject = false
+    @State private var panelProjectID: UUID?              // открытая панель проекта
+    @State private var expanded: Set<UUID> = []           // раскрытые проекты
 
     var body: some View {
         NavigationSplitView {
@@ -45,54 +56,133 @@ struct ContentView: View {
         .sheet(isPresented: $showingComparison) {
             ComparisonView(vm: vm)
         }
+        .sheet(isPresented: $showingCreateProject) {
+            ProjectCreateView { title, instructions in
+                let pid = vm.newProject(title: title, brief: instructions)
+                vm.newChat(inProject: pid)
+                mode = .projects
+                expanded.insert(pid)
+            }
+        }
+        .sheet(item: Binding(get: { panelProjectID.map { IDBox(id: $0) } },
+                             set: { panelProjectID = $0?.id })) { box in
+            ProjectPanelView(vm: vm, projectID: box.id)
+        }
     }
 
-    // MARK: - Боковая навигация по чатам
+    // MARK: - Боковая навигация: переключатель Чаты | Проекты + список
 
     private var sidebar: some View {
-        List(selection: $vm.selectedChatID) {
-            ForEach(vm.chats) { chat in
-                HStack(spacing: 6) {
-                    Image(systemName: "bubble.left")
-                        .foregroundColor(.secondary)
-                    Text(chat.title)
-                        .lineLimit(1)
-                    Spacer()
-                    if chat.isLoading {
-                        ProgressView().controlSize(.mini)
-                    }
-                }
-                .tag(chat.id)
-                .contextMenu {
-                    Button(role: .destructive) {
-                        vm.deleteChat(chat.id)
-                    } label: {
-                        Label("Удалить чат", systemImage: "trash")
-                    }
-                }
+        VStack(spacing: 0) {
+            Picker("", selection: $mode) {
+                ForEach(SidebarMode.allCases) { m in Text(m.label).tag(m) }
             }
-            .onDelete(perform: vm.deleteChats)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(8)
+            Divider()
+            Group {
+                if mode == .chats { chatsList } else { projectsList }
+            }
         }
-        .navigationTitle("Чаты")
-        .frame(minWidth: 200)
+        .frame(minWidth: 220)
+        .navigationTitle(mode.label)
         .toolbar {
+            // Меню «прочее» — чтобы не плодить иконки в тулбаре.
             ToolbarItem {
-                Button { showingKeys = true } label: {
-                    Label("API-ключи", systemImage: "key")
+                Menu {
+                    Button { showingKeys = true } label: { Label("API-ключи", systemImage: "key") }
+                    Button { showingComparison = true } label: { Label("Сравнение моделей", systemImage: "rectangle.split.3x1") }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
                 }
-                .help("API-ключи провайдеров")
+                .help("Ключи, сравнение моделей")
             }
+            // Одна заметная «+», контекст-зависимая.
             ToolbarItem {
-                Button { showingComparison = true } label: {
-                    Label("Сравнение моделей", systemImage: "rectangle.split.3x1")
+                Button {
+                    if mode == .chats { vm.newChat() } else { showingCreateProject = true }
+                } label: {
+                    Label(mode == .chats ? "Новый чат" : "Новый проект",
+                          systemImage: mode == .chats ? "square.and.pencil" : "folder.badge.plus")
                 }
-                .help("Сравнить до 3 моделей на одном вопросе")
+                .help(mode == .chats ? "Новый чат" : "Новый проект")
             }
-            ToolbarItem {
-                Button(action: vm.newChat) {
-                    Label("Новый чат", systemImage: "square.and.pencil")
+        }
+    }
+
+    // Список обычных чатов (без проекта).
+    private var chatsList: some View {
+        List(selection: $vm.selectedChatID) {
+            if vm.looseChats.isEmpty {
+                Text("Чатов пока нет. Нажми «+».")
+                    .font(.callout).foregroundColor(.secondary)
+            }
+            ForEach(vm.looseChats) { chat in chatRow(chat) }
+        }
+    }
+
+    // Список проектов: каждый — раскрывающийся, со своими диалогами (cowork).
+    private var projectsList: some View {
+        List(selection: $vm.selectedChatID) {
+            if vm.projects.filter({ !$0.archived }).isEmpty {
+                Text("Проектов пока нет. Нажми «+», задай название — и пиши.")
+                    .font(.callout).foregroundColor(.secondary)
+            }
+            ForEach(vm.projects.filter { !$0.archived }) { project in
+                projectRow(project)
+            }
+        }
+    }
+
+    private func projectRow(_ project: Project) -> some View {
+        DisclosureGroup(isExpanded: Binding(
+            get: { expanded.contains(project.id) },
+            set: { v in if v { expanded.insert(project.id) } else { expanded.remove(project.id) } }
+        )) {
+            ForEach(vm.chats(in: project.id)) { chat in chatRow(chat) }
+            Button {
+                vm.newChat(inProject: project.id)
+                expanded.insert(project.id)
+            } label: {
+                Label("Новый диалог", systemImage: "plus.bubble")
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "folder").foregroundColor(.secondary)
+                Text(project.title).lineLimit(1)
+                Spacer()
+                Button { panelProjectID = project.id } label: {
+                    Image(systemName: "slider.horizontal.3")
                 }
-                .help("Новый чат")
+                .buttonStyle(.borderless)
+                .help("Память и инструкции проекта")
+            }
+            .contextMenu {
+                Button { vm.newChat(inProject: project.id); expanded.insert(project.id) } label: {
+                    Label("Новый диалог", systemImage: "plus.bubble")
+                }
+                Button { panelProjectID = project.id } label: { Label("Открыть проект", systemImage: "folder") }
+                Button(role: .destructive) { vm.deleteProject(id: project.id) } label: {
+                    Label("Удалить проект", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func chatRow(_ chat: Chat) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "bubble.left").foregroundColor(.secondary)
+            Text(chat.title).lineLimit(1)
+            Spacer()
+            if chat.isLoading { ProgressView().controlSize(.mini) }
+        }
+        .tag(chat.id)
+        .contextMenu {
+            Button(role: .destructive) { vm.deleteChat(chat.id) } label: {
+                Label("Удалить чат", systemImage: "trash")
             }
         }
     }
@@ -105,23 +195,41 @@ struct ContentView: View {
             ChatDetailView(vm: vm)
         } else {
             VStack(spacing: 12) {
-                Image(systemName: "bubble.left.and.bubble.right")
+                Image(systemName: mode == .chats ? "bubble.left.and.bubble.right" : "folder")
                     .font(.largeTitle)
                     .foregroundColor(.secondary)
-                Text("Нет выбранного чата")
+                Text(mode == .chats ? "Нет выбранного чата" : "Выбери проект и диалог")
                     .foregroundColor(.secondary)
-                Button("Создать чат", action: vm.newChat)
+                Button(mode == .chats ? "Создать чат" : "Создать проект") {
+                    if mode == .chats { vm.newChat() } else { showingCreateProject = true }
+                }
             }
             .frame(minWidth: 480, minHeight: 600)
         }
     }
 }
 
+/// Обёртка UUID для .sheet(item:).
+private struct IDBox: Identifiable { let id: UUID }
+
 /// Область одного чата: список сообщений + поле ввода.
 struct ChatDetailView: View {
     @ObservedObject var vm: ChatViewModel
     @State private var showingSettings = false
     @State private var showingFacts = false
+    @State private var showingMemory = false
+    @State private var showingProjectPanel = false
+    /// Черновик записи памяти (сохранение из сообщения / добавление вручную).
+    @State private var memoryDraft: MemoryDraft?
+    /// Черновик секции проекта (сохранение сообщения «В проект»).
+    @State private var projectDraft: ProjectEntryDraft?
+    /// Измеренная высота текста в поле ввода — чтобы поле росло до предела,
+    /// а дальше включался скролл колесом (см. inputBar).
+    @State private var inputContentHeight: CGFloat = ChatDetailView.inputMinHeight
+
+    /// Высота поля ввода: от одной строки до ~5–6, дальше — скролл.
+    static let inputMinHeight: CGFloat = 22
+    static let inputMaxHeight: CGFloat = 120
 
     private var messages: [ChatMessage] { vm.selectedChat?.messages ?? [] }
     private var isLoading: Bool { vm.selectedChat?.isLoading ?? false }
@@ -140,14 +248,17 @@ struct ChatDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             branchBar
+            pipelineBar
             messagesList
             Divider()
             errorBar
             truncationBar
+            pipelineModeBar
             inputBar
         }
         .frame(minWidth: 480, minHeight: 600)
         .navigationTitle(vm.selectedChat?.title ?? "Чат")
+        .navigationSubtitle(attachedProject.map { "Проект: \($0.title)" } ?? "")
         .toolbar {
             ToolbarItem(placement: .status) {
                 if let chat = vm.selectedChat, chat.totalTokens > 0 {
@@ -163,7 +274,7 @@ struct ChatDetailView: View {
                     .help("Стоимость чата \(MessageBubble.formatCost(chat.totalCost)) (включая саммаризацию).\nТокены — запрос: \(chat.promptTokens.formatted()) · ответ: \(chat.completionTokens.formatted()) · всего: \(chat.totalTokens.formatted())")
                 }
             }
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
                 if factsActive {
                     Button {
                         showingFacts = true
@@ -172,8 +283,23 @@ struct ChatDetailView: View {
                     }
                     .help("Память фактов: показать и изменить")
                 }
-            }
-            ToolbarItem(placement: .primaryAction) {
+                if attachedProject != nil {
+                    Button {
+                        showingProjectPanel = true
+                    } label: {
+                        Image(systemName: "folder")
+                    }
+                    .help("Проект: инструкции, секции, «Собрать»")
+                }
+                Button {
+                    showingMemory = true
+                } label: {
+                    Image(systemName: "brain")
+                        .foregroundStyle(vm.memorySuggestions.isEmpty ? Color.secondary : Color.accentColor)
+                }
+                .help(vm.memorySuggestions.isEmpty
+                      ? "Память: профиль и заметки диалога"
+                      : "Память: \(vm.memorySuggestions.count) подсказок ждут подтверждения")
                 Button {
                     showingSettings = true
                 } label: {
@@ -190,6 +316,32 @@ struct ChatDetailView: View {
                 if let id = vm.selectedChatID { vm.setFacts(chatID: id, edited) }
             }
         }
+        .sheet(isPresented: $showingMemory) {
+            MemoryPanelView(vm: vm)
+        }
+        .sheet(isPresented: $showingProjectPanel) {
+            if let p = attachedProject {
+                ProjectPanelView(vm: vm, projectID: p.id)
+            }
+        }
+        .sheet(item: $memoryDraft) { draft in
+            MemoryItemEditorView(item: draft.item, title: "Сохранить в память") { edited in
+                vm.saveMemory(edited, chatID: vm.selectedChatID)
+            }
+        }
+        .sheet(item: $projectDraft) { draft in
+            ProjectEntryEditorView(entry: draft.entry, title: "Сохранить в проект") { edited in
+                if let pid = draft.projectID {
+                    vm.addEntry(projectID: pid, title: edited.title, body: edited.body,
+                                kind: edited.kind, sourceChatID: vm.selectedChatID)
+                }
+            }
+        }
+    }
+
+    /// Привязанный к выбранному чату проект (если есть).
+    private var attachedProject: Project? {
+        vm.selectedChat.flatMap { vm.project(for: $0) }
     }
 
     // MARK: - Список сообщений
@@ -205,6 +357,7 @@ struct ChatDetailView: View {
                             .padding(.top, 40)
                     }
                     compactionBanner
+                    memorySuggestionBanner
                     ForEach(messages) { message in
                         MessageBubble(
                             message: message,
@@ -212,7 +365,27 @@ struct ChatDetailView: View {
                                 if let chatID = vm.selectedChatID {
                                     vm.makeBranchFrom(chatID: chatID, messageID: message.id)
                                 }
-                            } : nil
+                            } : nil,
+                            onSaveToMemory: {
+                                let kind: MemoryKind = message.role == .user ? .note : .knowledge
+                                memoryDraft = MemoryDraft(item: MemoryItem(
+                                    scope: kind.defaultScope,
+                                    kind: kind,
+                                    text: message.content,
+                                    sourceChatID: vm.selectedChatID
+                                ))
+                            },
+                            onSaveToProject: attachedProject.map { project in
+                                {
+                                    projectDraft = ProjectEntryDraft(
+                                        entry: ProjectEntry(
+                                            title: ProjectEntry.deriveTitle(from: message.content),
+                                            body: message.content,
+                                            kind: message.role == .user ? .note : .knowledge,
+                                            sourceChatID: vm.selectedChatID),
+                                        projectID: project.id, isNew: true)
+                                }
+                            }
                         )
                         .id(message.id)
                     }
@@ -265,6 +438,27 @@ struct ChatDetailView: View {
         }
     }
 
+    /// Плашка: ассистент памяти предложил записи — открыть панель для подтверждения.
+    @ViewBuilder
+    private var memorySuggestionBanner: some View {
+        if !vm.memorySuggestions.isEmpty {
+            Button {
+                showingMemory = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "brain.head.profile")
+                    Text("Ассистент памяти предлагает \(vm.memorySuggestions.count) запис(и) — нажми, чтобы посмотреть и подтвердить")
+                }
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity, alignment: .center)
+        }
+    }
+
     @ViewBuilder
     private func bannerLine(_ text: String, system: String?, busy: Bool, sub: String, help: String) -> some View {
         VStack(spacing: 1) {
@@ -298,16 +492,16 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var errorBar: some View {
         if let error = errorText {
-            HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundColor(.orange)
                 Text(error)
-                    .font(.callout)
                     .foregroundColor(.primary)
                 Spacer()
             }
+            .font(.caption)
             .padding(.horizontal)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
             .background(Color.orange.opacity(0.12))
         }
     }
@@ -363,6 +557,123 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Полоса состояния конечного автомата задачи (FSM)
+
+    /// Над лентой: этапы (план → выполнение → проверка → ответ) с подсветкой
+    /// текущего + кнопки управления (пауза/продолжить/принять план/…).
+    @ViewBuilder
+    private var pipelineBar: some View {
+        if let chat = vm.selectedChat, let run = chat.taskRun {
+            VStack(spacing: 4) {
+                HStack(spacing: 6) {
+                    Image(systemName: "list.number")
+                        .foregroundColor(.secondary)
+                    ForEach(Array(TaskPhase.allCases.enumerated()), id: \.element) { idx, ph in
+                        phaseChip(ph, run: run)
+                        if idx < TaskPhase.allCases.count - 1 {
+                            Image(systemName: "arrow.right")
+                                .font(.caption2)
+                                .foregroundColor(.secondary.opacity(0.4))
+                        }
+                    }
+                    if run.executionRetries > 0 {
+                        Text("↻\(run.executionRetries)")
+                            .font(.caption2)
+                            .foregroundColor(.orange)
+                            .help("Возвратов «Проверка → Выполнение»: \(run.executionRetries)")
+                    }
+                    Spacer()
+                    pipelineControls(chat: chat, run: run)
+                }
+                if run.status == .failed, let err = run.errorText {
+                    Text(err)
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.accentColor.opacity(0.06))
+        }
+    }
+
+    private enum PhaseChipState { case done, current, upcoming }
+
+    private func phaseChipState(_ phase: TaskPhase, run: TaskRun) -> PhaseChipState {
+        if run.status == .finished { return .done }
+        let order = TaskPhase.allCases
+        guard let pi = order.firstIndex(of: phase),
+              let ci = order.firstIndex(of: run.phase) else { return .upcoming }
+        if pi < ci { return .done }
+        if pi == ci { return .current }
+        return .upcoming
+    }
+
+    @ViewBuilder
+    private func phaseChip(_ phase: TaskPhase, run: TaskRun) -> some View {
+        let state = phaseChipState(phase, run: run)
+        HStack(spacing: 3) {
+            if state == .done {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+            } else if state == .current, run.status == .running {
+                ProgressView().controlSize(.mini)
+            }
+            Text(phase.label)
+                .fontWeight(state == .current ? .semibold : .regular)
+                .foregroundColor(state == .current ? .accentColor
+                                 : (state == .done ? .primary : .secondary))
+        }
+    }
+
+    @ViewBuilder
+    private func pipelineControls(chat: Chat, run: TaskRun) -> some View {
+        HStack(spacing: 10) {
+            switch run.status {
+            case .running:
+                Button { vm.pausePipeline(chatID: chat.id) } label: {
+                    Label("Пауза", systemImage: "pause.fill")
+                }
+                .buttonStyle(.borderless)
+            case .awaitingPlan:
+                Button { vm.approvePlan(chatID: chat.id) } label: {
+                    Label("Принять план", systemImage: "checkmark.circle")
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.accentColor)
+                Button { vm.replan(chatID: chat.id) } label: {
+                    Label("Заново", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Перепланировать заново")
+            case .paused:
+                Button { vm.resumePipeline(chatID: chat.id) } label: {
+                    Label("Продолжить", systemImage: "play.fill")
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.accentColor)
+            case .failed:
+                Button { vm.resumePipeline(chatID: chat.id) } label: {
+                    Label("Повторить", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.orange)
+            case .finished:
+                HStack(spacing: 3) {
+                    Image(systemName: "checkmark.seal.fill").foregroundColor(.green)
+                    Text("Готово").foregroundColor(.green)
+                }
+            }
+            Button { vm.cancelRun(chatID: chat.id) } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundColor(.secondary.opacity(0.5))
+            .help("Сбросить задачу (история в ленте останется)")
+        }
+    }
+
     // MARK: - Предупреждение об усечении контекста
 
     /// Жёлтый бар: история чата рискует не влезть в окно выбранной модели —
@@ -370,45 +681,106 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var truncationBar: some View {
         if let chat = vm.selectedChat, let warning = vm.truncationWarning(for: chat) {
-            HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "scissors")
                     .foregroundColor(.yellow)
                 Text(warning)
-                    .font(.callout)
                 Spacer()
             }
+            .font(.caption)
             .padding(.horizontal)
-            .padding(.vertical, 8)
+            .padding(.vertical, 6)
             .background(Color.yellow.opacity(0.12))
         }
+    }
+
+    // MARK: - Быстрый переключатель режима задачи (FSM) — над полем ввода
+
+    /// Сегмент Обычный | Авто | План прямо над полем ввода, чтобы режим можно было
+    /// переключать в один клик, не заходя в настройки чата.
+    private var pipelineModeBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "list.number")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text("Режим задачи")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Picker("Режим задачи", selection: settingsBinding.pipelineMode) {
+                ForEach(PipelineMode.allCases) { m in
+                    Text(m.label).tag(m)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .fixedSize()
+            .help("Обычный — обычный чат без конвейера. Авто — этапы план → выполнение → проверка → ответ подряд. План — стоп после планирования (нужно «Принять план»).")
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
     }
 
     // MARK: - Поле ввода
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            TextField("Сообщение…", text: $vm.input, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...5)            // растёт до 5 строк, дальше — скролл
-                .font(.body)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color(nsColor: .textBackgroundColor))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.gray.opacity(0.35), lineWidth: 1)
-                )
-                .onSubmit(vm.send)
+        HStack(alignment: .bottom, spacing: 10) {
+            // Поле в ScrollView: TextField растёт без ограничения, контейнер
+            // ограничивает высоту до inputMaxHeight и даёт скролл колесом мыши.
+            // (TextField с lineLimit обрезал, но колёсиком не скроллился — только
+            // переходом курсора по тексту.)
+            ScrollView(.vertical) {
+                TextField("Сообщение…", text: $vm.input, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.preference(key: InputHeightKey.self, value: geo.size.height)
+                        }
+                    )
+                    .onSubmit(vm.send)
+            }
+            .frame(height: min(max(Self.inputMinHeight, inputContentHeight), Self.inputMaxHeight))
+            // Пока текст влезает — скролл выключен (нет лишнего «отскока»).
+            .scrollDisabled(inputContentHeight <= Self.inputMaxHeight)
+            .onPreferenceChange(InputHeightKey.self) { inputContentHeight = $0 }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(nsColor: .textBackgroundColor))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+            )
 
+            // Круглая кнопка отправки — единый размер, акцентный цвет, гасится когда нечего слать.
             Button(action: vm.send) {
                 Image(systemName: "paperplane.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .background(
+                        Circle().fill(vm.canSend ? Color.accentColor : Color.secondary.opacity(0.35))
+                    )
             }
+            .buttonStyle(.plain)
             .disabled(!vm.canSend)
+            .help("Отправить сообщение")
         }
-        .padding()
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+}
+
+/// Высота содержимого поля ввода (для авто-роста до предела и скролла дальше).
+private struct InputHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -420,11 +792,17 @@ struct ChatSettingsView: View {
     var showModelSection: Bool = true
     /// Ветвление — структурная стратегия, в сравнении недоступна.
     var allowBranching: Bool = true
+    /// Память кратко-/рабочая — на чат; в сравнении прячем (там только глобальная).
+    var showMemorySection: Bool = true
+    /// Профиль ответа — на чат; в сравнении прячем.
+    var showProfileSection: Bool = true
     @Environment(\.dismiss) private var dismiss
 
     /// Стоп-последовательности редактируем как строку «через запятую».
     @State private var stopText: String = ""
     @State private var showingModelPicker = false
+    /// Открытый редактор профиля (создание/правка).
+    @State private var editingProfile: ResponseProfile?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -482,11 +860,37 @@ struct ChatSettingsView: View {
                 }
                 }
 
+                if showProfileSection {
+                Section("Профиль ответа") {
+                    Picker("Профиль", selection: profileBinding) {
+                        Text("Без профиля").tag(UUID?.none)
+                        ForEach(vm.profiles) { p in Text(p.name).tag(Optional(p.id)) }
+                    }
+                    HStack(spacing: 12) {
+                        Button { editingProfile = ResponseProfile() } label: {
+                            Label("Новый", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderless)
+                        if let p = currentProfile {
+                            Button { editingProfile = p } label: { Label("Редактировать", systemImage: "pencil") }
+                                .buttonStyle(.borderless)
+                            Button(role: .destructive) { vm.deleteProfile(id: p.id) } label: {
+                                Label("Удалить", systemImage: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    Text("Пресет стиля/формата/ограничений ответа. Переключается на каждый чат; на токены/температуру не влияет (это отдельные параметры).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                }
+
                 Section("Формат ответа") {
                     TextEditor(text: $settings.responseFormat)
                         .frame(minHeight: 56)
                         .font(.body)
-                    Text("Как форматировать ответ (свободная инструкция). Напр.: «Маркированный список из 3 пунктов» или «верни строго JSON-объектом». Пусто — без требований к формату.")
+                    Text("Разовая правка формата поверх профиля. Напр.: «верни строго JSON». Пусто — без доп. требований.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -559,6 +963,66 @@ struct ChatSettingsView: View {
                         .foregroundColor(.secondary)
                 }
 
+                Section("Режим задачи (FSM)") {
+                    Picker("Режим", selection: $settings.pipelineMode) {
+                        ForEach(PipelineMode.allCases) { m in
+                            Text(m.label).tag(m)
+                        }
+                    }
+                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskRun.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                if showMemorySection {
+                Section("Память") {
+                    Toggle("Долговременная память (глобально, во всех чатах)", isOn: $settings.injectLongTermMemory)
+                    Toggle("Память этого чата (проект + краткосрочная)", isOn: $settings.injectChatMemory)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Бюджет памяти")
+                            Spacer()
+                            Text("\(settings.memoryTokenBudget) ток.")
+                                .foregroundColor(.secondary)
+                                .monospacedDigit()
+                        }
+                        Slider(
+                            value: Binding(
+                                get: { Double(settings.memoryTokenBudget) },
+                                set: { settings.memoryTokenBudget = Int($0) }
+                            ),
+                            in: Double(GenerationSettings.memoryTokenBudgetRange.lowerBound)...Double(GenerationSettings.memoryTokenBudgetRange.upperBound),
+                            step: 100
+                        )
+                        Text("Сколько токенов максимум занимает блок памяти в промпте. Закреплённые записи включаются всегда.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Toggle("Ассистент памяти (разбирать диалог фоном)", isOn: $settings.memoryAssistEnabled)
+                    if settings.memoryAssistEnabled {
+                        Toggle("Автозапись: ИИ сам пишет важное в память", isOn: $settings.autoMemory)
+                        Text(settings.autoMemory
+                             ? "Вкл: ассистент сам сохраняет, что счёл важным."
+                             : "Выкл: ассистент ПРЕДЛАГАЕТ записи — ты подтверждаешь (кнопка «Память» в шапке).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("Выкл: фоновых вызовов нет. Память пополняется только вручную (кнопки «В память» / «В проект» на сообщении или панель «Память»).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Toggle("Автосекции в проект: полные ответы агента → секции", isOn: $settings.autoProjectSections)
+                    Text(settings.autoProjectSections
+                         ? "Вкл: содержательный ответ целиком добавляется секцией в привязанный проект (нужен проект)."
+                         : "Выкл: ответы попадают в проект только вручную кнопкой «В проект».")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                }
+
                 Section("Стоп-последовательности") {
                     TextField("", text: $stopText, prompt: Text("через запятую, напр.: \\n, END"))
                         .onChange(of: stopText) { _ in
@@ -601,6 +1065,30 @@ struct ChatSettingsView: View {
                 onSelect: { settings.provider = $0.provider; settings.model = $0.model }
             )
         }
+        .sheet(item: $editingProfile) { p in
+            ProfileEditorView(profile: p) { edited in
+                if vm.profiles.contains(where: { $0.id == edited.id }) {
+                    vm.updateProfile(edited)
+                } else {
+                    // Новый профиль — добавляем и сразу делаем активным для чата.
+                    vm.profiles.insert(edited, at: 0)
+                    if let cid = vm.selectedChatID { vm.setChatProfile(chatID: cid, profileID: edited.id) }
+                }
+            }
+        }
+    }
+
+    /// Активный профиль выбранного чата (для секции «Профиль ответа»).
+    private var currentProfile: ResponseProfile? {
+        vm.selectedChat.flatMap { vm.profile(for: $0) }
+    }
+
+    /// Привязка профиля к выбранному чату.
+    private var profileBinding: Binding<UUID?> {
+        Binding(
+            get: { vm.selectedChat?.profileID },
+            set: { newID in if let cid = vm.selectedChatID { vm.setChatProfile(chatID: cid, profileID: newID) } }
+        )
     }
 
     /// Парсит «a, b, c» в массив, превращая литералы \n и \t в реальные символы.
@@ -618,6 +1106,57 @@ struct ChatSettingsView: View {
         stops.map { $0.replacingOccurrences(of: "\n", with: "\\n")
                       .replacingOccurrences(of: "\t", with: "\\t") }
              .joined(separator: ", ")
+    }
+}
+
+/// Редактор «Профиля ответа»: название + стиль/тон, формат, длина-и-ограничения,
+/// язык, доп. инструкции (все поля свободные; токены/температуру не задаёт).
+struct ProfileEditorView: View {
+    @State var profile: ResponseProfile
+    let onSave: (ResponseProfile) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var isEmptyName: Bool {
+        profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Профиль ответа").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") { onSave(profile); dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isEmptyName)
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                Section("Название") {
+                    TextField("", text: $profile.name, prompt: Text("название профиля"))
+                }
+                field("Стиль и тон", $profile.style, "напр.: дружелюбный и неформальный; строгий технический")
+                field("Формат ответа", $profile.format, "напр.: маркированные пункты; таблица; строго JSON")
+                field("Длина и ограничения", $profile.constraints, "напр.: коротко, до 3 пунктов; без жаргона; не давай советов")
+                Section("Язык ответа") {
+                    TextField("", text: $profile.language, prompt: Text("напр.: русский; как спрашивают"))
+                }
+                field("Доп. инструкции", $profile.extra, "любые дополнительные правила для ответов этого профиля")
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 520, height: 660)
+    }
+
+    @ViewBuilder
+    private func field(_ title: String, _ text: Binding<String>, _ hint: String) -> some View {
+        Section(title) {
+            TextEditor(text: text).frame(minHeight: 48).font(.body)
+            Text(hint).font(.caption).foregroundColor(.secondary)
+        }
     }
 }
 
@@ -782,6 +1321,467 @@ struct FactsEditorView: View {
     }
 }
 
+// MARK: - Память (UI)
+
+/// Обёртка записи памяти для .sheet(item:) (черновик/редактирование).
+struct MemoryDraft: Identifiable {
+    let id = UUID()
+    var item: MemoryItem
+}
+
+/// Редактор одной записи памяти: уровень, тип, текст, теги, закрепление.
+struct MemoryItemEditorView: View {
+    @State var item: MemoryItem
+    var title: String = "Запись памяти"
+    let onSave: (MemoryItem) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var tagsText = ""
+
+    private var isEmpty: Bool {
+        item.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(title).font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") {
+                    item.tags = tagsText.split(separator: ",")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                    onSave(item)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isEmpty)
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                Section {
+                    // Рабочая память живёт в проекте (секции) — здесь только
+                    // долговременная и краткосрочная.
+                    Picker("Уровень памяти", selection: $item.scope) {
+                        ForEach([MemoryScope.longTerm, .shortTerm]) { s in Text(s.label).tag(s) }
+                    }
+                    Text(item.scope.hint).font(.caption).foregroundColor(.secondary)
+                    Picker("Тип", selection: $item.kind) {
+                        ForEach(MemoryKind.allCases) { k in Text(k.label).tag(k) }
+                    }
+                }
+                Section("Текст") {
+                    TextEditor(text: $item.text)
+                        .frame(minHeight: 100)
+                        .font(.body)
+                }
+                Section {
+                    TextField("", text: $tagsText, prompt: Text("теги через запятую (необязательно)"))
+                    Toggle("Закрепить (всегда подставлять в промпт)", isOn: $item.pinned)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 470, height: 480)
+        .onAppear { tagsText = item.tags.joined(separator: ", ") }
+    }
+}
+
+/// Обёртка секции проекта для .sheet(item:) (черновик/редактирование).
+struct ProjectEntryDraft: Identifiable {
+    let id = UUID()
+    var entry: ProjectEntry
+    var projectID: UUID?
+    var isNew: Bool
+}
+
+/// Панель ПРОФИЛЯ (кнопка «мозг» в чате): долговременная + краткосрочная память +
+/// подсказки ассистента. Рабочая память (проект) — отдельно, во вкладке «Проекты».
+struct MemoryPanelView: View {
+    @ObservedObject var vm: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var editTarget: MemoryDraft?
+
+    private var chat: Chat? { vm.selectedChat }
+    private var chatID: UUID? { vm.selectedChatID }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Память").font(.headline)
+                Spacer()
+                if chat?.messages.isEmpty == false {
+                    Button {
+                        if let cid = chatID { vm.requestMemorySuggestions(chatID: cid) }
+                    } label: {
+                        Label("Предложить в профиль", systemImage: "sparkles")
+                    }
+                    .help("ИИ разберёт диалог и предложит записи в долговременный профиль")
+                }
+                Button("Готово") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                suggestionsSection
+                scopeSection(title: "Долговременная — профиль (во всех чатах)",
+                             icon: "brain", items: vm.memory, addScope: .longTerm, addKind: .knowledge)
+                scopeSection(title: "Краткосрочная — текущий диалог",
+                             icon: "bubble.left", items: chat?.memory ?? [], addScope: .shortTerm, addKind: .note)
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 560, height: 600)
+        .sheet(item: $editTarget) { draft in
+            MemoryItemEditorView(item: draft.item) { edited in
+                if vm.memorySuggestions.contains(where: { $0.id == edited.id }) {
+                    vm.confirmSuggestion(edited, chatID: chatID)
+                } else {
+                    vm.updateMemory(edited, chatID: chatID)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var suggestionsSection: some View {
+        if !vm.memorySuggestions.isEmpty {
+            Section {
+                ForEach(vm.memorySuggestions) { s in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(s.text).font(.callout)
+                        HStack(spacing: 10) {
+                            Text("\(s.scope.label) · \(s.kind.label)")
+                                .font(.caption2).foregroundColor(.secondary)
+                            Spacer()
+                            Button("Править") { editTarget = MemoryDraft(item: s) }
+                                .buttonStyle(.borderless)
+                            Button("В память") { vm.confirmSuggestion(s, chatID: chatID) }
+                                .buttonStyle(.borderless)
+                            Button("Скрыть") { vm.dismissSuggestion(id: s.id) }
+                                .buttonStyle(.borderless)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                Button("Скрыть все подсказки") { vm.clearSuggestions() }
+                    .buttonStyle(.borderless)
+                    .foregroundColor(.secondary)
+            } header: {
+                Label("Подсказки ассистента памяти", systemImage: "sparkles")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func scopeSection(title: String, icon: String, items: [MemoryItem],
+                              addScope: MemoryScope, addKind: MemoryKind) -> some View {
+        Section {
+            if items.isEmpty {
+                Text("Пусто").font(.caption).foregroundColor(.secondary)
+            }
+            ForEach(items) { item in itemRow(item) }
+            Button {
+                editTarget = MemoryDraft(item: MemoryItem(scope: addScope, kind: addKind, sourceChatID: chatID))
+            } label: {
+                Label("Добавить запись", systemImage: "plus")
+            }
+            .buttonStyle(.borderless)
+        } header: {
+            Label(title, systemImage: icon)
+        }
+    }
+
+    private func itemRow(_ item: MemoryItem) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Button { vm.togglePin(id: item.id, chatID: chatID) } label: {
+                Image(systemName: item.pinned ? "pin.fill" : "pin")
+            }
+            .buttonStyle(.borderless)
+            .foregroundColor(item.pinned ? .accentColor : .secondary)
+            .help(item.pinned ? "Открепить" : "Закрепить (всегда в промпте)")
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.text).font(.callout).lineLimit(3)
+                HStack(spacing: 6) {
+                    Text(item.kind.label)
+                    if !item.tags.isEmpty { Text("#" + item.tags.joined(separator: " #")) }
+                }
+                .font(.caption2).foregroundColor(.secondary)
+            }
+            Spacer()
+            Button { editTarget = MemoryDraft(item: item) } label: {
+                Image(systemName: "pencil")
+            }
+            .buttonStyle(.borderless)
+            Button(role: .destructive) { vm.deleteMemory(id: item.id, chatID: chatID) } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// Панель ПРОЕКТА (вкладка «Проекты»): инструкции + полнотекстовые секции +
+/// «Собрать». Память проекта общая для всех его диалогов (cowork).
+struct ProjectPanelView: View {
+    @ObservedObject var vm: ChatViewModel
+    let projectID: UUID
+    @Environment(\.dismiss) private var dismiss
+    @State private var entryTarget: ProjectEntryDraft?
+
+    private var project: Project? { vm.projects.first { $0.id == projectID } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(project?.title ?? "Проект").font(.headline)
+                Spacer()
+                if let p = project {
+                    Button { vm.assembleProject(projectID: p.id) } label: {
+                        Label("Собрать", systemImage: "doc.text.magnifyingglass")
+                    }
+                    .disabled(p.entries.isEmpty || vm.isAssembling)
+                    .help("Сшить полные секции проекта в итоговый документ")
+                    if vm.isAssembling { ProgressView().controlSize(.small) }
+                }
+                Button("Готово") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                Section("Название проекта") {
+                    TextField("", text: titleBinding, prompt: Text("название"))
+                }
+                Section {
+                    TextEditor(text: instructionsBinding).frame(minHeight: 60).font(.body)
+                } header: {
+                    Label("Инструкции проекта", systemImage: "text.alignleft")
+                } footer: {
+                    Text("Учитываются в каждом ответе диалогов этого проекта. Можно оставить пустым.")
+                        .font(.caption)
+                }
+                if let p = project { sectionsSection(p) }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 620, height: 700)
+        .sheet(item: $entryTarget) { draft in
+            ProjectEntryEditorView(entry: draft.entry) { edited in
+                if draft.isNew {
+                    vm.addEntry(projectID: projectID, title: edited.title, body: edited.body, kind: edited.kind)
+                } else {
+                    vm.updateEntry(edited, projectID: projectID)
+                }
+            }
+        }
+        .sheet(isPresented: Binding(
+            get: { vm.assemblyResult != nil },
+            set: { if !$0 { vm.assemblyResult = nil } }
+        )) {
+            AssemblyResultView(text: vm.assemblyResult ?? "") { result in
+                vm.addEntry(projectID: projectID, title: "Итог проекта", body: result, kind: .knowledge)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func sectionsSection(_ p: Project) -> some View {
+        Section {
+            if p.entries.isEmpty {
+                Text("Секций пока нет. Они появятся, когда агент будет вести проект (автосекции) или по кнопке «В проект» на сообщении.")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+            ForEach(p.entries) { entry in entryRow(entry) }
+            Button {
+                entryTarget = ProjectEntryDraft(entry: ProjectEntry(kind: .knowledge), projectID: projectID, isNew: true)
+            } label: {
+                Label("Добавить секцию", systemImage: "plus")
+            }
+            .buttonStyle(.borderless)
+        } header: {
+            Label("Секции проекта", systemImage: "doc.plaintext")
+        }
+    }
+
+    private func entryRow(_ entry: ProjectEntry) -> some View {
+        DisclosureGroup {
+            Text(MarkdownText.attributed(entry.body))
+                .font(.callout)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 4)
+            HStack(spacing: 12) {
+                Button { entryTarget = ProjectEntryDraft(entry: entry, projectID: projectID, isNew: false) } label: {
+                    Label("Править", systemImage: "pencil")
+                }
+                .buttonStyle(.borderless)
+                Button(role: .destructive) { vm.deleteEntry(id: entry.id, projectID: projectID) } label: {
+                    Label("Удалить", systemImage: "trash")
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(.secondary)
+                Spacer()
+            }
+            .font(.caption2)
+        } label: {
+            HStack(spacing: 8) {
+                Button { vm.toggleEntryPin(id: entry.id, projectID: projectID) } label: {
+                    Image(systemName: entry.pinned ? "pin.fill" : "pin")
+                }
+                .buttonStyle(.borderless)
+                .foregroundColor(entry.pinned ? .accentColor : .secondary)
+                Text(entry.title.isEmpty ? "(без названия)" : entry.title)
+                    .font(.callout).lineLimit(1)
+            }
+        }
+    }
+
+    private var titleBinding: Binding<String> {
+        Binding(get: { project?.title ?? "" }, set: { vm.updateProject(id: projectID, title: $0) })
+    }
+    private var instructionsBinding: Binding<String> {
+        Binding(get: { project?.brief ?? "" }, set: { vm.updateProject(id: projectID, brief: $0) })
+    }
+}
+
+/// Редактор секции проекта: заголовок + тип + закрепление + ПОЛНЫЙ текст.
+struct ProjectEntryEditorView: View {
+    @State var entry: ProjectEntry
+    var title: String = "Секция проекта"
+    let onSave: (ProjectEntry) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    private var isEmpty: Bool { entry.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(title).font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") {
+                    if entry.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        entry.title = ProjectEntry.deriveTitle(from: entry.body)
+                    }
+                    onSave(entry)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(isEmpty)
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                Section("Заголовок секции") {
+                    TextField("", text: $entry.title, prompt: Text("название секции"))
+                    Picker("Тип", selection: $entry.kind) {
+                        ForEach(MemoryKind.allCases) { k in Text(k.label).tag(k) }
+                    }
+                    Toggle("Закрепить (всегда подставлять в промпт)", isOn: $entry.pinned)
+                }
+                Section("Текст секции (полный)") {
+                    TextEditor(text: $entry.body)
+                        .frame(minHeight: 200)
+                        .font(.body)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 560, height: 580)
+    }
+}
+
+/// Лист создания проекта: только название + необязательные инструкции.
+/// Никакого «ИИ предлагает бриф» — назвал и сразу пишешь.
+struct ProjectCreateView: View {
+    let onCreate: (String, String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title = ""
+    @State private var instructions = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Новый проект").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Создать") { onCreate(title, instructions); dismiss() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding()
+
+            Divider()
+
+            Form {
+                Section("Название") {
+                    TextField("", text: $title, prompt: Text("название проекта"))
+                }
+                Section {
+                    TextEditor(text: $instructions).frame(minHeight: 100).font(.body)
+                } header: {
+                    Label("Инструкции проекта (необязательно)", systemImage: "text.alignleft")
+                } footer: {
+                    Text("Твой промпт для задачи — агент учитывает его в каждом ответе проекта. Можно оставить пустым и просто начать писать.")
+                        .font(.caption)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 520, height: 480)
+    }
+}
+
+/// Лист с итогом «Собрать»: полный текст, копирование, сохранение секцией.
+struct AssemblyResultView: View {
+    let text: String
+    let onSaveAsSection: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var copied = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Итог проекта").font(.headline)
+                Spacer()
+                Button(copied ? "Скопировано" : "Копировать") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                    copied = true
+                }
+                Button("Сохранить как секцию") { onSaveAsSection(text); dismiss() }
+                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding()
+
+            Divider()
+
+            ScrollView {
+                Text(MarkdownText.attributed(text))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+        }
+        .frame(width: 660, height: 660)
+    }
+}
+
 /// Лист с API-ключами провайдеров (хранятся вне репозитория через KeyStore).
 struct ProviderKeysView: View {
     @ObservedObject var vm: ChatViewModel
@@ -854,44 +1854,28 @@ struct ProviderKeysView: View {
     }
 }
 
-/// «Пузырь» одного сообщения: user — справа (обычный текст), assistant — слева (Markdown).
-/// При наведении показывается кнопка «Копировать».
-struct MessageBubble: View {
-    let message: ChatMessage
-    /// Действие «создать ветку диалога с этого места» (если доступно).
-    var onBranch: (() -> Void)? = nil
+/// Содержимое пузыря (текст/Markdown + фон). Equatable и зависит ТОЛЬКО от
+/// содержимого и роли — поэтому при перерисовке родителя (hover-кнопки, copied,
+/// загрузка соседних сообщений) SwiftUI НЕ пересоздаёт Markdown и не сбрасывает
+/// активное выделение текста. Выделение ответов агента раньше слетало именно
+/// из-за пересборки этого поддерева на каждое изменение hovering.
+private struct BubbleContent: View, Equatable {
+    let content: String
+    let isUser: Bool
 
-    @State private var hovering = false
-    @State private var copied = false
-
-    private var isUser: Bool { message.role == .user }
-
-    var body: some View {
-        VStack(alignment: isUser ? .trailing : .leading, spacing: 3) {
-            HStack(spacing: 0) {
-                if isUser { Spacer(minLength: 40) }
-                bubble
-                if !isUser { Spacer(minLength: 40) }
-            }
-            if !isUser, let metrics = message.metrics {
-                Text(Self.metricsText(metrics))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .help(Self.metricsTooltip(metrics))
-            }
-            copyControl
-        }
-        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
-        .onHover { hovering = $0 }
+    static func == (a: BubbleContent, b: BubbleContent) -> Bool {
+        a.content == b.content && a.isUser == b.isUser
     }
 
-    /// Содержимое пузыря: пользовательский текст — как есть, ответ агента — как Markdown.
-    private var bubble: some View {
+    var body: some View {
         Group {
             if isUser {
-                Text(message.content)
+                Text(content)
             } else {
-                Markdown(message.content)
+                // Один Text из styled-AttributedString → выделение сплошное по
+                // всему ответу (MarkdownUI рисует блоки порознь и так не умеет).
+                Text(MarkdownText.attributed(content))
+                    .tint(.accentColor)
             }
         }
         .textSelection(.enabled)
@@ -904,6 +1888,55 @@ struct MessageBubble: View {
                 .stroke(Color.gray.opacity(isUser ? 0 : 0.25), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// «Пузырь» одного сообщения: user — справа (обычный текст), assistant — слева (Markdown).
+/// При наведении показывается кнопка «Копировать».
+struct MessageBubble: View {
+    let message: ChatMessage
+    /// Действие «создать ветку диалога с этого места» (если доступно).
+    var onBranch: (() -> Void)? = nil
+    /// Действие «сохранить это сообщение в память» (если доступно).
+    var onSaveToMemory: (() -> Void)? = nil
+    /// Действие «сохранить это сообщение секцией в проект» (если чат привязан к проекту).
+    var onSaveToProject: (() -> Void)? = nil
+
+    @State private var hovering = false
+    @State private var copied = false
+
+    private var isUser: Bool { message.role == .user }
+
+    var body: some View {
+        VStack(alignment: isUser ? .trailing : .leading, spacing: 3) {
+            if !isUser, let phase = message.phase {
+                Text(phase.label)
+                    .font(.caption2)
+                    .fontWeight(.medium)
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.12)))
+            }
+            HStack(spacing: 0) {
+                if isUser { Spacer(minLength: 40) }
+                // .equatable() — чтобы смена hovering/copied (кнопки под пузырём)
+                // НЕ пересоздавала Markdown: иначе при появлении кнопок выделение
+                // текста сбрасывается. Пузырь зависит только от содержимого.
+                BubbleContent(content: message.content, isUser: isUser)
+                    .equatable()
+                if !isUser { Spacer(minLength: 40) }
+            }
+            if !isUser, let metrics = message.metrics {
+                Text(Self.metricsText(metrics))
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .help(Self.metricsTooltip(metrics))
+            }
+            copyControl
+        }
+        .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .onHover { hovering = $0 }
     }
 
     /// Кнопки под пузырём (появляются при наведении): копировать + ветка.
@@ -920,6 +1953,20 @@ struct MessageBubble: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Создать новый чат-ветку с историей до этого сообщения")
+            }
+            if let onSaveToProject {
+                Button(action: onSaveToProject) {
+                    Label("В проект", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(.borderless)
+                .help("Сохранить этот ответ ПОЛНОСТЬЮ секцией в привязанный проект")
+            }
+            if let onSaveToMemory {
+                Button(action: onSaveToMemory) {
+                    Label("В память", systemImage: "brain")
+                }
+                .buttonStyle(.borderless)
+                .help("Сохранить как короткую запись (профиль/заметка)")
             }
         }
         .font(.caption2)
