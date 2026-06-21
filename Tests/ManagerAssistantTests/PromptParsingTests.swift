@@ -153,6 +153,46 @@ final class PromptParsingTests: XCTestCase {
         XCTAssertFalse(p.contains("УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ"))
     }
 
+    // MARK: Диспетчер переходов (роутер)
+
+    func testParseRouterDecisionForms() {
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ок\nДЕЙСТВИЕ: REDO_CURRENT"), .redoCurrent)
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: BACK"), .back)
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("надо переделать\nДЕЙСТВИЕ: REPLAN"), .replan)
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: RESTART"), .restart)
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: REFUSE"), .refuse)
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: GOTO:validation"), .goto(.validation))
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: GOTO: проверка"), .goto(.validation))
+        XCTAssertEqual(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: GOTO:планирование"), .goto(.planning))
+    }
+
+    func testParseRouterDecisionJunk() {
+        XCTAssertNil(PipelinePrompts.parseRouterDecision("просто текст без маркера"))
+        XCTAssertNil(PipelinePrompts.parseRouterDecision("ДЕЙСТВИЕ: НЕПОНЯТНО"))
+    }
+
+    func testRouterTargetMapping() {
+        XCTAssertNil(PipelinePrompts.routerTarget(.redoCurrent, from: .execution))
+        XCTAssertNil(PipelinePrompts.routerTarget(.refuse, from: .validation))
+        XCTAssertEqual(PipelinePrompts.routerTarget(.back, from: .validation), .execution)
+        XCTAssertEqual(PipelinePrompts.routerTarget(.replan, from: .validation), .planning)
+        XCTAssertEqual(PipelinePrompts.routerTarget(.restart, from: .execution), .planning)
+        XCTAssertEqual(PipelinePrompts.routerTarget(.goto(.answer), from: .validation), .answer)
+    }
+
+    func testStripRouterMarker() {
+        XCTAssertEqual(PipelinePrompts.stripRouterMarker("Вернёмся к проверке.\nДЕЙСТВИЕ: BACK"), "Вернёмся к проверке.")
+        XCTAssertEqual(PipelinePrompts.stripRouterMarker("без маркера"), "без маркера")
+    }
+
+    func testTransitionRulesBlockNoViolationMarker() {
+        // Скрытый инвариант переходов НЕ должен содержать маркер инвариантов (иначе ложный обрыв).
+        let block = PipelinePrompts.transitionRulesBlock(from: .planning)
+        XCTAssertFalse(block.contains(InvariantValidator.violationMarker))
+        XCTAssertTrue(block.contains("Выполнение"))           // из planning доступно только выполнение
+        XCTAssertTrue(PipelinePrompts.transitionRulesBlock(from: .answer).contains("терминальная"))
+    }
+
     // MARK: subAgentPrompt — узкий контекст
 
     func testSubAgentPromptIncludesOnlyDepOutputs() {

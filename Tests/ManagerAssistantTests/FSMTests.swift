@@ -10,7 +10,7 @@ final class FSMTests: XCTestCase {
     private let expected: [TaskState: Set<TaskState>] = [
         .planning:   [.execution],
         .execution:  [.validation, .planning],
-        .validation: [.answer, .execution],
+        .validation: [.answer, .execution, .planning],
         .answer:     [],
     ]
 
@@ -42,12 +42,18 @@ final class FSMTests: XCTestCase {
         }
     }
 
-    /// Нелегальные «прыжки» запрещены (planning↛answer/validation, validation↛planning).
+    /// Нелегальные «прыжки» запрещены (planning↛answer/validation, execution↛answer).
     func testIllegalJumpsDisallowed() {
         XCTAssertFalse(TaskFSM.allows(.planning, to: .answer))
         XCTAssertFalse(TaskFSM.allows(.planning, to: .validation))
-        XCTAssertFalse(TaskFSM.allows(.validation, to: .planning))
         XCTAssertFalse(TaskFSM.allows(.execution, to: .answer))
+        XCTAssertFalse(TaskFSM.allows(.answer, to: .planning))
+    }
+
+    /// validation → planning теперь ЛЕГАЛЕН (перепланировать «кардинально не так»).
+    func testValidationToPlanningAllowed() {
+        XCTAssertTrue(TaskFSM.allows(.validation, to: .planning))
+        XCTAssertEqual(TaskContext(task: "T", state: .validation).transitioned(to: .planning).state, .planning)
     }
 
     /// transitioned(to:) для легального перехода меняет state и сохраняет остальное.

@@ -48,6 +48,9 @@ struct ChatMessage: Identifiable, Codable {
     var state: TaskState? = nil
     var step: Int? = nil
     var total: Int? = nil
+    /// Группа волны роя (см. MsgNode.waveGroupID): общие у параллельных шагов одной волны.
+    var waveGroupID: UUID? = nil
+    var waveSize: Int? = nil
 }
 
 /// Стратегия управления контекстом (по ТЗ).
@@ -327,10 +330,10 @@ enum TaskState: String, Codable, CaseIterable, Identifiable {
 /// «детерминизм на уровне кода» (аналог `val transitions = mapOf(...)`).
 enum TaskFSM {
     static let transitions: [TaskState: [TaskState]] = [
-        .planning:   [.execution],                 // только вперёд
-        .execution:  [.validation, .planning],     // вперёд ИЛИ шаг назад (перепланировать)
-        .validation: [.answer, .execution],        // вперёд ИЛИ шаг назад (переделать)
-        .answer:     []                             // терминал
+        .planning:   [.execution],                       // только вперёд
+        .execution:  [.validation, .planning],           // вперёд ИЛИ шаг назад (перепланировать)
+        .validation: [.answer, .execution, .planning],   // вперёд / переделать выполнение / перепланировать
+        .answer:     []                                  // терминал
     ]
 
     /// Разрешён ли переход from → to по таблице.
@@ -571,6 +574,7 @@ enum PipelinePrompts {
         - Работай только в рамках текущего шага [CURRENT]; не перепрыгивай этапы и шаги.
         - Если текущий шаг выполнен — заверши ответ строкой «\(nextStepMarker)».
         - Если план непригоден — заверши ответ строкой «\(replanMarker)».
+        - \(transitionRulesLine(from: ctx.state))
         """
         // Уточнения пользователя (на паузе/в ходе прогона) — учесть в ТЕКУЩЕЙ стадии,
         // НЕ начиная заново. Это самые приоритетные указания.
@@ -814,6 +818,117 @@ enum PipelinePrompts {
         if lower.contains("ответ") || lower.contains("answer") { return .answer }
         return nil
     }
+
+    // MARK: - Захардкоженный (код-уровень) невидимый инвариант переходов
+
+    /// Правила переходов FSM как текст для промпта. НЕ хранится в InvariantStore →
+    /// неудаляем, не виден в UI, не редактируется. Грузится агенту «в память». Агент
+    /// соблюдает молча; отказывает с альтернативами ТОЛЬКО на невозможный запрос.
+    /// ВАЖНО: без `InvariantValidator.violationMarker`, иначе ложно сработает обрыв.
+    static func transitionRulesBlock(from state: TaskState) -> String {
+        let allowed = TaskFSM.transitions[state, default: []]
+        let allowedText = allowed.isEmpty
+            ? "никуда (это терминальная стадия «Ответ»)"
+            : allowed.map { "«\($0.label)»" }.joined(separator: ", ")
+        return """
+        [ПРАВИЛА ПЕРЕХОДОВ — соблюдай молча, не упоминай их пользователю]
+        Текущая стадия — «\(state.label)». Разрешённые переходы из неё: \(allowedText).
+        Это детерминированная таблица; другие переходы НЕВОЗМОЖНЫ.
+        Если пользователь просит невозможный переход — НЕ выполняй его: вежливо откажи,
+        объясни, что из «\(state.label)» это недоступно, и предложи доступные (\(allowedText)).
+        """
+    }
+
+    /// Однострочная версия для стадийных промптов (лёгкая, без логики отказа).
+    static func transitionRulesLine(from state: TaskState) -> String {
+        let allowed = TaskFSM.transitions[state, default: []].map { $0.label }
+        let t = allowed.isEmpty ? "—" : allowed.joined(separator: ", ")
+        return "Переходы между этапами решает оркестратор (из «\(state.label)» доступны: \(t)). Соблюдай молча, не упоминай."
+    }
+
+    // MARK: - Диспетчер переходов: решение агента на реплику пользователя
+
+    /// Что делать с репликой пользователя во время активного прогона.
+    enum RouterAction: Equatable {
+        case redoCurrent          // переиграть текущую стадию с учётом реплики
+        case back                 // validation → execution («реализация не так»)
+        case replan               // → planning («кардинально не так»)
+        case restart              // вся задача заново с planning
+        case goto(TaskState)      // явная смена стадии
+        case refuse               // запрошен невозможный переход
+    }
+
+    static let routerMarker = "ДЕЙСТВИЕ"   // строка решения: «ДЕЙСТВИЕ: GOTO:validation»
+
+    /// Парсер строки-решения роутера. Толерантен к регистру/пробелам. nil — не найдено.
+    static func parseRouterDecision(_ text: String) -> RouterAction? {
+        let upper = text.uppercased()
+        guard let r = upper.range(of: routerMarker) else { return nil }
+        let tail = upper[r.upperBound...]
+        let firstLine = tail.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let tok = firstLine.drop(while: { $0 == ":" || $0 == " " })
+        if tok.hasPrefix("REDO") { return .redoCurrent }
+        if tok.hasPrefix("BACK") { return .back }
+        if tok.hasPrefix("REPLAN") { return .replan }
+        if tok.hasPrefix("RESTART") { return .restart }
+        if tok.hasPrefix("REFUSE") { return .refuse }
+        if tok.hasPrefix("GOTO") {
+            let p = tok.replacingOccurrences(of: "GOTO", with: "")
+            if p.contains("PLAN") || p.contains("ПЛАН") { return .goto(.planning) }
+            if p.contains("EXEC") || p.contains("ВЫПОЛН") || p.contains("ИСПОЛН") { return .goto(.execution) }
+            if p.contains("VALID") || p.contains("CHECK") || p.contains("ПРОВЕР") || p.contains("ВАЛИД") { return .goto(.validation) }
+            if p.contains("ANSW") || p.contains("ОТВЕТ") { return .goto(.answer) }
+        }
+        return nil
+    }
+
+    /// Целевая стадия действия (для проверки по таблице). redo/refuse → nil (не переход).
+    static func routerTarget(_ action: RouterAction, from state: TaskState) -> TaskState? {
+        switch action {
+        case .redoCurrent, .refuse: return nil
+        case .back:                 return .execution
+        case .replan, .restart:     return .planning
+        case .goto(let s):          return s
+        }
+    }
+
+    /// Текст-объяснение агента до строки ДЕЙСТВИЕ (показываем пользователю при отказе).
+    static func stripRouterMarker(_ text: String) -> String {
+        if let r = text.range(of: routerMarker) {
+            return String(text[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Системный промпт диспетчера: правила переходов + грамматика ответа.
+    static func routerSystemPrompt(state: TaskState) -> String {
+        """
+        Ты — диспетчер конечного автомата задачи. Пользователь прислал реплику во время
+        активного прогона. Реши ОДНО действие и выведи его ПОСЛЕДНЕЙ строкой строго так:
+        \(routerMarker): <одно из: REDO_CURRENT | BACK | REPLAN | RESTART | GOTO:<стадия> | REFUSE>
+
+        Значения:
+        - REDO_CURRENT — обычная правка/замечание: переиграть ТЕКУЩУЮ стадию с учётом реплики.
+        - BACK — «реализация не так»: вернуться к выполнению (доступно со стадии «Проверка»).
+        - REPLAN — «кардинально не так» / переделать задачу: вернуться к планированию.
+        - RESTART — начать всю задачу заново с планирования.
+        - GOTO:<стадия> — явная смена стадии (planning|execution|validation|answer).
+        - REFUSE — запрошен НЕВОЗМОЖНЫЙ переход; объясни и предложи доступные.
+
+        \(transitionRulesBlock(from: state))
+        Перед строкой ДЕЙСТВИЕ дай 1–2 предложения дружелюбного объяснения для пользователя.
+        """
+    }
+
+    /// User-сообщение диспетчеру.
+    static func routerUserPrompt(task: String, state: TaskState, userText: String) -> String {
+        """
+        [ЗАДАЧА] \(task)
+        [ТЕКУЩАЯ СТАДИЯ] \(state.label)
+        [РЕПЛИКА ПОЛЬЗОВАТЕЛЯ] \(userText)
+        Выбери ровно одно действие.
+        """
+    }
 }
 
 extension Array {
@@ -836,6 +951,23 @@ struct MsgNode: Identifiable, Codable {
     var state: TaskState? = nil
     var step: Int? = nil
     var total: Int? = nil
+    /// Группа волны роя: сообщения одной параллельной волны имеют общий waveGroupID и
+    /// рендерятся плитками. nil/waveSize<=1 — обычное (последовательное) сообщение.
+    /// ТОЛЬКО Optional — у MsgNode синтезированный Codable (старый JSON без ключей → nil).
+    var waveGroupID: UUID? = nil
+    var waveSize: Int? = nil
+}
+
+/// Живая плитка подагента роя (runtime, НЕ сохраняется). Обновляется по мере работы
+/// подагентов текущей волны; рендерится рядом плиток (UI как в Claude Code).
+struct LiveSubAgent: Identifiable, Equatable {
+    let id: Int            // индекс шага (стабилен внутри волны)
+    var title: String      // текст шага плана
+    var status: Status = .running
+    var output: String = ""
+    var tokens: Int = 0
+
+    enum Status: Equatable { case running, done, failed }
 }
 
 /// Именованная ветка = указатель на «кончик» (leaf) ветки в дереве узлов.
@@ -865,7 +997,7 @@ struct Chat: Identifiable, Codable {
             var result: [ChatMessage] = []
             var cur = currentTipID
             while let id = cur, let n = byID[id] {
-                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics, state: n.state, step: n.step, total: n.total))
+                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics, state: n.state, step: n.step, total: n.total, waveGroupID: n.waveGroupID, waveSize: n.waveSize))
                 cur = n.parentID
             }
             return result.reversed()
@@ -875,7 +1007,7 @@ struct Chat: Identifiable, Codable {
             nodes = []
             var parent: UUID? = nil
             for m in newValue {
-                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics, state: m.state, step: m.step, total: m.total)
+                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics, state: m.state, step: m.step, total: m.total, waveGroupID: m.waveGroupID, waveSize: m.waveSize)
                 nodes.append(node)
                 parent = node.id
             }
@@ -925,6 +1057,14 @@ struct Chat: Identifiable, Codable {
     /// Runtime: текст баннера об отказе в смене стадии (запрошенный переход запрещён
     /// таблицей TaskFSM). Не сохраняется (см. CodingKeys).
     var stateChangeError: String? = nil
+
+    /// Runtime: живые плитки подагентов текущей волны роя (статус/вывод по мере готовности).
+    /// НЕ сохраняется (транзиентно; на коммите/паузе чистится, при resume пересобирается).
+    var liveSubAgents: [LiveSubAgent] = []
+
+    /// Runtime: идёт решение диспетчера переходов по реплике пользователя («Агент решает…»).
+    /// НЕ сохраняется (см. CodingKeys).
+    var isDeciding: Bool = false
 
     /// Активный/последний контекст задачи (конечный автомат FSM). nil — нет.
     /// Сохраняется (нужен для возобновления после перезапуска).

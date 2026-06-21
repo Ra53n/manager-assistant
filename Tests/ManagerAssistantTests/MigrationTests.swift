@@ -82,6 +82,38 @@ final class MigrationTests: XCTestCase {
         XCTAssertEqual(s.maxParallelAgents, 3)
     }
 
+    // MARK: MsgNode wave-поля (миграция дерева сообщений)
+
+    func testMsgNodeOldJSONWithoutWaveFields() throws {
+        // Старый узел без waveGroupID/waveSize — Optional → nil, decode НЕ падает.
+        let json = #"{"id":"\#(UUID().uuidString)","role":"assistant","content":"привет"}"#
+        let node = try dec.decode(MsgNode.self, from: Data(json.utf8))
+        XCTAssertEqual(node.content, "привет")
+        XCTAssertNil(node.waveGroupID)
+        XCTAssertNil(node.waveSize)
+    }
+
+    func testMsgNodeRoundTripWaveFields() throws {
+        let gid = UUID()
+        var node = MsgNode(id: UUID(), parentID: nil, role: .assistant, content: "шаг",
+                           state: .execution, step: 1, total: 3)
+        node.waveGroupID = gid
+        node.waveSize = 3
+        let back = try dec.decode(MsgNode.self, from: enc.encode(node))
+        XCTAssertEqual(back.waveGroupID, gid)
+        XCTAssertEqual(back.waveSize, 3)
+        XCTAssertEqual(back.step, 1)
+    }
+
+    func testChatLiveSubAgentsNotPersisted() throws {
+        var chat = Chat(title: "T")
+        chat.liveSubAgents = [LiveSubAgent(id: 0, title: "шаг", status: .running)]
+        chat.isDeciding = true
+        let back = try dec.decode(Chat.self, from: enc.encode(chat))
+        XCTAssertTrue(back.liveSubAgents.isEmpty)   // runtime-поля не сохраняются
+        XCTAssertFalse(back.isDeciding)
+    }
+
     // MARK: PendingQuestion
 
     func testPendingQuestionRoundTrip() throws {

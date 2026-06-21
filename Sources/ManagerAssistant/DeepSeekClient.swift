@@ -76,6 +76,23 @@ struct DeepSeekClient {
         )
     }
 
+    /// То же, но с переопределением temperature/maxTokens (для дешёвых служебных
+    /// запросов — например, диспетчера переходов: короткий ответ, низкая температура).
+    func runPhase(systemPrompt: String, userMessage: String, settings: GenerationSettings,
+                  temperature: Double, maxTokens: Int) async throws -> SendResult {
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: systemPrompt),
+            .init(role: ChatRole.user.rawValue, content: userMessage),
+        ]
+        return try await post(
+            payloadMessages: payloadMessages,
+            settings: settings,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            stop: []
+        )
+    }
+
     /// Доп. запрос-валидатор инвариантов: проверяет ОТВЕТ на список ограничений и
     /// возвращает нарушенные (парсит строки «НАРУШЕН: <название>»). Best-effort.
     func checkInvariants(response: String, invariants: [Invariant], settings: GenerationSettings) async throws -> [InvariantViolation] {

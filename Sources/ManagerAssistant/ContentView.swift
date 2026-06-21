@@ -374,38 +374,30 @@ struct ChatDetailView: View {
                     }
                     compactionBanner
                     memorySuggestionBanner
-                    ForEach(messages) { message in
-                        MessageBubble(
-                            message: message,
-                            onBranch: branchingActive ? {
-                                if let chatID = vm.selectedChatID {
-                                    vm.makeBranchFrom(chatID: chatID, messageID: message.id)
-                                }
-                            } : nil,
-                            onSaveToMemory: {
-                                let kind: MemoryKind = message.role == .user ? .note : .knowledge
-                                memoryDraft = MemoryDraft(item: MemoryItem(
-                                    scope: kind.defaultScope,
-                                    kind: kind,
-                                    text: message.content,
-                                    sourceChatID: vm.selectedChatID
-                                ))
-                            },
-                            onSaveToProject: attachedProject.map { project in
-                                {
-                                    projectDraft = ProjectEntryDraft(
-                                        entry: ProjectEntry(
-                                            title: ProjectEntry.deriveTitle(from: message.content),
-                                            body: message.content,
-                                            kind: message.role == .user ? .note : .knowledge,
-                                            sourceChatID: vm.selectedChatID),
-                                        projectID: project.id, isNew: true)
-                                }
-                            }
-                        )
-                        .id(message.id)
+                    ForEach(feedItems) { item in
+                        switch item {
+                        case .single(let message):
+                            messageBubble(message).id(message.id)
+                        case .wave(let id, let msgs):
+                            WaveTilesView(messages: msgs).id(msgs.last?.id ?? id)
+                        }
                     }
-                    if isLoading {
+                    // Живые плитки подагентов текущей волны роя (как в Claude Code).
+                    if let chat = vm.selectedChat, !chat.liveSubAgents.isEmpty {
+                        WaveTilesView(live: chat.liveSubAgents).id("live-wave")
+                    }
+                    // Диспетчер решает, что делать с репликой пользователя.
+                    if vm.selectedChat?.isDeciding == true {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Агент решает, что делать с вашим сообщением…")
+                                .foregroundColor(.secondary)
+                                .font(.callout)
+                        }
+                        .id("deciding")
+                    }
+                    // Обычный спиннер «печатает…» — скрываем, когда уже показаны живые плитки.
+                    if isLoading, (vm.selectedChat?.liveSubAgents.isEmpty ?? true), vm.selectedChat?.isDeciding != true {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
                             Text("\(vm.selectedChat?.settings.model ?? "Модель") печатает…")
@@ -426,7 +418,74 @@ struct ChatDetailView: View {
             .onChange(of: vm.selectedChatID) { _ in
                 scrollToBottom(proxy)
             }
+            .onChange(of: vm.selectedChat?.liveSubAgents.map(\.status)) { _ in
+                scrollToBottom(proxy)
+            }
         }
+    }
+
+    /// Элемент ленты: обычное сообщение или группа волны роя (рендерится плитками).
+    enum FeedItem: Identifiable {
+        case single(ChatMessage)
+        case wave(id: UUID, [ChatMessage])
+        var id: UUID {
+            switch self {
+            case .single(let m): return m.id
+            case .wave(let id, _): return id
+            }
+        }
+    }
+
+    /// Группирует подряд идущие сообщения одной волны роя (общий waveGroupID, waveSize>1)
+    /// в `.wave`; остальные — `.single` (как раньше). Группа рвётся на любом не-волновом
+    /// сообщении или смене группы.
+    private var feedItems: [FeedItem] {
+        var out: [FeedItem] = []
+        for m in messages {
+            if let gid = m.waveGroupID, (m.waveSize ?? 1) > 1 {
+                if case .wave(let id, var arr)? = out.last, id == gid {
+                    arr.append(m)
+                    out[out.count - 1] = .wave(id: id, arr)
+                } else {
+                    out.append(.wave(id: gid, [m]))
+                }
+            } else {
+                out.append(.single(m))
+            }
+        }
+        return out
+    }
+
+    @ViewBuilder
+    private func messageBubble(_ message: ChatMessage) -> some View {
+        MessageBubble(
+            message: message,
+            onBranch: branchingActive ? {
+                if let chatID = vm.selectedChatID {
+                    vm.makeBranchFrom(chatID: chatID, messageID: message.id)
+                }
+            } : nil,
+            onSaveToMemory: {
+                let kind: MemoryKind = message.role == .user ? .note : .knowledge
+                memoryDraft = MemoryDraft(item: MemoryItem(
+                    scope: kind.defaultScope,
+                    kind: kind,
+                    text: message.content,
+                    sourceChatID: vm.selectedChatID
+                ))
+            },
+            onSaveToProject: attachedProject.map { project in
+                {
+                    projectDraft = ProjectEntryDraft(
+                        entry: ProjectEntry(
+                            title: ProjectEntry.deriveTitle(from: message.content),
+                            body: message.content,
+                            kind: message.role == .user ? .note : .knowledge,
+                            sourceChatID: vm.selectedChatID),
+                        projectID: project.id, isNew: true)
+                }
+            }
+        )
     }
 
     /// Плашка вверху ленты: сколько старых сообщений свёрнуто в саммари.
@@ -915,26 +974,15 @@ struct ChatDetailView: View {
 
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            // Поле в ScrollView: TextField растёт без ограничения, контейнер
-            // ограничивает высоту до inputMaxHeight и даёт скролл колесом мыши.
-            // (TextField с lineLimit обрезал, но колёсиком не скроллился — только
-            // переходом курсора по тексту.)
-            ScrollView(.vertical) {
-                TextField(inputPlaceholder, text: $vm.input, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(key: InputHeightKey.self, value: geo.size.height)
-                        }
-                    )
-                    .onSubmit(vm.send)
-            }
+            // Поле ввода: Enter отправляет, Shift+Enter — перенос (NSTextView-обёртка,
+            // см. GrowingTextView). Авто-высота клэмпится min…max, дальше — скролл.
+            GrowingTextEditor(
+                text: $vm.input,
+                placeholder: inputPlaceholder,
+                onSubmit: { if vm.canSend { vm.send() } },
+                measuredHeight: $inputContentHeight
+            )
             .frame(height: min(max(Self.inputMinHeight, inputContentHeight), Self.inputMaxHeight))
-            // Пока текст влезает — скролл выключен (нет лишнего «отскока»).
-            .scrollDisabled(inputContentHeight <= Self.inputMaxHeight)
-            .onPreferenceChange(InputHeightKey.self) { inputContentHeight = $0 }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(
@@ -2283,6 +2331,100 @@ private struct BubbleContent: View, Equatable {
                 .stroke(Color.gray.opacity(isUser ? 0 : 0.25), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// Рой агентов — ряд компактных плиток-подагентов (как в Claude Code): каждая плитка =
+/// один подагент шага со статусом (⟳ работает / ✓ готово / ✗ ошибка); клик по плитке
+/// раскрывает её вывод ПОД рядом. Источник — живые плитки волны (`live`) или
+/// историческая группа сообщений волны (`messages`).
+struct WaveTilesView: View {
+    private struct Tile: Identifiable {
+        let id: Int            // индекс шага
+        let title: String
+        let status: LiveSubAgent.Status
+        let output: String
+    }
+    private let tiles: [Tile]
+    private let isLive: Bool
+    @State private var expanded: Int?
+
+    init(live agents: [LiveSubAgent]) {
+        isLive = true
+        tiles = agents.map { Tile(id: $0.id, title: $0.title, status: $0.status, output: $0.output) }
+    }
+    init(messages: [ChatMessage]) {
+        isLive = false
+        tiles = messages.enumerated().map { (k, m) in
+            Tile(id: m.step ?? k, title: WaveTilesView.shortLabel(m.content), status: .done, output: m.content)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "square.grid.2x2.fill").foregroundColor(.purple).font(.caption)
+                Text("Рой агентов · \(tiles.count)")
+                    .font(.caption).fontWeight(.medium).foregroundColor(.secondary)
+                if isLive, tiles.contains(where: { $0.status == .running }) {
+                    Text("· работают параллельно")
+                        .font(.caption2).foregroundColor(.secondary.opacity(0.7))
+                }
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(tiles) { tile($0) }
+                }
+                .padding(.bottom, 2)
+            }
+            if let sel = expanded, let t = tiles.first(where: { $0.id == sel }) {
+                BubbleContent(content: t.output.isEmpty ? "…" : t.output, isUser: false)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func tile(_ tile: Tile) -> some View {
+        let isSel = expanded == tile.id
+        Button {
+            guard tile.status != .running else { return }     // пока работает — раскрывать нечего
+            expanded = isSel ? nil : tile.id
+        } label: {
+            HStack(spacing: 6) {
+                statusIcon(tile.status)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Шаг \(tile.id + 1)").font(.caption2).foregroundColor(.secondary)
+                    Text(tile.title).font(.caption).lineLimit(1)
+                }
+                Image(systemName: isSel ? "chevron.up" : "chevron.down")
+                    .font(.caption2).foregroundColor(.secondary.opacity(0.5))
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .frame(width: 190, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(isSel ? Color.purple.opacity(0.12) : Color(nsColor: .windowBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.25), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(tile.status == .running ? "Подагент работает…" : "Открыть/свернуть вывод подагента")
+    }
+
+    @ViewBuilder
+    private func statusIcon(_ s: LiveSubAgent.Status) -> some View {
+        switch s {
+        case .running: ProgressView().controlSize(.mini)
+        case .done:    Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.caption)
+        case .failed:  Image(systemName: "xmark.circle.fill").foregroundColor(.orange).font(.caption)
+        }
+    }
+
+    private static func shortLabel(_ content: String) -> String {
+        let line = content.split(whereSeparator: \.isNewline).first.map(String.init) ?? content
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "шаг" : String(trimmed.prefix(40))
     }
 }
 
