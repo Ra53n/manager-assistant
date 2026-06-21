@@ -216,6 +216,15 @@ final class PromptParsingTests: XCTestCase {
         XCTAssertFalse(PipelinePrompts.systemPrompt(for: .answer, invariants: [inv]).contains("INVARIANTS"))
     }
 
+    func testValidationStageOmitsInvariantBlock() {
+        // Проверяющему инварианты НЕ кладём — иначе он флагает их маркером и отчёт уходит «в ответ».
+        let inv = Invariant(kind: .noBanned, name: "ETF", banned: ["ETF"], enforcement: .both)
+        XCTAssertFalse(PipelinePrompts.systemPrompt(for: .validation, invariants: [inv]).contains("INVARIANTS"))
+        var ctx = TaskContext(task: "T", state: .validation)
+        ctx.done = ["шаг"]
+        XCTAssertFalse(PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: "", invariants: [inv]).contains("INVARIANTS"))
+    }
+
     // MARK: subAgentPrompt — узкий контекст
 
     func testSubAgentPromptIncludesOnlyDepOutputs() {

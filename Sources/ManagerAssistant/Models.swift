@@ -533,8 +533,11 @@ enum PipelinePrompts {
     /// Системный промпт стадии = ОГРАНИЧЕНИЯ (если есть) + РОЛЬ этапа. Инварианты идут
     /// ПЕРВЫМИ и в системном промпте (а не только в user-сообщении) — модель сильнее их
     /// соблюдает. `swarm` — просить у планировщика зависимости шагов.
+    /// ВАЖНО: этапу «Проверка» блок инвариантов НЕ кладём — его дело сверять план/DONE,
+    /// а не флагать ограничения (иначе он выводит маркер-конфликт и его отчёт уходит «в ответ»).
     static func systemPrompt(for state: TaskState, swarm: Bool = false, invariants: [Invariant] = []) -> String {
         let role = rolePrompt(for: state, swarm: swarm)
+        guard state != .validation else { return role }
         let inv = InvariantValidator.promptBlock(invariants)
         return inv.isEmpty ? role : inv + "\n\n" + role
     }
@@ -621,9 +624,13 @@ enum PipelinePrompts {
             s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их в текущей стадии, приоритетно]\n"
                 + ctx.guidance.map { "- \($0)" }.joined(separator: "\n")
         }
-        // Инварианты (ограничения) — агент ОБЯЗАН их учитывать и отказывать в нарушениях.
-        let invBlock = InvariantValidator.promptBlock(invariants)
-        if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        // Инварианты (ограничения) — агент ОБЯЗАН их учитывать. Этапу «Проверка» НЕ кладём
+        // (он обсуждает нарушения по роли; см. systemPrompt). Соблюдение обеспечивают
+        // генерирующие этапы (планирование/выполнение/ответ).
+        if ctx.state != .validation {
+            let invBlock = InvariantValidator.promptBlock(invariants)
+            if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        }
         // Уже выявленные нарушения инвариантов — исправить в перегенерации.
         if !ctx.invariantViolations.isEmpty {
             s += "\n\n[ТЫ НАРУШИЛ ОГРАНИЧЕНИЯ — ПЕРЕГЕНЕРИРУЙ ПОЛНОСТЬЮ БЕЗ НИХ]\n"
