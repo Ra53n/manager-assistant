@@ -944,15 +944,18 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Отказ в невозможном переходе: показываем объяснение агента + доступные переходы,
-    /// прогон ставим на паузу (пользователь решает дальше).
+    /// Отказ в невозможном переходе: агент СООБЩАЕТ это в ленте (объяснение + доступные
+    /// переходы) и ставит прогон на паузу — пользователь решает дальше (продолжить/меню «→ этап»).
     private func refusePath(chatID: UUID, from: TaskState, explanation: String) {
         guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
+        chats[i].isDeciding = false
         let allowed = TaskFSM.transitions[from, default: []].map { $0.label }
-        let allowedText = allowed.isEmpty ? "нет (терминальная стадия «Ответ»)" : allowed.joined(separator: ", ")
+        let allowedText = allowed.isEmpty ? "нет — это терминальная стадия «Ответ»" : allowed.joined(separator: ", ")
         let expl = explanation.trimmingCharacters(in: .whitespacesAndNewlines)
-        chats[i].stateChangeError = (expl.isEmpty ? "" : expl + " ")
-            + "Из «\(from.label)» доступные переходы: \(allowedText)."
+        let msg = (expl.isEmpty ? "Не могу выполнить такой переход прямо сейчас. " : expl + "\n\n")
+            + "Из стадии «\(from.label)» доступные переходы: \(allowedText). Можно продолжить текущий прогон или выбрать стадию в меню «→ этап»."
+        addMessage(i, role: .assistant, content: msg, state: from)
+        chats[i].stateChangeError = "Из «\(from.label)» доступные переходы: \(allowedText)."
         chats[i].taskContext?.status = .paused
         chats[i].isLoading = false
         pipelineTasks[chatID] = nil
