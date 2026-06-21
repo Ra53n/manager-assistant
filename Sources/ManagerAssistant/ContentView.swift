@@ -663,10 +663,12 @@ struct ChatDetailView: View {
     private enum PhaseChipState { case done, current, upcoming }
 
     private func stateChipState(_ s: TaskState, run: TaskContext) -> PhaseChipState {
-        if run.status == .finished { return .done }
         let order = TaskState.allCases
         guard let pi = order.firstIndex(of: s),
               let ci = order.firstIndex(of: run.state) else { return .upcoming }
+        // Финиш: обычный — state=.answer (всё done); обрыв по конфликту инварианта —
+        // done ТОЛЬКО до места обрыва (видно, что дальше по шагам не пошли).
+        if run.status == .finished { return pi <= ci ? .done : .upcoming }
         if pi < ci { return .done }
         if pi == ci { return .current }
         return .upcoming

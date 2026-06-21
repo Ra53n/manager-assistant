@@ -498,30 +498,6 @@ final class ChatViewModel: ObservableObject {
                 guard let j = chats.firstIndex(where: { $0.id == chatID }),
                       var c = chats[j].taskContext else { clearTask(chatID, gen: gen); return }
 
-                // Нарушение инвариантов: КОНФЛИКТ с запросом юзера (модель сама пометила) →
-                // баннер, без retry. Ошибка модели (запрещённое вошло в ответ) → retry того
-                // же этапа/шага с нарушениями в промпте (лимит maxInvariantRetries).
-                if invMethod != .off, !invs.isEmpty {
-                    let conflict = InvariantValidator.modelFlaggedConflict(result.text)
-                    var violations: [InvariantViolation] = (invMethod == .code || invMethod == .both)
-                        ? InvariantValidator.codeViolations(result.text, invs) : []
-                    violations += llmViolations
-                    if conflict {
-                        chats[j].invariantConflict = violations.isEmpty
-                            ? "Запрос нарушает инвариант — предложена допустимая альтернатива."
-                            : violations.map { $0.description }.joined(separator: "\n")
-                        c.invariantRetries = 0; c.invariantViolations = []
-                    } else if !violations.isEmpty, c.invariantRetries < TaskContext.maxInvariantRetries {
-                        c.invariantRetries += 1
-                        c.invariantViolations = violations.map { $0.description }
-                        chats[j].taskContext = c
-                        persistNow()
-                        continue   // ТОТ ЖЕ этап/шаг заново — нарушения уйдут в промпт
-                    } else {
-                        c.invariantRetries = 0; c.invariantViolations = []
-                    }
-                }
-
                 let cleaned = PipelinePrompts.stripMarkers(result.text)
                 let metrics = MessageMetrics(
                     promptTokens: result.promptTokens,
@@ -531,6 +507,64 @@ final class ChatViewModel: ObservableObject {
                     promptCost: price.map { Double(result.promptTokens) * $0.promptPerToken },
                     completionCost: price.map { Double(result.completionTokens) * $0.completionPerToken }
                 )
+
+                // Инварианты (детектится даже при методе .off — они всё равно в промпте).
+                if !invs.isEmpty {
+                    // КОНФЛИКТ с запросом юзера (модель пометила маркером) → ОБРЫВАЕМ
+                    // конвейер: дальше по шагам идти бессмысленно (трата токенов). Показываем
+                    // отказ + альтернативу как ИТОГ, ставим баннер, завершаем прогон.
+                    if InvariantValidator.modelFlaggedConflict(result.text) {
+                        addMessage(j, role: .assistant, content: cleaned, metrics: metrics, state: .answer)
+                        accumulateTokens(j, result, metrics)
+                        c.answer = cleaned
+                        c.status = .finished
+                        c.invariantRetries = 0; c.invariantViolations = []
+                        chats[j].invariantConflict = "Запрос нарушает инвариант — выполнение остановлено, предложена допустимая альтернатива (см. ответ)."
+                        chats[j].taskContext = c
+                        persistNow()
+                        chats[j].isLoading = false
+                        clearTask(chatID, gen: gen)
+                        return
+                    }
+                    // Ошибка МОДЕЛИ (запрещённое вошло в ответ без маркера). Метод .off
+                    // проверку не гоняет. Бюджет повторов — НА ВЕСЬ ПРОГОН (invariantRetries
+                    // не сбрасывается между шагами), чтобы не зацикливаться и не жечь токены.
+                    if invMethod != .off {
+                        var violations = (invMethod == .code || invMethod == .both)
+                            ? InvariantValidator.codeViolations(result.text, invs) : []
+                        violations += llmViolations
+                        if !violations.isEmpty {
+                            if c.invariantRetries < TaskContext.maxInvariantRetries {
+                                c.invariantRetries += 1
+                                c.invariantViolations = violations.map { $0.description }
+                                chats[j].taskContext = c
+                                persistNow()
+                                continue   // ТОТ ЖЕ этап/шаг заново — нарушения уйдут в промпт
+                            } else {
+                                // Бюджет исчерпан, модель не соблюдает инвариант → ОБРЫВАЕМ
+                                // (дальше идти по шагам бессмысленно), сообщаем и завершаем.
+                                let msg = "Не удалось выполнить без нарушения инвариантов: "
+                                    + violations.map { $0.description }.joined(separator: "; ")
+                                    + ".\nВыполнение остановлено — уточни задачу или ослабь ограничения."
+                                addMessage(j, role: .assistant, content: msg, metrics: metrics, state: .answer)
+                                accumulateTokens(j, result, metrics)
+                                c.answer = msg
+                                c.status = .finished
+                                c.invariantRetries = 0; c.invariantViolations = []
+                                chats[j].invariantConflict = msg
+                                chats[j].taskContext = c
+                                persistNow()
+                                chats[j].isLoading = false
+                                clearTask(chatID, gen: gen)
+                                return
+                            }
+                        } else {
+                            // Чисто на этом шаге — снять прокинутые нарушения. Счётчик повторов
+                            // НЕ сбрасываем: бюджет общий на прогон.
+                            c.invariantViolations = []
+                        }
+                    }
+                }
 
                 // Вывод этапа в контекст + в ленту + ПЕРЕХОД (только через transitioned).
                 switch state {
