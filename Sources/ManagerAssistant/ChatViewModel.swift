@@ -820,9 +820,10 @@ final class ChatViewModel: ObservableObject {
 
     // MARK: - Интерактивность: уточнения / ответы на вопросы / смена стадии
 
-    /// Уточнение пользователя во время прогона. Добавляется в `guidance` и учитывается
-    /// в ТЕКУЩЕЙ стадии (агент дорабатывает её, НЕ возвращаясь в планирование).
-    /// На паузе — сразу продолжаем. На ходу — кладём в очередь (следующий проход учтёт).
+    /// Уточнение пользователя во время прогона. Добавляется в `guidance` и СРАЗУ
+    /// перезапускает ТЕКУЩИЙ этап/шаг с его учётом — агент дорабатывает текущую стадию,
+    /// НЕ возвращаясь в планирование. Реакция немедленная (на ходу — отменяя текущий
+    /// запрос через startPipeline → bump gen; устаревший запрос вернётся и будет отброшен).
     func interject(chatID: UUID, text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty,
@@ -830,6 +831,7 @@ final class ChatViewModel: ObservableObject {
               var ctx = chats[i].taskContext else { return }
         switch ctx.status {
         case .awaitingInput:
+            // Свободный текст вместо выбора варианта — это ответ на вопрос агента.
             answerClarification(chatID: chatID, answer: t)
         case .awaitingPlan:
             // После планирования правки идут в перепланирование (это всё ещё «планирование»).
@@ -837,16 +839,11 @@ final class ChatViewModel: ObservableObject {
             chats[i].taskContext = ctx
             persistNow()
             replan(chatID: chatID, feedback: t)
-        case .running:
-            // Прогон идёт — добавляем в очередь, следующий этап/шаг учтёт guidance. Запрос не рвём.
-            ctx.guidance.append(t)
-            chats[i].taskContext = ctx
-            persistNow()
-            // ИСКЛЮЧЕНИЕ: на этапе «Ответ» следующего прохода НЕТ — иначе уточнение
-            // потерялось бы. Перезапускаем этап, чтобы финальный ответ его учёл
-            // (старый запрос вернётся с устаревшим gen и состояние не тронет).
-            if ctx.state == .answer { startPipeline(chatID: chatID) }
-        case .paused, .failed:
+        case .running, .paused, .failed:
+            // Добавляем указание и СРАЗУ перезапускаем текущий этап/шаг с его учётом.
+            // На ходу startPipeline отменяет текущий запрос (bump gen) — пользователь
+            // видит немедленную реакцию: этап переигрывается уже с указанием, БЕЗ
+            // возврата в планирование. Старый запрос вернётся с устаревшим gen → отброшен.
             ctx.guidance.append(t)
             ctx.status = .running
             ctx.errorText = nil

@@ -24,6 +24,13 @@ final class PromptParsingTests: XCTestCase {
         XCTAssertEqual(steps, ["просто текст без нумерации"])
     }
 
+    func testParsePlanDropsMarkerFinalizerSteps() {
+        // Планировщик иногда включает протокольный маркер как «шаг» — он невыполним
+        // и зациклил бы проверку; такие шаги должны отбрасываться.
+        let steps = PipelinePrompts.parsePlanSteps("1. Сделай A\n2. Сделай B\n3. Заверши ответ строкой NEXT_STEP")
+        XCTAssertEqual(steps, ["Сделай A", "Сделай B"])
+    }
+
     // MARK: parseVerdict
 
     func testVerdictPassFail() {

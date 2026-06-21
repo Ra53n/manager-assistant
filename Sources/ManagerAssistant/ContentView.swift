@@ -838,7 +838,8 @@ struct ChatDetailView: View {
                 } label: {
                     Label("этап", systemImage: "arrow.triangle.swap")
                 }
-                .menuStyle(.borderlessButton)
+                .menuStyle(.button)
+                .buttonStyle(.borderless)
                 .fixedSize()
                 .help("Сменить стадию, если это разрешено таблицей переходов")
             }

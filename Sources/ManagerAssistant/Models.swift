@@ -504,7 +504,9 @@ enum PipelinePrompts {
             var s = """
             Ты — планировщик. По задаче из [QUERY] составь чёткий пошаговый план: \
             пронумерованные шаги (1., 2., 3., …), каждый шаг — одно конкретное \
-            действие, без воды. Не выполняй задачу — только спланируй. Верни ТОЛЬКО план.
+            действие по сути задачи, без воды. Не выполняй задачу — только спланируй. \
+            НЕ добавляй служебных/протокольных шагов (например «заверши ответ строкой …», \
+            «выведи маркер») — только содержательные действия. Верни ТОЛЬКО план.
             """
             if swarm {
                 s += "\n\n" + """
@@ -614,6 +616,11 @@ enum PipelinePrompts {
                 line.removeSubrange(r)
                 line = line.trimmingCharacters(in: .whitespaces)
             }
+            // Шаг-артефакт: планировщик включил протокольный маркер как «шаг» (например
+            // «заверши ответ строкой NEXT_STEP») — после очистки он невыполним и зациклит
+            // проверку. Отбрасываем такие строки.
+            let u2 = line.uppercased()
+            if u2.contains(nextStepMarker) || u2.contains(replanMarker) || u2.contains(askUserMarker) { continue }
             if !line.isEmpty { steps.append(line) }
         }
         return steps.isEmpty ? [text.trimmingCharacters(in: .whitespacesAndNewlines)] : steps
