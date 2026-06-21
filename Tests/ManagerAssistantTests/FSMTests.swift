@@ -56,6 +56,31 @@ final class FSMTests: XCTestCase {
         XCTAssertEqual(TaskContext(task: "T", state: .validation).transitioned(to: .planning).state, .planning)
     }
 
+    // MARK: - День 15: контролируемые переходы (явные требования задания)
+
+    /// «Нельзя делать финал без валидации»: в стадию «Ответ» можно ТОЛЬКО из «Проверки».
+    func testNoFinalWithoutValidation() {
+        for s in TaskState.allCases {
+            XCTAssertEqual(TaskFSM.allows(s, to: .answer), s == .validation,
+                           "В «Ответ» можно ТОЛЬКО из «Проверки» — пробовали из \(s.rawValue)")
+        }
+    }
+
+    /// «Нельзя делать реализацию до утверждённого плана»: из «Планирования» можно ТОЛЬКО
+    /// в «Выполнение» (нельзя перепрыгнуть сразу в проверку или ответ).
+    func testNoImplementationBeforePlan() {
+        XCTAssertEqual(Set(TaskFSM.transitions[.planning, default: []]), [.execution])
+        XCTAssertFalse(TaskFSM.allows(.planning, to: .validation))
+        XCTAssertFalse(TaskFSM.allows(.planning, to: .answer))
+    }
+
+    /// «Ассистент не может перепрыгнуть этап»: ни один переход не пропускает стадию.
+    func testNoStageSkipping() {
+        XCTAssertFalse(TaskFSM.allows(.planning, to: .validation))   // через «Выполнение»
+        XCTAssertFalse(TaskFSM.allows(.planning, to: .answer))       // через всё
+        XCTAssertFalse(TaskFSM.allows(.execution, to: .answer))      // через «Проверку»
+    }
+
     /// transitioned(to:) для легального перехода меняет state и сохраняет остальное.
     func testTransitionedLegal() {
         let ctx = TaskContext(task: "T", state: .planning)
