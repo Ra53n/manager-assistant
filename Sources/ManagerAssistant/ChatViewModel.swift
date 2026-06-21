@@ -481,6 +481,23 @@ final class ChatViewModel: ObservableObject {
             let invs = effectiveInvariants(for: chats[i])   // глобальные + проект + чат
             let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
 
+            // ЖЁСТКАЯ ГОТОВНОСТЬ ЭТАПА (последний рубеж на уровне кода): НЕ генерируем
+            // промпт стадии без РЕАЛЬНОГО результата предыдущей. «Нет результата → нет
+            // следующего prompt». Транзишены это и так гарантируют — это страховка от
+            // любого пути (меню/диспетчер/гонки), чтобы FSM была по-настоящему жёсткой.
+            if state == .validation, ctx.done.isEmpty {
+                chats[i].taskContext = ctx.transitioned(to: .execution)   // нет выполнения — назад
+                continue
+            }
+            if state == .answer, ctx.validationResult.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // «Ответ» терминален — назад нельзя транзишеном; останавливаемся с пояснением.
+                chats[i].taskContext?.status = .paused
+                chats[i].stateChangeError = "Нельзя сформировать ответ: этап «Проверка» не дал результата."
+                chats[i].isLoading = false
+                clearTask(chatID, gen: gen)
+                return
+            }
+
             // На выполнении выбираем ТЕКУЩИЙ шаг плана (current) и сохраняем для UI/промпта.
             if state == .execution {
                 guard !ctx.plan.isEmpty else {                       // плана нет — НЕ прыгаем в проверку,
