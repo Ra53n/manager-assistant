@@ -519,7 +519,7 @@ final class ChatViewModel: ObservableObject {
                 chats[i].taskContext = ctx
             }
 
-            let sys = PipelinePrompts.systemPrompt(for: state, swarm: settings.swarmEnabled)
+            let sys = PipelinePrompts.systemPrompt(for: state, swarm: settings.swarmEnabled, invariants: invs)
             let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs)
             chats[i].isLoading = true
 
@@ -1092,7 +1092,7 @@ final class ChatViewModel: ObservableObject {
         let guidance = snap.guidance
         let wave = snap.waves[snap.waveIndex]
         let cap = max(1, settings.maxParallelAgents)
-        let sys = PipelinePrompts.subAgentSystemPrompt()
+        let sys = PipelinePrompts.subAgentSystemPrompt(invariants: invs)
         chats[i].isLoading = true
         chats[i].isDeciding = false
         // Засеять живые плитки подагентов волны (runtime; UI рисует ряд плиток как в Claude Code).

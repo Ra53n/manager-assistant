@@ -530,8 +530,17 @@ enum PipelinePrompts {
     (2–4 варианта). Выводи этот блок ТОЛЬКО при реальной нехватке данных, не злоупотребляй.
     """
 
-    /// Системный промпт = РОЛЬ этапа. `swarm` — просить у планировщика зависимости шагов.
-    static func systemPrompt(for state: TaskState, swarm: Bool = false) -> String {
+    /// Системный промпт стадии = ОГРАНИЧЕНИЯ (если есть) + РОЛЬ этапа. Инварианты идут
+    /// ПЕРВЫМИ и в системном промпте (а не только в user-сообщении) — модель сильнее их
+    /// соблюдает. `swarm` — просить у планировщика зависимости шагов.
+    static func systemPrompt(for state: TaskState, swarm: Bool = false, invariants: [Invariant] = []) -> String {
+        let role = rolePrompt(for: state, swarm: swarm)
+        let inv = InvariantValidator.promptBlock(invariants)
+        return inv.isEmpty ? role : inv + "\n\n" + role
+    }
+
+    /// Роль этапа (без инвариантов).
+    private static func rolePrompt(for state: TaskState, swarm: Bool) -> String {
         switch state {
         case .planning:
             var s = """
@@ -617,8 +626,11 @@ enum PipelinePrompts {
         if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
         // Уже выявленные нарушения инвариантов — исправить в перегенерации.
         if !ctx.invariantViolations.isEmpty {
-            s += "\n\n[НАРУШЕНЫ ИНВАРИАНТЫ — ИСПРАВЬ, перегенерируй без нарушений]\n"
+            s += "\n\n[ТЫ НАРУШИЛ ОГРАНИЧЕНИЯ — ПЕРЕГЕНЕРИРУЙ ПОЛНОСТЬЮ БЕЗ НИХ]\n"
                 + ctx.invariantViolations.map { "- \($0)" }.joined(separator: "\n")
+                + "\nЗамени запрещённое разрешёнными альтернативами и НЕ упоминай запрещённые "
+                + "термины ВООБЩЕ — ни одного вхождения (даже в сравнениях/скобках/пояснениях). "
+                + "Дай полноценный ответ по сути запроса на допустимых альтернативах."
         }
         // Замечания проверки прокидываем в повтор выполнения.
         let v = ctx.validationResult.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -771,14 +783,17 @@ enum PipelinePrompts {
     }
 
     /// Системный промпт подагента роя (исполнитель ОДНОГО шага с узким контекстом).
-    static func subAgentSystemPrompt() -> String {
-        """
+    /// Инварианты — ПЕРВЫМИ (модель сильнее их соблюдает).
+    static func subAgentSystemPrompt(invariants: [Invariant] = []) -> String {
+        let role = """
         Ты — подагент-исполнитель в рое. Выполни ТОЛЬКО порученный шаг [STEP] полностью и \
         самодостаточно. Используй [DEPS] (результаты шагов, от которых зависит твой) как \
         вход; [PLAN] — общий контекст. НЕ выполняй другие шаги и НЕ задавай вопросов — \
         дай готовый результат своего шага. Если шаг невозможен без переплана — заверши \
         ответ строкой «\(replanMarker)».
         """
+        let inv = InvariantValidator.promptBlock(invariants)
+        return inv.isEmpty ? role : inv + "\n\n" + role
     }
 
     /// User-сообщение подагенту: узкий контекст (обзор плана + ТОЛЬКО выводы зависимостей

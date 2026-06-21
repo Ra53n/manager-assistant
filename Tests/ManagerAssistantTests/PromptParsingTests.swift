@@ -193,6 +193,29 @@ final class PromptParsingTests: XCTestCase {
         XCTAssertTrue(PipelinePrompts.transitionRulesBlock(from: .answer).contains("терминальная"))
     }
 
+    // MARK: Инварианты реально попадают в промпты
+
+    func testInvariantsInjectedIntoPrompts() {
+        let inv = Invariant(kind: .noBanned, name: "ETF", banned: ["ETF"], enforcement: .both)
+        // Системный промпт стадии содержит блок ограничений и запрещённый термин.
+        let sys = PipelinePrompts.systemPrompt(for: .answer, invariants: [inv])
+        XCTAssertTrue(sys.contains("INVARIANTS"))
+        XCTAssertTrue(sys.contains("ETF"))
+        // User-сообщение стадии — тоже.
+        var ctx = TaskContext(task: "куда вложить деньги", state: .answer)
+        ctx.done = ["шаг"]
+        let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: "", invariants: [inv])
+        XCTAssertTrue(user.contains("ETF"))
+        // Промпт подагента роя — тоже.
+        XCTAssertTrue(PipelinePrompts.subAgentSystemPrompt(invariants: [inv]).contains("ETF"))
+    }
+
+    func testInvariantPromptOmittedWhenCodeOnly() {
+        // enforcement .code — НЕ показывается в промпте (только код-проверка).
+        let inv = Invariant(kind: .noBanned, name: "X", banned: ["X"], enforcement: .code)
+        XCTAssertFalse(PipelinePrompts.systemPrompt(for: .answer, invariants: [inv]).contains("INVARIANTS"))
+    }
+
     // MARK: subAgentPrompt — узкий контекст
 
     func testSubAgentPromptIncludesOnlyDepOutputs() {
