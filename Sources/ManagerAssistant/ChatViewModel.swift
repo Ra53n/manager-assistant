@@ -483,8 +483,8 @@ final class ChatViewModel: ObservableObject {
 
             // На выполнении выбираем ТЕКУЩИЙ шаг плана (current) и сохраняем для UI/промпта.
             if state == .execution {
-                guard !ctx.plan.isEmpty else {                       // плана нет — нечего выполнять
-                    chats[i].taskContext = ctx.transitioned(to: .validation)
+                guard !ctx.plan.isEmpty else {                       // плана нет — НЕ прыгаем в проверку,
+                    chats[i].taskContext = ctx.transitioned(to: .planning)   // а возвращаемся строить план
                     continue
                 }
                 ctx.total = ctx.plan.count
@@ -934,28 +934,37 @@ final class ChatViewModel: ObservableObject {
                 chats[i].taskContext?.status = .running
                 persistNow()
                 startPipeline(chatID: chatID)
-            } else if TaskFSM.allows(from, to: target) {
-                requestStateChange(chatID: chatID, to: target)      // сам проверит таблицу + сбросы
+            } else if !TaskFSM.allows(from, to: target) {
+                refusePath(chatID: chatID, from: from, explanation: explanation)            // недопустим по таблице
+            } else if let reason = ctx.transitionBlockReason(to: target) {
+                refusePath(chatID: chatID, from: from, explanation: explanation, reason: reason)  // этап ещё не выполнен
             } else {
-                refusePath(chatID: chatID, from: from, explanation: explanation)
+                requestStateChange(chatID: chatID, to: target)      // сам проверит таблицу+готовность + сбросы
             }
         case .refuse:
             refusePath(chatID: chatID, from: from, explanation: explanation)
         }
     }
 
-    /// Отказ в невозможном переходе: агент СООБЩАЕТ это в ленте (объяснение + доступные
-    /// переходы) и ставит прогон на паузу — пользователь решает дальше (продолжить/меню «→ этап»).
-    private func refusePath(chatID: UUID, from: TaskState, explanation: String) {
+    /// Отказ в переходе: агент СООБЩАЕТ причину в ленте и ставит прогон на паузу.
+    /// `reason != nil` — переход легален по таблице, но этап-источник ещё не выполнен
+    /// (нельзя перепрыгнуть); `reason == nil` — переход недопустим таблицей.
+    private func refusePath(chatID: UUID, from: TaskState, explanation: String, reason: String? = nil) {
         guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
         chats[i].isDeciding = false
-        let allowed = TaskFSM.transitions[from, default: []].map { $0.label }
-        let allowedText = allowed.isEmpty ? "нет — это терминальная стадия «Ответ»" : allowed.joined(separator: ", ")
         let expl = explanation.trimmingCharacters(in: .whitespacesAndNewlines)
-        let msg = (expl.isEmpty ? "Не могу выполнить такой переход прямо сейчас. " : expl + "\n\n")
-            + "Из стадии «\(from.label)» доступные переходы: \(allowedText). Можно продолжить текущий прогон или выбрать стадию в меню «→ этап»."
+        let detail: String
+        if let reason {
+            detail = "Сейчас так перейти нельзя: \(reason). Сначала заверши текущий этап."
+            chats[i].stateChangeError = "Переход недоступен: \(reason)."
+        } else {
+            let allowed = TaskFSM.transitions[from, default: []].map { $0.label }
+            let allowedText = allowed.isEmpty ? "нет — это терминальная стадия «Ответ»" : allowed.joined(separator: ", ")
+            detail = "Из стадии «\(from.label)» доступные переходы: \(allowedText). Можно продолжить текущий прогон или выбрать стадию в меню «→ этап»."
+            chats[i].stateChangeError = "Из «\(from.label)» доступные переходы: \(allowedText)."
+        }
+        let msg = (expl.isEmpty ? "Не могу выполнить такой переход прямо сейчас. " : expl + "\n\n") + detail
         addMessage(i, role: .assistant, content: msg, state: from)
-        chats[i].stateChangeError = "Из «\(from.label)» доступные переходы: \(allowedText)."
         chats[i].taskContext?.status = .paused
         chats[i].isLoading = false
         pipelineTasks[chatID] = nil
@@ -1005,6 +1014,12 @@ final class ChatViewModel: ObservableObject {
             let allowedText = allowed.isEmpty ? "нет (это терминальная стадия)" : allowed.joined(separator: ", ")
             chats[i].stateChangeError = "Не могу перейти из «\(from.label)» в «\(target.label)». "
                 + "Доступные переходы: \(allowedText)."
+            chats[i].isLoading = false
+            return
+        }
+        // Готовность: вперёд нельзя «перепрыгнуть» через невыполненный этап.
+        if let reason = ctx.transitionBlockReason(to: target) {
+            chats[i].stateChangeError = "Нельзя перейти в «\(target.label)»: \(reason)."
             chats[i].isLoading = false
             return
         }

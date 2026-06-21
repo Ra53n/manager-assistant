@@ -81,6 +81,38 @@ final class FSMTests: XCTestCase {
         XCTAssertFalse(TaskFSM.allows(.execution, to: .answer))      // через «Проверку»
     }
 
+    /// Готовность: ВПЕРЁД нельзя «перепрыгнуть» через невыполненный этап — пока этап-
+    /// источник не дал результат, прямой переход вперёд недоступен.
+    func testForwardTransitionsRequireStageOutput() {
+        // Планирование без плана → нельзя в «Выполнение».
+        var p = TaskContext(task: "T", state: .planning)
+        XCTAssertFalse(p.canTransition(to: .execution))
+        p.plan = ["шаг1", "шаг2"]
+        XCTAssertTrue(p.canTransition(to: .execution))
+
+        // Выполнение без завершённых шагов → нельзя в «Проверку».
+        var ex = TaskContext(task: "T", state: .execution)
+        ex.plan = ["a", "b"]; ex.done = ["вывод a"]      // 1/2 — не завершено
+        XCTAssertFalse(ex.canTransition(to: .validation))
+        ex.done = ["вывод a", "вывод b"]                 // 2/2
+        XCTAssertTrue(ex.canTransition(to: .validation))
+
+        // Проверка без вердикта → нельзя в «Ответ».
+        var va = TaskContext(task: "T", state: .validation)
+        XCTAssertFalse(va.canTransition(to: .answer))
+        va.validationResult = "ВЕРДИКТ: ВЫПОЛНЕНО"
+        XCTAssertTrue(va.canTransition(to: .answer))
+    }
+
+    /// Шаги НАЗАД (переделать/перепланировать) доступны всегда, без условий готовности.
+    func testBackwardTransitionsAlwaysAllowed() {
+        let ex = TaskContext(task: "T", state: .execution)   // пустой
+        XCTAssertTrue(ex.canTransition(to: .planning))       // перепланировать
+        let va = TaskContext(task: "T", state: .validation)  // пустой
+        XCTAssertTrue(va.canTransition(to: .execution))      // переделать выполнение
+        XCTAssertTrue(va.canTransition(to: .planning))       // перепланировать
+    }
+
     /// transitioned(to:) для легального перехода меняет state и сохраняет остальное.
     func testTransitionedLegal() {
         let ctx = TaskContext(task: "T", state: .planning)

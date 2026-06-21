@@ -881,18 +881,26 @@ struct ChatDetailView: View {
                 .buttonStyle(.borderless)
                 .help("Шаг назад: вернуться к планированию")
             }
-            // Меню «→ этап»: запросить смену стадии. Легальные по таблице переходы —
-            // активны, нелегальные — серые (то же можно текстом: «вернись к проверке»).
+            // Меню «→ этап»: переход активен ТОЛЬКО если он легален по таблице И этап-источник
+            // реально выполнен (нельзя «перепрыгнуть» через невыполненный этап). Серые —
+            // с пояснением почему (недопустим / этап ещё не завершён).
             if run.status != .finished {
                 Menu {
                     ForEach(TaskState.allCases.filter { $0 != run.state }) { st in
+                        let ok = run.canTransition(to: st)
+                        let reason = run.transitionBlockReason(to: st)
                         Button {
                             vm.requestStateChange(chatID: chat.id, to: st)
                         } label: {
-                            Text(TaskFSM.allows(run.state, to: st)
-                                 ? "В «\(st.label)»" : "В «\(st.label)» — недоступно")
+                            if ok {
+                                Text("В «\(st.label)»")
+                            } else if let reason {
+                                Text("В «\(st.label)» — \(reason)")
+                            } else {
+                                Text("В «\(st.label)» — недоступно")
+                            }
                         }
-                        .disabled(!TaskFSM.allows(run.state, to: st))
+                        .disabled(!ok)
                     }
                 } label: {
                     Label("этап", systemImage: "arrow.triangle.swap")
@@ -900,7 +908,7 @@ struct ChatDetailView: View {
                 .menuStyle(.button)
                 .buttonStyle(.borderless)
                 .fixedSize()
-                .help("Сменить стадию, если это разрешено таблицей переходов")
+                .help("Сменить стадию (вперёд — только если предыдущий этап выполнен)")
             }
             Button { vm.cancelRun(chatID: chat.id) } label: {
                 Image(systemName: "xmark.circle.fill")

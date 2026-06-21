@@ -478,6 +478,36 @@ extension TaskContext {
         c.state = target
         return c
     }
+
+    /// Можно ли ВРУЧНУЮ перейти в `target`: легально по таблице И предыдущий этап реально
+    /// произвёл результат. Нельзя «перепрыгнуть» через невыполненный этап (нет плана →
+    /// нет выполнения; нет выполнения → нет проверки; нет проверки → нет ответа). Шаги
+    /// НАЗАД (переделать/перепланировать) — всегда можно. Источник истины «этап выполнен»
+    /// — артефакты контекста (plan/done/validationResult).
+    func canTransition(to target: TaskState) -> Bool {
+        TaskFSM.allows(state, to: target) && transitionBlockReason(to: target) == nil
+    }
+
+    /// Причина, по которой ВПЕРЁД-переход недоступен (nil — доступен либо это шаг назад).
+    func transitionBlockReason(to target: TaskState) -> String? {
+        switch (state, target) {
+        case (.planning, .execution):
+            return plan.isEmpty
+                ? "сначала нужно построить план — этап «Планирование» ещё не дал результата"
+                : nil
+        case (.execution, .validation):
+            if plan.isEmpty { return "нет плана для выполнения" }
+            return done.count >= plan.count
+                ? nil
+                : "сначала нужно выполнить все шаги — «Выполнение» ещё не завершено (\(done.count)/\(plan.count))"
+        case (.validation, .answer):
+            return validationResult.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "сначала нужно пройти «Проверку» — она ещё не дала результат"
+                : nil
+        default:
+            return nil   // шаги назад (execution→planning, validation→execution/planning) — всегда
+        }
+    }
 }
 
 /// Сборка промптов из контекста — «уровень кода»: ЧТО делает модель на каждом
