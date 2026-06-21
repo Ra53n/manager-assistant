@@ -254,6 +254,8 @@ struct ChatDetailView: View {
             Divider()
             errorBar
             invariantConflictBar
+            stateChangeErrorBar
+            clarificationBar
             truncationBar
             pipelineModeBar
             inputBar
@@ -548,6 +550,75 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Баннер отказа в смене стадии (запрошенный переход запрещён таблицей)
+
+    @ViewBuilder
+    private var stateChangeErrorBar: some View {
+        if let chat = vm.selectedChat, let err = chat.stateChangeError {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "arrow.triangle.swap")
+                    .foregroundColor(.orange)
+                Text(err)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button {
+                    if let id = vm.selectedChatID { vm.clearStateChangeError(chatID: id) }
+                } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless)
+                .foregroundColor(.secondary.opacity(0.6))
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.orange.opacity(0.12))
+        }
+    }
+
+    // MARK: - Уточняющий вопрос агента (с вариантами ответа, как AskUserQuestion)
+
+    @ViewBuilder
+    private var clarificationBar: some View {
+        if let chat = vm.selectedChat, let run = chat.taskContext,
+           run.status == .awaitingInput, let pq = run.pendingQuestion {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "questionmark.bubble.fill")
+                        .foregroundColor(.accentColor)
+                    Text(pq.question)
+                        .fontWeight(.medium)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(pq.options.enumerated()), id: \.offset) { _, opt in
+                        Button {
+                            vm.answerClarification(chatID: chat.id, answer: opt)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "circle")
+                                    .font(.caption2)
+                                    .foregroundColor(.accentColor)
+                                Text(opt)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                Text("Выбери вариант или ответь своим текстом в поле ниже.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.10))
+        }
+    }
+
     // MARK: - Ветвление: панель веток над лентой
 
     @ViewBuilder
@@ -624,6 +695,14 @@ struct ChatDetailView: View {
                             .font(.caption2)
                             .foregroundColor(.accentColor)
                             .help("Текущий шаг плана")
+                    }
+                    // Рой: индикатор параллельной волны (несколько подагентов разом).
+                    if run.state == .execution, chat.settings.swarmEnabled,
+                       run.waveIndex < run.waves.count, run.waves[run.waveIndex].count > 1 {
+                        Text("рой ×\(run.waves[run.waveIndex].count)")
+                            .font(.caption2)
+                            .foregroundColor(.purple)
+                            .help("Параллельно работают \(run.waves[run.waveIndex].count) подагентов (волна \(run.waveIndex + 1)/\(run.waves.count))")
                     }
                     if run.executionRetries > 0 {
                         Text("↻\(run.executionRetries)")
@@ -710,6 +789,12 @@ struct ChatDetailView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Перепланировать заново")
+            case .awaitingInput:
+                HStack(spacing: 3) {
+                    Image(systemName: "questionmark.circle.fill").foregroundColor(.accentColor)
+                    Text("Ждёт ответа").foregroundColor(.accentColor)
+                }
+                .help("Агент задал вопрос — выбери вариант ниже или ответь в поле ввода")
             case .paused:
                 Button { vm.resumePipeline(chatID: chat.id) } label: {
                     Label("Продолжить", systemImage: "play.fill")
@@ -736,6 +821,26 @@ struct ChatDetailView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Шаг назад: вернуться к планированию")
+            }
+            // Меню «→ этап»: запросить смену стадии. Легальные по таблице переходы —
+            // активны, нелегальные — серые (то же можно текстом: «вернись к проверке»).
+            if run.status != .finished {
+                Menu {
+                    ForEach(TaskState.allCases.filter { $0 != run.state }) { st in
+                        Button {
+                            vm.requestStateChange(chatID: chat.id, to: st)
+                        } label: {
+                            Text(TaskFSM.allows(run.state, to: st)
+                                 ? "В «\(st.label)»" : "В «\(st.label)» — недоступно")
+                        }
+                        .disabled(!TaskFSM.allows(run.state, to: st))
+                    }
+                } label: {
+                    Label("этап", systemImage: "arrow.triangle.swap")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Сменить стадию, если это разрешено таблицей переходов")
             }
             Button { vm.cancelRun(chatID: chat.id) } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -796,6 +901,17 @@ struct ChatDetailView: View {
 
     // MARK: - Поле ввода
 
+    /// Плейсхолдер поля ввода: при активном прогоне FSM подсказывает, что сообщение —
+    /// уточнение/ответ/смена стадии, а не новый запуск.
+    private var inputPlaceholder: String {
+        guard let run = vm.selectedChat?.taskContext, run.status != .finished else { return "Сообщение…" }
+        switch run.status {
+        case .awaitingInput: return "Ответь на вопрос или выбери вариант выше…"
+        case .awaitingPlan:  return "Правки к плану…"
+        default:             return "Уточнение к текущему этапу (или «вернись к проверке»)…"
+        }
+    }
+
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 10) {
             // Поле в ScrollView: TextField растёт без ограничения, контейнер
@@ -803,7 +919,7 @@ struct ChatDetailView: View {
             // (TextField с lineLimit обрезал, но колёсиком не скроллился — только
             // переходом курсора по тексту.)
             ScrollView(.vertical) {
-                TextField("Сообщение…", text: $vm.input, axis: .vertical)
+                TextField(inputPlaceholder, text: $vm.input, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(.body)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1041,7 +1157,26 @@ struct ChatSettingsView: View {
                             Text(m.label).tag(m)
                         }
                     }
-                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskContext.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент.")
+                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskContext.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент. На паузе можно дослать уточнение (агент доработает текущий этап) или попросить сменить стадию («→ этап» / текстом).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("Рой агентов (параллельное выполнение)") {
+                    Toggle("Распараллеливать независимые шаги", isOn: $settings.swarmEnabled)
+                    if settings.swarmEnabled {
+                        Stepper(value: $settings.maxParallelAgents,
+                                in: GenerationSettings.maxParallelAgentsRange) {
+                            HStack {
+                                Text("Макс. подагентов в волне")
+                                Spacer()
+                                Text("\(settings.maxParallelAgents)")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                    }
+                    Text("На этапе «Выполнение» независимые шаги плана выполняются параллельно подагентами со своим узким контекстом (только их зависимости) — быстрее и экономнее по токенам. Зависимые шаги идут по порядку (планировщик указывает зависимости, шаги раскладываются по волнам). Выкл — последовательное выполнение с полным контекстом, как раньше.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

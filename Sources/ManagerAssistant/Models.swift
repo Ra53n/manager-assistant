@@ -167,6 +167,13 @@ struct GenerationSettings: Equatable, Codable {
     /// off — только промпт; code — вхождение запрещённых слов; llm — доп. запрос; both.
     var invariantValidation: InvariantValidationMode = .code
 
+    /// Рой агентов (FSM): на этапе «Выполнение» независимые шаги плана выполняются
+    /// ПАРАЛЛЕЛЬНО подагентами со своим узким контекстом (экономия токенов/времени).
+    /// По умолчанию ВКЛ. Зависимые шаги всё равно идут по порядку (топосортировка волн).
+    var swarmEnabled: Bool = true
+    /// Максимум одновременно работающих подагентов в одной волне.
+    var maxParallelAgents: Int = 3
+
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -176,6 +183,7 @@ struct GenerationSettings: Equatable, Codable {
     static let maxStopCount = 16
     static let historyWindowRange = 4...50
     static let memoryTokenBudgetRange = 200...4000
+    static let maxParallelAgentsRange = 2...6
 
     enum CodingKeys: String, CodingKey {
         case provider, model, temperature, topP, maxTokens, stop, responseFormat
@@ -184,6 +192,7 @@ struct GenerationSettings: Equatable, Codable {
         case memoryAssistEnabled, autoMemory, autoProjectSections
         case pipelineMode
         case invariantValidation
+        case swarmEnabled, maxParallelAgents
     }
 }
 
@@ -211,6 +220,8 @@ extension GenerationSettings {
         autoProjectSections = try c.decodeIfPresent(Bool.self, forKey: .autoProjectSections) ?? d.autoProjectSections
         pipelineMode = try c.decodeIfPresent(PipelineMode.self, forKey: .pipelineMode) ?? d.pipelineMode
         invariantValidation = try c.decodeIfPresent(InvariantValidationMode.self, forKey: .invariantValidation) ?? d.invariantValidation
+        swarmEnabled = try c.decodeIfPresent(Bool.self, forKey: .swarmEnabled) ?? d.swarmEnabled
+        maxParallelAgents = try c.decodeIfPresent(Int.self, forKey: .maxParallelAgents) ?? d.maxParallelAgents
     }
 }
 
@@ -332,6 +343,7 @@ enum TaskFSM {
 enum TaskRunStatus: String, Codable {
     case running       // этап в полёте (есть активный Task)
     case awaitingPlan  // план готов, ждём «Принять план» (только режим .plan)
+    case awaitingInput // агент задал уточняющий вопрос — ждём ответ пользователя
     case paused        // пользователь поставил паузу / отмена / перезапуск в середине
     case failed        // этап упал с ошибкой (не отмена)
     case finished      // дошли до Готово (терминал)
@@ -340,6 +352,27 @@ enum TaskRunStatus: String, Codable {
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self = TaskRunStatus(rawValue: raw) ?? .paused
+    }
+}
+
+/// Уточняющий вопрос агента с вариантами ответа (как AskUserQuestion в Claude Code).
+/// Агент выводит его, когда для корректной работы не хватает данных; пользователь
+/// выбирает вариант (или пишет свой), после чего прогон продолжается с той же стадии.
+struct PendingQuestion: Codable, Equatable {
+    var question: String = ""
+    var options: [String] = []
+
+    enum CodingKeys: String, CodingKey { case question, options }
+
+    init(question: String, options: [String]) {
+        self.question = question
+        self.options = options
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        question = try c.decodeIfPresent(String.self, forKey: .question) ?? ""
+        options = try c.decodeIfPresent([String].self, forKey: .options) ?? []
     }
 }
 
@@ -367,6 +400,14 @@ struct TaskContext: Codable, Identifiable {
     var planFeedback: String = ""         // правки к плану (кнопка/маркер REPLAN)
     var invariantRetries: Int = 0         // перегенерации текущего ответа из-за нарушения инвариантов
     var invariantViolations: [String] = [] // нарушения для прокидывания в retry-промпт
+    // --- интерактивность (пауза/уточнения, см. ChatViewModel.interject/answerClarification) ---
+    var guidance: [String] = []           // уточнения пользователя, прокидываются в промпт текущей стадии
+    var pendingQuestion: PendingQuestion? = nil  // заданный агентом вопрос (status == .awaitingInput)
+    // --- рой агентов (параллельное выполнение независимых шагов) ---
+    var waves: [[Int]] = []               // волны выполнения: группы индексов шагов, выполнимых параллельно
+    var waveIndex: Int = 0                // текущая волна (для возобновления)
+    var stepResults: [String] = []        // результаты по индексу шага (для зависимостей подагентов)
+    var stepDeps: [[Int]] = []            // зависимости по индексу шага (какие шаги нужны как вход)
     var errorText: String? = nil
     var startedAt: Date = Date()
 
@@ -380,6 +421,8 @@ struct TaskContext: Codable, Identifiable {
         case mode, status, validationResult, validationPassed, answer
         case executionRetries, planRetries, planFeedback, errorText, startedAt
         case invariantRetries, invariantViolations
+        case guidance, pendingQuestion
+        case waves, waveIndex, stepResults, stepDeps
     }
 }
 
@@ -412,6 +455,12 @@ extension TaskContext {
         planFeedback = try c.decodeIfPresent(String.self, forKey: .planFeedback) ?? ""
         invariantRetries = try c.decodeIfPresent(Int.self, forKey: .invariantRetries) ?? 0
         invariantViolations = try c.decodeIfPresent([String].self, forKey: .invariantViolations) ?? []
+        guidance = try c.decodeIfPresent([String].self, forKey: .guidance) ?? []
+        pendingQuestion = try c.decodeIfPresent(PendingQuestion.self, forKey: .pendingQuestion)
+        waves = try c.decodeIfPresent([[Int]].self, forKey: .waves) ?? []
+        waveIndex = try c.decodeIfPresent(Int.self, forKey: .waveIndex) ?? 0
+        stepResults = try c.decodeIfPresent([String].self, forKey: .stepResults) ?? []
+        stepDeps = try c.decodeIfPresent([[Int]].self, forKey: .stepDeps) ?? []
         errorText = try c.decodeIfPresent(String.self, forKey: .errorText)
         startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
     }
@@ -434,16 +483,41 @@ extension TaskContext {
 enum PipelinePrompts {
     static let nextStepMarker = "NEXT_STEP"   // модель сообщает: текущий шаг выполнен
     static let replanMarker   = "REPLAN"      // модель сообщает: план непригоден, нужен возврат
+    static let askUserMarker  = "ASK_USER"    // модель просит уточнение у пользователя
 
-    /// Системный промпт = РОЛЬ этапа.
-    static func systemPrompt(for state: TaskState) -> String {
+    /// Клауза про уточняющий вопрос (как AskUserQuestion в Claude Code): добавляется в
+    /// роль планировщика/исполнителя — спрашивай вместо догадок, если данных не хватает.
+    static let askUserClause = """
+    Если для корректной работы НЕ ХВАТАЕТ данных и любое продолжение было бы догадкой — \
+    НЕ угадывай. Вместо ответа выведи блок РОВНО в таком виде и остановись:
+    \(askUserMarker)
+    QUESTION: <один короткий вопрос>
+    OPTION: <вариант 1>
+    OPTION: <вариант 2>
+    (2–4 варианта). Выводи этот блок ТОЛЬКО при реальной нехватке данных, не злоупотребляй.
+    """
+
+    /// Системный промпт = РОЛЬ этапа. `swarm` — просить у планировщика зависимости шагов.
+    static func systemPrompt(for state: TaskState, swarm: Bool = false) -> String {
         switch state {
         case .planning:
-            return """
+            var s = """
             Ты — планировщик. По задаче из [QUERY] составь чёткий пошаговый план: \
             пронумерованные шаги (1., 2., 3., …), каждый шаг — одно конкретное \
             действие, без воды. Не выполняй задачу — только спланируй. Верни ТОЛЬКО план.
             """
+            if swarm {
+                s += "\n\n" + """
+                После плана ОБЯЗАТЕЛЬНО добавь раздел зависимостей в формате:
+                ЗАВИСИМОСТИ:
+                <номер шага>: <номера шагов, от которых он зависит через запятую>
+                Указывай ТОЛЬКО реальные зависимости по данным/порядку. Независимые шаги \
+                не перечисляй (или пиши «<номер>: -») — они будут выполнены параллельно. \
+                Стремись к максимальной параллельности: не вводи лишних зависимостей.
+                """
+            }
+            s += "\n\n" + askUserClause
+            return s
         case .execution:
             return """
             Ты — исполнитель. Выполни ТОЛЬКО текущий шаг [CURRENT] (НЕ весь план сразу). \
@@ -451,6 +525,8 @@ enum PipelinePrompts {
             шага. Когда шаг выполнен — заверши ответ ОТДЕЛЬНОЙ ПОСЛЕДНЕЙ строкой \
             «\(nextStepMarker)». Если по ходу стало ясно, что план непригоден и нужно \
             перепланировать — вместо этого заверши ответ строкой «\(replanMarker)».
+
+            \(askUserClause)
             """
         case .validation:
             return """
@@ -494,6 +570,12 @@ enum PipelinePrompts {
         - Если текущий шаг выполнен — заверши ответ строкой «\(nextStepMarker)».
         - Если план непригоден — заверши ответ строкой «\(replanMarker)».
         """
+        // Уточнения пользователя (на паузе/в ходе прогона) — учесть в ТЕКУЩЕЙ стадии,
+        // НЕ начиная заново. Это самые приоритетные указания.
+        if !ctx.guidance.isEmpty {
+            s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их в текущей стадии, приоритетно]\n"
+                + ctx.guidance.map { "- \($0)" }.joined(separator: "\n")
+        }
         // Инварианты (ограничения) — агент ОБЯЗАН их учитывать и отказывать в нарушениях.
         let invBlock = InvariantValidator.promptBlock(invariants)
         if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
@@ -515,12 +597,19 @@ enum PipelinePrompts {
         return s
     }
 
-    /// Текст плана → список шагов: снимает нумерацию/маркеры; пустой план → весь текст одним шагом.
+    static let depsHeader = "ЗАВИСИМОСТИ"
+
+    /// Текст плана → список шагов: снимает нумерацию/маркеры; пустой план → весь текст
+    /// одним шагом. Останавливается на разделах ЗАВИСИМОСТИ:/ASK_USER (не считает их шагами).
     static func parsePlanSteps(_ text: String) -> [String] {
         var steps: [String] = []
         for raw in text.split(whereSeparator: \.isNewline) {
             var line = raw.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else { continue }
+            let upper = line.uppercased()
+            // Разделы зависимостей / уточнения — не часть плана; дальше шагов нет.
+            if upper.hasPrefix(depsHeader) || upper.hasPrefix(askUserMarker)
+                || upper.hasPrefix("QUESTION:") || upper.hasPrefix("OPTION:") { break }
             if let r = line.range(of: #"^\s*(\d+[.)]|[-–•*])\s+"#, options: .regularExpression) {
                 line.removeSubrange(r)
                 line = line.trimmingCharacters(in: .whitespaces)
@@ -533,10 +622,23 @@ enum PipelinePrompts {
     static func wantsNextStep(_ text: String) -> Bool { text.uppercased().contains(nextStepMarker) }
     static func wantsReplan(_ text: String)   -> Bool { text.uppercased().contains(replanMarker) }
 
-    /// Убирает служебные маркеры из текста перед показом/сохранением.
+    /// Убирает служебные маркеры/разделы из текста перед показом/сохранением.
     static func stripMarkers(_ text: String) -> String {
-        var t = text
-        for m in [nextStepMarker, replanMarker] { t = t.replacingOccurrences(of: m, with: "") }
+        var kept: [String] = []
+        var inDeps = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            let upper = line.trimmingCharacters(in: .whitespaces).uppercased()
+            if upper.hasPrefix(depsHeader) { inDeps = true; continue }      // раздел зависимостей — убрать
+            if inDeps {                                                      // строки вида «3: 1,2» внутри раздела
+                if line.range(of: #"^\s*\d+\s*:"#, options: .regularExpression) != nil { continue }
+                inDeps = false
+            }
+            if upper == askUserMarker || upper.hasPrefix("QUESTION:") || upper.hasPrefix("OPTION:") { continue }
+            kept.append(line)
+        }
+        var t = kept.joined(separator: "\n")
+        for m in [nextStepMarker, replanMarker, askUserMarker] { t = t.replacingOccurrences(of: m, with: "") }
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -550,6 +652,168 @@ enum PipelinePrompts {
             if tail.contains("ВЫПОЛНЕНО") { return true }
         }
         return true
+    }
+
+    // MARK: - Уточняющий вопрос (ASK_USER)
+
+    /// Парсит блок ASK_USER → PendingQuestion. Возвращает nil, если нет всех частей
+    /// (маркер ASK_USER + строка QUESTION: + хотя бы один OPTION:).
+    static func parseQuestion(_ text: String) -> PendingQuestion? {
+        guard text.uppercased().contains(askUserMarker) else { return nil }
+        var question = ""
+        var options: [String] = []
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let upper = line.uppercased()
+            if upper.hasPrefix("QUESTION:") {
+                question = String(line.dropFirst("QUESTION:".count)).trimmingCharacters(in: .whitespaces)
+            } else if upper.hasPrefix("OPTION:") {
+                let opt = String(line.dropFirst("OPTION:".count)).trimmingCharacters(in: .whitespaces)
+                if !opt.isEmpty { options.append(opt) }
+            }
+        }
+        // Дедуп вариантов, ограничение до 4.
+        var seen = Set<String>()
+        options = options.filter { seen.insert($0.lowercased()).inserted }
+        if options.count > 4 { options = Array(options.prefix(4)) }
+        guard !question.isEmpty, !options.isEmpty else { return nil }
+        return PendingQuestion(question: question, options: options)
+    }
+
+    // MARK: - Рой агентов: зависимости шагов → волны (топосортировка)
+
+    /// Парсит раздел «ЗАВИСИМОСТИ:» (строки «3: 1,2», номера 1-based) → для каждого шага
+    /// (0-based) множество индексов-предшественников. Вне диапазона/self/дубли отбрасываются.
+    static func parseDeps(_ text: String, stepCount n: Int) -> [Set<Int>] {
+        var deps = Array(repeating: Set<Int>(), count: max(0, n))
+        guard n > 0 else { return [] }
+        var inSection = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.uppercased().hasPrefix(depsHeader) { inSection = true; continue }
+            guard inSection, !line.isEmpty else { continue }
+            // «<номер>: <номера через запятую/пробел>»
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, let stepNum = Int(parts[0].trimmingCharacters(in: .whitespaces)) else { continue }
+            let target = stepNum - 1
+            guard target >= 0, target < n else { continue }
+            let refs = parts[1].split(whereSeparator: { $0 == "," || $0 == " " || $0 == ";" })
+            for r in refs {
+                guard let num = Int(r.trimmingCharacters(in: .whitespaces)) else { continue }
+                let dep = num - 1
+                if dep >= 0, dep < n, dep != target { deps[target].insert(dep) }
+            }
+        }
+        return deps
+    }
+
+    /// Волны выполнения (алгоритм Кана): группы индексов шагов, выполнимых параллельно.
+    /// Цикл/тупик или пустой ввод → последовательный фолбэк (каждый шаг — своя волна).
+    static func computeWaves(n: Int, deps: [Set<Int>]) -> [[Int]] {
+        guard n > 0 else { return [] }
+        // Защита от рассинхрона размеров.
+        let d: [Set<Int>] = (0..<n).map { i in i < deps.count ? deps[i].filter { $0 >= 0 && $0 < n && $0 != i } : [] }
+        var placed = Array(repeating: false, count: n)
+        var waves: [[Int]] = []
+        var remaining = n
+        while remaining > 0 {
+            var wave: [Int] = []
+            for i in 0..<n where !placed[i] {
+                if d[i].allSatisfy({ placed[$0] }) { wave.append(i) }
+            }
+            if wave.isEmpty { return (0..<n).map { [$0] } }   // цикл/тупик → последовательно
+            for i in wave { placed[i] = true }
+            remaining -= wave.count
+            waves.append(wave.sorted())
+        }
+        return waves
+    }
+
+    /// Системный промпт подагента роя (исполнитель ОДНОГО шага с узким контекстом).
+    static func subAgentSystemPrompt() -> String {
+        """
+        Ты — подагент-исполнитель в рое. Выполни ТОЛЬКО порученный шаг [STEP] полностью и \
+        самодостаточно. Используй [DEPS] (результаты шагов, от которых зависит твой) как \
+        вход; [PLAN] — общий контекст. НЕ выполняй другие шаги и НЕ задавай вопросов — \
+        дай готовый результат своего шага. Если шаг невозможен без переплана — заверши \
+        ответ строкой «\(replanMarker)».
+        """
+    }
+
+    /// User-сообщение подагенту: узкий контекст (обзор плана + ТОЛЬКО выводы зависимостей
+    /// + текущий шаг). Полный [DONE] НЕ передаём — экономия токенов/контекста.
+    static func subAgentPrompt(task: String, stepIndex: Int, plan: [String],
+                               deps: Set<Int>, stepResults: [String],
+                               profile: String, invariants: [Invariant] = [],
+                               guidance: [String] = []) -> String {
+        func numberedPlan() -> String {
+            plan.isEmpty ? "—" : plan.enumerated()
+                .map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n           ")
+        }
+        let depList = deps.sorted()
+        let depsText: String
+        if depList.isEmpty {
+            depsText = "—"
+        } else {
+            depsText = depList.map { idx -> String in
+                let res = (idx < stepResults.count ? stepResults[idx] : "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = idx < plan.count ? plan[idx] : "шаг \(idx + 1)"
+                return "• Шаг \(idx + 1) (\(title)):\n\(res.isEmpty ? "—" : res)"
+            }.joined(separator: "\n")
+        }
+        let step = stepIndex < plan.count ? plan[stepIndex] : ""
+        let prof = profile.trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = """
+        [QUERY]    \(task)
+        [PLAN]     \(numberedPlan())
+        [STEP]     \(stepIndex + 1). \(step)
+        [DEPS]
+        \(depsText)
+        [PROFILE]  \(prof.isEmpty ? "—" : prof)
+
+        Дай полный результат шага [STEP].
+        """
+        if !guidance.isEmpty {
+            s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их, приоритетно]\n"
+                + guidance.map { "- \($0)" }.joined(separator: "\n")
+        }
+        let invBlock = InvariantValidator.promptBlock(invariants)
+        if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        return s
+    }
+
+    // MARK: - Запрос смены стадии текстом
+
+    /// Распознаёт в тексте пользователя ПРОСЬБУ СМЕНИТЬ СТАДИЮ («вернись к проверке»,
+    /// «перейди к ответу», «назад к планированию», «go to validation»). Возвращает целевую
+    /// стадию или nil (тогда текст — обычное уточнение). Легальность перехода НЕ проверяет.
+    ///
+    /// Чтобы не путать навигацию с уточнением («верни ответ покороче» — это НЕ переход),
+    /// требуем три части: глагол перехода + предлог «к»/«to» + метку этапа. Без предлога
+    /// (как у обычной правки) — это уточнение, а не смена стадии.
+    static func parseStateChangeRequest(_ text: String) -> TaskState? {
+        let lower = text.lowercased()
+        let verbs = ["верн", "перейд", "перейт", "переключ", "назад", "вернёмс", "вернемс",
+                     "go to", "back to", "switch to", "move to"]
+        let hasVerb = verbs.contains { lower.contains($0) }
+        // Предлог направления: отдельное «к» (рус.) или « to » (англ.).
+        let hasPreposition = lower.range(of: #"(^|\s)к\s"#, options: .regularExpression) != nil
+            || lower.contains(" to ")
+        guard hasVerb, hasPreposition else { return nil }
+        // Порядок проверки: более специфичные метки раньше.
+        if lower.contains("планир") || lower.contains("plan") { return .planning }
+        if lower.contains("выполн") || lower.contains("исполн") || lower.contains("execut") { return .execution }
+        if lower.contains("провер") || lower.contains("валид") || lower.contains("valid") || lower.contains("check") { return .validation }
+        if lower.contains("ответ") || lower.contains("answer") { return .answer }
+        return nil
+    }
+}
+
+extension Array {
+    /// Разбивает массив на чанки заданного размера (для ограничения параллельности роя).
+    func chunked(into size: Int) -> [[Element]] {
+        guard size > 0 else { return isEmpty ? [] : [self] }
+        return stride(from: 0, to: count, by: size).map { Array(self[$0..<Swift.min($0 + size, count)]) }
     }
 }
 
@@ -650,6 +914,10 @@ struct Chat: Identifiable, Codable {
     /// Runtime: текст баннера о конфликте инвариантов (модель отказала из-за запроса
     /// пользователя). Не сохраняется (см. CodingKeys).
     var invariantConflict: String? = nil
+
+    /// Runtime: текст баннера об отказе в смене стадии (запрошенный переход запрещён
+    /// таблицей TaskFSM). Не сохраняется (см. CodingKeys).
+    var stateChangeError: String? = nil
 
     /// Активный/последний контекст задачи (конечный автомат FSM). nil — нет.
     /// Сохраняется (нужен для возобновления после перезапуска).

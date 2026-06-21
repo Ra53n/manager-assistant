@@ -180,8 +180,10 @@ final class ChatViewModel: ObservableObject {
     var canSend: Bool {
         guard let idx = selectedIndex else { return false }
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let run = chats[idx].taskContext, run.status != .finished { return false }
-        return !text.isEmpty && !chats[idx].isLoading
+        guard !text.isEmpty else { return false }
+        // Активный прогон FSM — текст уходит как уточнение/ответ/смена стадии (см. send()).
+        if let run = chats[idx].taskContext, run.status != .finished { return true }
+        return !chats[idx].isLoading
     }
 
     // MARK: - Управление чатами
@@ -354,11 +356,26 @@ final class ChatViewModel: ObservableObject {
     func send() {
         guard let idx = selectedIndex else { return }
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !chats[idx].isLoading else { return }
-        // Незавершённый прогон FSM — Enter не стартует новый (управление — на полосе).
-        if let run = chats[idx].taskContext, run.status != .finished { return }
-
+        guard !text.isEmpty else { return }
         let chatID = chats[idx].id
+
+        // Активный прогон FSM: новое сообщение — НЕ новый запуск. Это либо ответ на
+        // уточняющий вопрос, либо просьба сменить стадию, либо уточнение к текущей стадии
+        // (агент дорабатывает ТЕКУЩИЙ этап, не возвращаясь в планирование).
+        if let run = chats[idx].taskContext, run.status != .finished {
+            addMessage(idx, role: .user, content: text)
+            input = ""
+            if run.status == .awaitingInput {
+                answerClarification(chatID: chatID, answer: text)
+            } else if let target = PipelinePrompts.parseStateChangeRequest(text) {
+                requestStateChange(chatID: chatID, to: target)
+            } else {
+                interject(chatID: chatID, text: text)
+            }
+            return
+        }
+
+        guard !chats[idx].isLoading else { return }
 
         // Тайтл чата — из первого сообщения пользователя.
         if !chats[idx].messages.contains(where: { $0.role == .user }) {
@@ -372,6 +389,7 @@ final class ChatViewModel: ObservableObject {
         // кода (см. startPipeline), а не один запрос модели. Enter запускает автомат.
         if chats[idx].settings.pipelineMode != .off {
             chats[idx].invariantConflict = nil
+            chats[idx].stateChangeError = nil
             chats[idx].taskContext = TaskContext(task: text,
                                                  state: .planning,
                                                  mode: chats[idx].settings.pipelineMode,
@@ -469,12 +487,21 @@ final class ChatViewModel: ObservableObject {
                     continue
                 }
                 ctx.total = ctx.plan.count
+                // Рой ВКЛ → волновое (параллельное) выполнение через runWave; иначе пошагово.
+                if settings.swarmEnabled {
+                    if ctx.waves.isEmpty { ctx.waves = (0..<ctx.plan.count).map { [$0] } }
+                    ctx.waveIndex = min(max(0, ctx.waveIndex), ctx.waves.count - 1)
+                    chats[i].taskContext = ctx
+                    await runWave(chatID: chatID, gen: gen)
+                    if pipelineGen[chatID] != gen { return }
+                    continue                                          // следующий проход: новая волна / проверка
+                }
                 ctx.step = min(ctx.step, ctx.plan.count - 1)
                 ctx.current = ctx.plan[ctx.step]
                 chats[i].taskContext = ctx
             }
 
-            let sys = PipelinePrompts.systemPrompt(for: state)
+            let sys = PipelinePrompts.systemPrompt(for: state, swarm: settings.swarmEnabled)
             let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs)
             chats[i].isLoading = true
 
@@ -566,12 +593,36 @@ final class ChatViewModel: ObservableObject {
                     }
                 }
 
+                // Уточняющий вопрос агента (ASK_USER): остановиться и спросить пользователя.
+                // БЕЗ перехода стадии — после ответа продолжим ту же стадию (interject/answer).
+                if let pq = PipelinePrompts.parseQuestion(result.text) {
+                    let qText = "❓ \(pq.question)\n"
+                        + pq.options.enumerated().map { "  \($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+                    addMessage(j, role: .assistant, content: qText, metrics: metrics, state: c.state)
+                    accumulateTokens(j, result, metrics)
+                    c.pendingQuestion = pq
+                    c.status = .awaitingInput
+                    chats[j].taskContext = c
+                    persistNow()
+                    chats[j].isLoading = false
+                    clearTask(chatID, gen: gen)
+                    return
+                }
+
                 // Вывод этапа в контекст + в ленту + ПЕРЕХОД (только через transitioned).
                 switch state {
                 case .planning:
                     c.plan = PipelinePrompts.parsePlanSteps(result.text)
                     c.total = c.plan.count
                     c.done = []; c.step = 0
+                    c.stepResults = []; c.waveIndex = 0
+                    // Рой: распарсить зависимости и разложить шаги по волнам (топосортировка).
+                    if settings.swarmEnabled {
+                        c.stepDeps = PipelinePrompts.parseDeps(result.text, stepCount: c.plan.count).map { $0.sorted() }
+                        c.waves = PipelinePrompts.computeWaves(n: c.plan.count, deps: c.stepDeps.map { Set($0) })
+                    } else {
+                        c.stepDeps = []; c.waves = []
+                    }
                     c.current = c.plan.first ?? ""
                     c.planFeedback = ""
                     addMessage(j, role: .assistant, content: cleaned, metrics: metrics, state: .planning)
@@ -616,6 +667,7 @@ final class ChatViewModel: ObservableObject {
                     } else if c.executionRetries < TaskContext.maxExecutionRetries {
                         c.executionRetries += 1
                         c.done = []; c.step = 0                       // переделать выполнение с замечаниями
+                        c.waveIndex = 0; c.stepResults = []          // рой: перезапустить волны
                         c = c.transitioned(to: .execution)
                     } else {
                         c = c.transitioned(to: .answer)
@@ -762,6 +814,299 @@ final class ChatViewModel: ObservableObject {
         if let i = chats.firstIndex(where: { $0.id == chatID }) {
             chats[i].taskContext = nil
             chats[i].isLoading = false
+            chats[i].stateChangeError = nil
+        }
+    }
+
+    // MARK: - Интерактивность: уточнения / ответы на вопросы / смена стадии
+
+    /// Уточнение пользователя во время прогона. Добавляется в `guidance` и учитывается
+    /// в ТЕКУЩЕЙ стадии (агент дорабатывает её, НЕ возвращаясь в планирование).
+    /// На паузе — сразу продолжаем. На ходу — кладём в очередь (следующий проход учтёт).
+    func interject(chatID: UUID, text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty,
+              let i = chats.firstIndex(where: { $0.id == chatID }),
+              var ctx = chats[i].taskContext else { return }
+        switch ctx.status {
+        case .awaitingInput:
+            answerClarification(chatID: chatID, answer: t)
+        case .awaitingPlan:
+            // После планирования правки идут в перепланирование (это всё ещё «планирование»).
+            ctx.guidance.append(t)
+            chats[i].taskContext = ctx
+            persistNow()
+            replan(chatID: chatID, feedback: t)
+        case .running:
+            // Прогон идёт — добавляем в очередь, следующий этап/шаг учтёт guidance. Запрос не рвём.
+            ctx.guidance.append(t)
+            chats[i].taskContext = ctx
+            persistNow()
+            // ИСКЛЮЧЕНИЕ: на этапе «Ответ» следующего прохода НЕТ — иначе уточнение
+            // потерялось бы. Перезапускаем этап, чтобы финальный ответ его учёл
+            // (старый запрос вернётся с устаревшим gen и состояние не тронет).
+            if ctx.state == .answer { startPipeline(chatID: chatID) }
+        case .paused, .failed:
+            ctx.guidance.append(t)
+            ctx.status = .running
+            ctx.errorText = nil
+            chats[i].taskContext = ctx
+            chats[i].errorText = nil
+            persistNow()
+            startPipeline(chatID: chatID)
+        case .finished:
+            break
+        }
+    }
+
+    /// Ответ на уточняющий вопрос агента (status == .awaitingInput): «Вопрос/Ответ» →
+    /// guidance, снять pendingQuestion, продолжить ТУ ЖЕ стадию (без перехода).
+    func answerClarification(chatID: UUID, answer: String) {
+        guard let i = chats.firstIndex(where: { $0.id == chatID }),
+              var ctx = chats[i].taskContext else { return }
+        let a = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = ctx.pendingQuestion?.question ?? ""
+        if !a.isEmpty { ctx.guidance.append(q.isEmpty ? a : "Вопрос: \(q)\nОтвет: \(a)") }
+        ctx.pendingQuestion = nil
+        ctx.status = .running
+        chats[i].taskContext = ctx
+        persistNow()
+        startPipeline(chatID: chatID)
+    }
+
+    /// Запрос смены стадии (меню или текстом). Переход — ТОЛЬКО если разрешён таблицей
+    /// TaskFSM; иначе баннер с доступными переходами (без обращения к модели).
+    func requestStateChange(chatID: UUID, to target: TaskState) {
+        // Обесценить хвост старого Task + отменить активный запрос (как cancelRun).
+        pipelineGen[chatID] = (pipelineGen[chatID] ?? 0) + 1
+        pipelineTasks[chatID]?.cancel()
+        pipelineTasks[chatID] = nil
+        guard let i = chats.firstIndex(where: { $0.id == chatID }),
+              let ctx = chats[i].taskContext else { return }
+        let from = ctx.state
+
+        // Та же стадия — просто перезапустить её (это НЕ переход, страж бы упал).
+        if from == target {
+            chats[i].stateChangeError = nil
+            chats[i].taskContext?.status = .running
+            chats[i].taskContext?.pendingQuestion = nil
+            chats[i].isLoading = false
+            startPipeline(chatID: chatID)
+            return
+        }
+
+        guard TaskFSM.allows(from, to: target) else {
+            let allowed = TaskFSM.transitions[from, default: []].map { $0.label }
+            let allowedText = allowed.isEmpty ? "нет (это терминальная стадия)" : allowed.joined(separator: ", ")
+            chats[i].stateChangeError = "Не могу перейти из «\(from.label)» в «\(target.label)». "
+                + "Доступные переходы: \(allowedText)."
+            chats[i].isLoading = false
+            return
+        }
+
+        chats[i].stateChangeError = nil
+        var c = ctx.transitioned(to: target)
+        c.pendingQuestion = nil
+        // Ручная смена стадии — явное намерение пользователя: даём свежий бюджет возвратов,
+        // иначе прогон с исчерпанными счётчиками мог бы тут же оборваться (forced answer).
+        c.executionRetries = 0; c.planRetries = 0
+        c.invariantRetries = 0; c.invariantViolations = []
+        switch target {                                          // сбросы полей по цели перехода
+        case .planning:
+            c.plan = []; c.done = []; c.step = 0; c.total = 0; c.current = ""
+            c.waves = []; c.waveIndex = 0; c.stepResults = []; c.stepDeps = []
+            c.planFeedback = "Пользователь вручную вернул на этап планирования."
+        case .execution:
+            c.done = []; c.step = 0; c.waveIndex = 0; c.stepResults = []
+            c.current = c.plan.first ?? ""
+        case .validation, .answer:
+            break                                               // переоценить/ответить по текущему done
+        }
+        c.status = .running
+        chats[i].taskContext = c
+        chats[i].isLoading = false
+        startPipeline(chatID: chatID)
+    }
+
+    func clearStateChangeError(chatID: UUID) {
+        if let i = chats.firstIndex(where: { $0.id == chatID }) { chats[i].stateChangeError = nil }
+    }
+
+    // MARK: - Рой агентов: одна волна параллельного выполнения
+
+    /// Выполняет ТЕКУЩУЮ волну (`waves[waveIndex]`): независимые шаги — параллельно
+    /// подагентами (узкий контекст: только их зависимости), оркестратор агрегирует.
+    /// Коммит волны — атомарно ПОСЛЕ успеха всех подагентов (краш/пауза → повтор волны).
+    private func runWave(chatID: UUID, gen: Int) async {
+        guard let i = chats.firstIndex(where: { $0.id == chatID }),
+              let snap = chats[i].taskContext, snap.status == .running,
+              snap.waveIndex < snap.waves.count else { return }
+
+        // Снимок (value-типы) на MainActor — НИЧЕГО из self не захватываем в группу.
+        let settings = chats[i].settings
+        let profileText = profile(for: chats[i])?.systemDirective ?? ""
+        let invs = effectiveInvariants(for: chats[i])
+        let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
+        let localClient = client                                // DeepSeekClient — struct без полей (Sendable)
+        let task = snap.task
+        let plan = snap.plan
+        let stepDeps = snap.stepDeps
+        let stepResults = snap.stepResults
+        let guidance = snap.guidance
+        let wave = snap.waves[snap.waveIndex]
+        let cap = max(1, settings.maxParallelAgents)
+        let sys = PipelinePrompts.subAgentSystemPrompt()
+        chats[i].isLoading = true
+        let start = Date()
+
+        // Параллельный прогон волны, чанками по cap (захват только value-типов).
+        var results: [Int: SendResult] = [:]
+        do {
+            for chunk in wave.chunked(into: cap) {
+                let collected = try await withThrowingTaskGroup(of: (Int, SendResult).self) { group -> [(Int, SendResult)] in
+                    for idx in chunk {
+                        let deps = idx < stepDeps.count ? Set(stepDeps[idx]) : []
+                        let user = PipelinePrompts.subAgentPrompt(task: task, stepIndex: idx, plan: plan,
+                                                                  deps: deps, stepResults: stepResults,
+                                                                  profile: profileText, invariants: invs,
+                                                                  guidance: guidance)
+                        group.addTask {
+                            let r = try await localClient.runPhase(systemPrompt: sys, userMessage: user, settings: settings)
+                            return (idx, r)
+                        }
+                    }
+                    var acc: [(Int, SendResult)] = []
+                    for try await pair in group { acc.append(pair) }
+                    return acc
+                }
+                for (idx, r) in collected { results[idx] = r }
+            }
+        } catch {
+            // Отмена (пауза) → тот же waveIndex, без коммита. Иначе — failed (возобновляемо).
+            if error is CancellationError || (error as? URLError)?.code == .cancelled || Task.isCancelled {
+                pauseAt(chatID, gen: gen); return
+            }
+            guard pipelineGen[chatID] == gen else { return }
+            if let j = chats.firstIndex(where: { $0.id == chatID }) {
+                chats[j].taskContext?.status = .failed
+                chats[j].taskContext?.errorText = error.localizedDescription
+                chats[j].errorText = error.localizedDescription
+                chats[j].isLoading = false
+            }
+            persistNow()
+            clearTask(chatID, gen: gen)
+            return
+        }
+
+        // Назад на MainActor: поколение/отмена ДО любых мутаций.
+        guard pipelineGen[chatID] == gen else { return }
+        if Task.isCancelled { pauseAt(chatID, gen: gen); return }
+        guard let j = chats.firstIndex(where: { $0.id == chatID }),
+              var c = chats[j].taskContext else { clearTask(chatID, gen: gen); return }
+
+        let waveSorted = wave.sorted()
+        let merged = waveSorted.compactMap { results[$0]?.text }.joined(separator: "\n\n")
+
+        // КОНФЛИКТ инварианта (модель пометила) → обрыв конвейера, отказ как итог.
+        if !invs.isEmpty, InvariantValidator.modelFlaggedConflict(merged) {
+            let cleaned = PipelinePrompts.stripMarkers(merged)
+            addMessage(j, role: .assistant, content: cleaned, metrics: waveMetrics(results, price: price, start: start), state: .answer)
+            accumulateWaveTokens(j, results, price)
+            c.answer = cleaned; c.status = .finished
+            c.invariantRetries = 0; c.invariantViolations = []
+            chats[j].invariantConflict = "Запрос нарушает инвариант — выполнение остановлено, предложена допустимая альтернатива (см. ответ)."
+            chats[j].taskContext = c
+            persistNow(); chats[j].isLoading = false
+            clearTask(chatID, gen: gen); return
+        }
+
+        // Нарушение МОДЕЛИ (код-проверка по объединённому выводу) → retry всей волны в общем бюджете.
+        let invMethod = settings.invariantValidation
+        if !invs.isEmpty, invMethod != .off {
+            let violations = (invMethod == .code || invMethod == .both)
+                ? InvariantValidator.codeViolations(merged, invs) : []
+            if !violations.isEmpty {
+                if c.invariantRetries < TaskContext.maxInvariantRetries {
+                    c.invariantRetries += 1
+                    c.invariantViolations = violations.map { $0.description }
+                    chats[j].taskContext = c
+                    persistNow()
+                    return                                       // та же волна заново (цикл продолжит)
+                } else {
+                    let msg = "Не удалось выполнить без нарушения инвариантов: "
+                        + violations.map { $0.description }.joined(separator: "; ")
+                        + ".\nВыполнение остановлено — уточни задачу или ослабь ограничения."
+                    addMessage(j, role: .assistant, content: msg, metrics: waveMetrics(results, price: price, start: start), state: .answer)
+                    accumulateWaveTokens(j, results, price)
+                    c.answer = msg; c.status = .finished
+                    c.invariantRetries = 0; c.invariantViolations = []
+                    chats[j].invariantConflict = msg
+                    chats[j].taskContext = c
+                    persistNow(); chats[j].isLoading = false
+                    clearTask(chatID, gen: gen); return
+                }
+            } else {
+                c.invariantViolations = []
+            }
+        }
+
+        // REPLAN от подагента → шаг назад в планирование (если бюджет позволяет).
+        if PipelinePrompts.wantsReplan(merged), c.planRetries < TaskContext.maxPlanRetries {
+            c.planRetries += 1
+            c.planFeedback = PipelinePrompts.stripMarkers(merged)
+            c.done = []; c.step = 0; c.waveIndex = 0; c.stepResults = []
+            c = c.transitioned(to: .planning)
+            chats[j].taskContext = c
+            persistNow()
+            return
+        }
+
+        // Коммит волны: результаты по индексам шага + в ленту по порядку.
+        if c.stepResults.count < plan.count {
+            c.stepResults += Array(repeating: "", count: plan.count - c.stepResults.count)
+        }
+        for idx in waveSorted {
+            guard let r = results[idx] else { continue }
+            let cleaned = PipelinePrompts.stripMarkers(r.text)
+            c.stepResults[idx] = cleaned
+            c.done.append(cleaned)
+            let m = MessageMetrics(
+                promptTokens: r.promptTokens, completionTokens: r.completionTokens,
+                totalTokens: r.totalTokens, duration: Date().timeIntervalSince(start),
+                promptCost: price.map { Double(r.promptTokens) * $0.promptPerToken },
+                completionCost: price.map { Double(r.completionTokens) * $0.completionPerToken })
+            addMessage(j, role: .assistant, content: cleaned, metrics: m, state: .execution, step: idx, total: c.total)
+        }
+        accumulateWaveTokens(j, results, price)
+        c.step = c.done.count
+        c.waveIndex += 1
+        if c.waveIndex >= c.waves.count { c = c.transitioned(to: .validation) }   // все волны сделаны
+        chats[j].taskContext = c
+        persistNow()
+    }
+
+    /// Суммарные метрики волны (для сообщений-итогов: конфликт/исчерпание бюджета).
+    private func waveMetrics(_ results: [Int: SendResult], price: ModelPricing?, start: Date) -> MessageMetrics {
+        let p = results.values.reduce(0) { $0 + $1.promptTokens }
+        let comp = results.values.reduce(0) { $0 + $1.completionTokens }
+        let tot = results.values.reduce(0) { $0 + $1.totalTokens }
+        return MessageMetrics(
+            promptTokens: p, completionTokens: comp, totalTokens: tot,
+            duration: Date().timeIntervalSince(start),
+            promptCost: price.map { Double(p) * $0.promptPerToken },
+            completionCost: price.map { Double(comp) * $0.completionPerToken })
+    }
+
+    /// Учёт токенов/стоимости всех подагентов волны в счётчиках чата.
+    private func accumulateWaveTokens(_ j: Int, _ results: [Int: SendResult], _ price: ModelPricing?) {
+        for r in results.values {
+            chats[j].promptTokens += r.promptTokens
+            chats[j].completionTokens += r.completionTokens
+            chats[j].totalTokens += r.totalTokens
+            if let price {
+                chats[j].totalCost += Double(r.promptTokens) * price.promptPerToken
+                    + Double(r.completionTokens) * price.completionPerToken
+            }
         }
     }
 

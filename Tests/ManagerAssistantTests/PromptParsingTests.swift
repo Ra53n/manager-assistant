@@ -1,0 +1,160 @@
+// PromptParsingTests — парсеры и сборка промптов PipelinePrompts.
+// Защищают разбор плана, вердикта, уточняющего вопроса, чистку маркеров,
+// распознавание запроса смены стадии и инжекцию указаний пользователя.
+
+import XCTest
+@testable import ManagerAssistant
+
+final class PromptParsingTests: XCTestCase {
+
+    // MARK: parsePlanSteps
+
+    func testParsePlanNumbered() {
+        let steps = PipelinePrompts.parsePlanSteps("1. Раз\n2) Два\n- Три\n• Четыре")
+        XCTAssertEqual(steps, ["Раз", "Два", "Три", "Четыре"])
+    }
+
+    func testParsePlanStopsAtDepsSection() {
+        let steps = PipelinePrompts.parsePlanSteps("1. A\n2. B\nЗАВИСИМОСТИ:\n2: 1")
+        XCTAssertEqual(steps, ["A", "B"])   // строки зависимостей — не шаги
+    }
+
+    func testParsePlanEmptyFallsBackToWholeText() {
+        let steps = PipelinePrompts.parsePlanSteps("просто текст без нумерации")
+        XCTAssertEqual(steps, ["просто текст без нумерации"])
+    }
+
+    // MARK: parseVerdict
+
+    func testVerdictPassFail() {
+        XCTAssertTrue(PipelinePrompts.parseVerdict("всё ок\nВЕРДИКТ: ВЫПОЛНЕНО"))
+        XCTAssertFalse(PipelinePrompts.parseVerdict("есть проблемы\nВЕРДИКТ: НЕ ВЫПОЛНЕНО"))
+    }
+
+    func testVerdictUsesLastOccurrence() {
+        let t = "ВЕРДИКТ: НЕ ВЫПОЛНЕНО\n...исправили...\nВЕРДИКТ: ВЫПОЛНЕНО"
+        XCTAssertTrue(PipelinePrompts.parseVerdict(t))
+    }
+
+    func testVerdictAmbiguousDefaultsTrue() {
+        XCTAssertTrue(PipelinePrompts.parseVerdict("без явного вердикта"))
+    }
+
+    // MARK: маркеры
+
+    func testWantsMarkers() {
+        XCTAssertTrue(PipelinePrompts.wantsNextStep("готово\nNEXT_STEP"))
+        XCTAssertTrue(PipelinePrompts.wantsReplan("план плох\nREPLAN"))
+        XCTAssertFalse(PipelinePrompts.wantsReplan("обычный ответ"))
+    }
+
+    func testStripMarkersRemovesServiceLines() {
+        let raw = """
+        Результат шага.
+        ЗАВИСИМОСТИ:
+        2: 1
+        NEXT_STEP
+        """
+        let cleaned = PipelinePrompts.stripMarkers(raw)
+        XCTAssertEqual(cleaned, "Результат шага.")
+        XCTAssertFalse(cleaned.contains("NEXT_STEP"))
+        XCTAssertFalse(cleaned.contains("ЗАВИСИМОСТИ"))
+    }
+
+    func testStripMarkersRemovesAskBlock() {
+        let raw = "ASK_USER\nQUESTION: что?\nOPTION: a\nOPTION: b"
+        XCTAssertEqual(PipelinePrompts.stripMarkers(raw), "")
+    }
+
+    // MARK: parseQuestion
+
+    func testParseQuestionValid() {
+        let raw = """
+        ASK_USER
+        QUESTION: Какой формат вывода?
+        OPTION: JSON
+        OPTION: Текст
+        """
+        let q = PipelinePrompts.parseQuestion(raw)
+        XCTAssertEqual(q?.question, "Какой формат вывода?")
+        XCTAssertEqual(q?.options, ["JSON", "Текст"])
+    }
+
+    func testParseQuestionRequiresAllParts() {
+        XCTAssertNil(PipelinePrompts.parseQuestion("QUESTION: нет маркера\nOPTION: a"))   // нет ASK_USER
+        XCTAssertNil(PipelinePrompts.parseQuestion("ASK_USER\nQUESTION: без вариантов")) // нет OPTION
+        XCTAssertNil(PipelinePrompts.parseQuestion("ASK_USER\nOPTION: a\nOPTION: b"))     // нет QUESTION
+        XCTAssertNil(PipelinePrompts.parseQuestion("обычный ответ"))
+    }
+
+    func testParseQuestionDedupAndCap() {
+        let raw = """
+        ASK_USER
+        QUESTION: Q?
+        OPTION: a
+        OPTION: A
+        OPTION: b
+        OPTION: c
+        OPTION: d
+        OPTION: e
+        """
+        let q = PipelinePrompts.parseQuestion(raw)
+        XCTAssertEqual(q?.options.count, 4)          // дедуп (a==A) + ограничение до 4
+        XCTAssertEqual(q?.options.first, "a")
+    }
+
+    // MARK: parseStateChangeRequest
+
+    func testStateChangeRequests() {
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("вернись к планированию"), .planning)
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("перейди к проверке"), .validation)
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("назад к выполнению"), .execution)
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("перейти к ответу"), .answer)
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("go to validation"), .validation)
+    }
+
+    func testStateChangeRequiresVerb() {
+        // Без глагола перехода — это обычное уточнение, не смена стадии.
+        XCTAssertNil(PipelinePrompts.parseStateChangeRequest("доработай ответ подробнее"))
+        XCTAssertNil(PipelinePrompts.parseStateChangeRequest("проверь ещё раз вот это"))
+    }
+
+    func testStateChangeRequiresPreposition() {
+        // Глагол + метка БЕЗ предлога «к»/«to» — это уточнение, НЕ навигация
+        // (иначе «верни ответ покороче» ошибочно ушло бы в смену стадии).
+        XCTAssertNil(PipelinePrompts.parseStateChangeRequest("верни ответ покороче"))
+        XCTAssertNil(PipelinePrompts.parseStateChangeRequest("верни выполнение шага без воды"))
+        // С предлогом — это навигация.
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("верни к ответу"), .answer)
+        XCTAssertEqual(PipelinePrompts.parseStateChangeRequest("back to planning please"), .planning)
+    }
+
+    // MARK: buildPrompt — указания пользователя
+
+    func testBuildPromptInjectsGuidance() {
+        var ctx = TaskContext(task: "сделать X", state: .execution)
+        ctx.plan = ["шаг1"]; ctx.current = "шаг1"; ctx.total = 1
+        ctx.guidance = ["учитывай требование Y"]
+        let p = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: "")
+        XCTAssertTrue(p.contains("УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ"))
+        XCTAssertTrue(p.contains("учитывай требование Y"))
+    }
+
+    func testBuildPromptNoGuidanceBlockWhenEmpty() {
+        let ctx = TaskContext(task: "T", state: .planning)
+        let p = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: "")
+        XCTAssertFalse(p.contains("УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ"))
+    }
+
+    // MARK: subAgentPrompt — узкий контекст
+
+    func testSubAgentPromptIncludesOnlyDepOutputs() {
+        let plan = ["A", "B", "C"]
+        let results = ["вывод A", "вывод B", ""]
+        let p = PipelinePrompts.subAgentPrompt(task: "T", stepIndex: 2, plan: plan,
+                                               deps: [0], stepResults: results, profile: "")
+        XCTAssertTrue(p.contains("вывод A"))        // зависимость включена
+        XCTAssertFalse(p.contains("вывод B"))       // НЕ-зависимость не включена (экономия контекста)
+        XCTAssertTrue(p.contains("C"))              // текущий шаг
+    }
+}

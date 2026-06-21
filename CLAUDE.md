@@ -98,6 +98,45 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   запускаются. UI — `pipelineBar` (полоса этапов) над лентой + быстрый сегмент-
   переключатель режима `pipelineModeBar` ПРЯМО НАД полем ввода (Выкл|Авто|План, один
   клик) + секция в `ChatSettingsView`. В сравнении FSM НЕТ.
+- **Интерактивная пауза (как Claude Code)** — на активном прогоне ввод в поле НЕ
+  стартует новый запуск, а роутится в `send()`: (1) `status==.awaitingInput` →
+  `answerClarification`; (2) распознан запрос смены стадии (`PipelinePrompts.
+  parseStateChangeRequest` — глагол перехода + метка этапа) → `requestStateChange`;
+  (3) иначе → `interject`. **Уточнение** (`interject`): текст копится в
+  `TaskContext.guidance` (инжектится блоком `[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ]` в КАЖДЫЙ
+  последующий промпт), агент дорабатывает ТЕКУЩУЮ стадию — НЕ возвращается в
+  планирование. На паузе/ошибке — сразу `running`+`startPipeline` (доработка);
+  на ходу (`.running`) — только очередь (запрос не рвём, учтётся след. проходом);
+  на `.awaitingPlan` — в `planFeedback`+`replan`. **Вопрос агента**: модель выводит
+  блок `ASK_USER`/`QUESTION:`/`OPTION:` (клауза `askUserClause` в роли планировщика/
+  исполнителя); `runStateMachine` ПЕРЕД switch ловит его `parseQuestion` → ставит
+  `pendingQuestion`+`status=.awaitingInput` и ВЫХОДИТ БЕЗ перехода; `answerClarification`
+  кладёт «Вопрос/Ответ» в `guidance`, снимает `pendingQuestion`, продолжает ТУ ЖЕ
+  стадию. UI — `clarificationBar` (вопрос + кнопки-варианты). **Смена стадии**:
+  `requestStateChange(to:)` — переход ТОЛЬКО если `TaskFSM.allows`, иначе рантайм-баннер
+  `Chat.stateChangeError` со списком доступных (БЕЗ токенов). `from==target` — перезапуск
+  стадии (НЕ `transitioned`, иначе precondition-краш). Сбросы полей по цели. UI — меню
+  «→ этап» в `pipelineControls` (легальные активны, нелегальные серые) + `stateChangeErrorBar`.
+  Новый статус `.awaitingInput`; `normalizeTaskRuns` его НЕ трогает (не `.running`).
+- **Рой агентов (параллельные подагенты, как в Claude Code)** — `GenerationSettings.
+  swarmEnabled` (ПО УМОЛЧАНИЮ ВКЛ) + `maxParallelAgents`(2…6). На `.planning` при swarm
+  планировщик доп. выдаёт раздел `ЗАВИСИМОСТИ:` («3: 1,2»); `PipelinePrompts.parseDeps`→
+  `TaskContext.stepDeps`, `computeWaves` (алгоритм Кана) → `TaskContext.waves` ([[Int]],
+  группы шагов, выполнимых параллельно; цикл/мусор → последовательный фолбэк). На
+  `.execution` оркестратор гонит `runWave(chatID:gen:)` ВОЛНА ЗА ВОЛНОЙ: подагенты шага
+  через `client.runPhase` с УЗКИМ контекстом (`subAgentPrompt`: обзор плана + ТОЛЬКО
+  выводы зависимостей из `stepResults`, НЕ весь `[DONE]` → экономия токенов) параллельно
+  через `withThrowingTaskGroup`, чанки по `maxParallelAgents` (захват ТОЛЬКО value-типов:
+  `client` — struct без полей, Sendable; НЕ `self`/`chats`/`ctx`). Коммит волны —
+  АТОМАРНО после успеха ВСЕХ подагентов: `stepResults[idx]`, `done.append` по порядку,
+  `addMessage(.execution,step:idx)`, `step=done.count`, `waveIndex++`, на последней волне
+  → `validation`; `persistNow` после волны. Пауза/отмена в волне → `pauseAt` БЕЗ коммита →
+  resume повторяет ВСЮ волну (идемпотентно). Инварианты — код-проверка по объединённому
+  выводу волны (конфликт→обрыв; нарушение→retry всей волны в общем бюджете
+  `invariantRetries`); LLM-проверку по подагентам не гоняем (дорого). `REPLAN` от подагента
+  → шаг назад в планирование. Swarm ВЫКЛ → старый последовательный путь байт-в-байт
+  (полный `[DONE]`, один `runPhase`/шаг). UI — бейдж «рой ×N» в `pipelineBar`, секция в
+  `ChatSettingsView`. В сравнении роя НЕТ.
 - **Инварианты (ограничения)** — валидируемые правила, которым ОБЯЗАН соответствовать
   ответ модели (Invariant.swift): стек/запрет(noBanned)/maxDeps/архитектура/бюджет/
   техрешения/бизнес-правила. ХРАНЯТСЯ ОТДЕЛЬНО ОТ ДИАЛОГА — `InvariantStore`→
@@ -195,10 +234,17 @@ swift build          # сборка
 swift run            # запуск в dev-режиме (окно активируется AppDelegate'ом)
 bash run.sh          # упаковка в ManagerAssistant.app (+иконка из Resources)
 bash install.sh      # run.sh + установка в /Applications (так пользуется юзер)
+
+# Тесты (юнит-тесты чистой логики FSM/роя/парсеров, таргет ManagerAssistantTests):
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer  # XCTest есть ТОЛЬКО в Xcode
+swift test           # 43+ теста; CommandLineTools НЕ годится (нет модуля XCTest)
 ```
 
 - Полный Xcode установлен, но его лицензия может быть не принята — поэтому
-  `DEVELOPER_DIR` указывает на Command Line Tools.
+  `DEVELOPER_DIR` для сборки указывает на Command Line Tools. ВАЖНО: `swift test`
+  требует полный Xcode-тулчейн (XCTest нет в Command Line Tools) — для тестов ставь
+  `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`. `swift build`/`run` под
+  Command Line Tools тест-таргет игнорируют (компилируются только при `swift test`).
 - Иконка генерируется скриптами в `icon/` → `Sources/ManagerAssistant/Resources/AppIcon.icns`
   (ресурс пакета: в рантайме ставится через `NSApp.applicationIconImage`).
 - Зависимость MarkdownUI ещё в Package.swift, но в рендере НЕ используется:
@@ -207,11 +253,16 @@ bash install.sh      # run.sh + установка в /Applications (так по
 ## Проверка изменений (workflow)
 
 1. `swift build` — без ошибок и предупреждений.
-2. `bash install.sh && open -a /Applications/ManagerAssistant.app` — поднять реальное приложение.
-3. UI-проверки делались через computer-use (скриншоты): отправить сообщение,
+2. `swift test` (под Xcode-тулчейном, см. «Сборка и запуск») — все тесты зелёные.
+   Покрывают ЧИСТУЮ логику: таблицу переходов TaskFSM, планировщик волн роя
+   (parseDeps/computeWaves), парсеры PipelinePrompts (план/вердикт/ASK_USER/смена
+   стадии/маркеры), миграцию Codable (новые поля + старый JSON без них). При правке
+   FSM/роя/парсеров — гонять тесты.
+3. `bash install.sh && open -a /Applications/ManagerAssistant.app` — поднять реальное приложение.
+4. UI-проверки делались через computer-use (скриншоты): отправить сообщение,
    проверить фичу глазами. У пользователя поверх поля ввода бывает невидимый
    оверлей Wispr Flow — кликать по левому краю поля.
-4. Перед коммитом: скан на ключи (см. выше).
+5. Перед коммитом: скан на ключи (см. выше).
 
 ## Git
 
