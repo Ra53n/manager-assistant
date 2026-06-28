@@ -31,6 +31,9 @@ export const createRoutineBody = {
     model: { type: "string" },
     maxIterations: { type: "number" },
     maxTokensBudget: { type: "number" },
+    mode: { type: "string" }, // снисходительно: неизвестное значение нормализует сервис
+    swarm: { type: "boolean" },
+    maxParallelAgents: { type: "number" },
     sinks: { type: "array", items: sinkSchema },
   },
 } as const;
@@ -50,6 +53,9 @@ export const updateRoutineBody = {
     model: { type: "string" },
     maxIterations: { type: "number" },
     maxTokensBudget: { type: "number" },
+    mode: { type: "string" }, // снисходительно: неизвестное значение нормализует сервис
+    swarm: { type: "boolean" },
+    maxParallelAgents: { type: "number" },
     sinks: { type: "array", items: sinkSchema },
   },
 } as const;

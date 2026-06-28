@@ -2,8 +2,14 @@
 // обновление проходит только если переданный rev совпадает с текущим в БД.
 
 import type { DB } from "./db.js";
-import type { Routine, SinkConfig } from "../domain/types.js";
+import type { Routine, RoutineMode, SinkConfig } from "../domain/types.js";
+import { ROUTINE_MODES } from "../domain/types.js";
 import { ConflictError, NotFoundError } from "../domain/errors.js";
+
+/** Снисходительный декод режима: неизвестное значение → "simple". */
+function parseMode(v: string): RoutineMode {
+  return (ROUTINE_MODES as readonly string[]).includes(v) ? (v as RoutineMode) : "simple";
+}
 
 interface RoutineRow {
   id: string;
@@ -16,6 +22,9 @@ interface RoutineRow {
   model: string;
   max_iterations: number;
   max_tokens_budget: number;
+  mode: string;
+  swarm: number;
+  max_parallel_agents: number;
   sinks_json: string;
   last_run_at: string | null;
   next_run_at: string | null;
@@ -45,6 +54,9 @@ function rowToRoutine(row: RoutineRow, cronHuman: string): Routine {
     model: row.model,
     maxIterations: row.max_iterations,
     maxTokensBudget: row.max_tokens_budget,
+    mode: parseMode(row.mode),
+    swarm: row.swarm === 1,
+    maxParallelAgents: row.max_parallel_agents,
     sinks: parseSinks(row.sinks_json),
     lastRunAt: row.last_run_at,
     nextRunAt: row.next_run_at,
@@ -72,11 +84,13 @@ export class RoutinesRepo {
       .prepare(
         `INSERT INTO routines
          (id, name, prompt, cron, timezone, enabled, catch_up_on_start, model,
-          max_iterations, max_tokens_budget, sinks_json, last_run_at, next_run_at,
+          max_iterations, max_tokens_budget, mode, swarm, max_parallel_agents,
+          sinks_json, last_run_at, next_run_at,
           created_at, updated_at, rev)
          VALUES
          (@id, @name, @prompt, @cron, @timezone, @enabled, @catch_up_on_start, @model,
-          @max_iterations, @max_tokens_budget, @sinks_json, @last_run_at, @next_run_at,
+          @max_iterations, @max_tokens_budget, @mode, @swarm, @max_parallel_agents,
+          @sinks_json, @last_run_at, @next_run_at,
           @created_at, @updated_at, @rev)`,
       )
       .run({
@@ -90,6 +104,9 @@ export class RoutinesRepo {
         model: r.model,
         max_iterations: r.maxIterations,
         max_tokens_budget: r.maxTokensBudget,
+        mode: r.mode,
+        swarm: r.swarm ? 1 : 0,
+        max_parallel_agents: r.maxParallelAgents,
         sinks_json: JSON.stringify(r.sinks),
         last_run_at: r.lastRunAt,
         next_run_at: r.nextRunAt,
@@ -131,6 +148,7 @@ export class RoutinesRepo {
            name=@name, prompt=@prompt, cron=@cron, timezone=@timezone,
            enabled=@enabled, catch_up_on_start=@catch_up_on_start, model=@model,
            max_iterations=@max_iterations, max_tokens_budget=@max_tokens_budget,
+           mode=@mode, swarm=@swarm, max_parallel_agents=@max_parallel_agents,
            sinks_json=@sinks_json, last_run_at=@last_run_at, next_run_at=@next_run_at,
            updated_at=@updated_at, rev=@rev
          WHERE id=@id AND rev=@expected_rev`,
@@ -146,6 +164,9 @@ export class RoutinesRepo {
         model: r.model,
         max_iterations: r.maxIterations,
         max_tokens_budget: r.maxTokensBudget,
+        mode: r.mode,
+        swarm: r.swarm ? 1 : 0,
+        max_parallel_agents: r.maxParallelAgents,
         sinks_json: JSON.stringify(r.sinks),
         last_run_at: r.lastRunAt,
         next_run_at: r.nextRunAt,

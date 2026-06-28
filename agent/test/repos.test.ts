@@ -23,6 +23,21 @@ describe("RoutinesRepo", () => {
     expect(repos.routinesRepo.list()).toHaveLength(1);
   });
 
+  it("round-trip полей режима: mode/swarm/maxParallelAgents", () => {
+    repos.routinesRepo.insert(
+      buildRoutine({ id: "p", mode: "pipeline", swarm: false, maxParallelAgents: 5 }),
+    );
+    const got = repos.routinesRepo.get("p");
+    expect(got?.mode).toBe("pipeline");
+    expect(got?.swarm).toBe(false);
+    expect(got?.maxParallelAgents).toBe(5);
+  });
+
+  it("round-trip mode=action", () => {
+    repos.routinesRepo.insert(buildRoutine({ id: "act", mode: "action" }));
+    expect(repos.routinesRepo.get("act")?.mode).toBe("action");
+  });
+
   it("getOrThrow бросает NotFound", () => {
     expect(() => repos.routinesRepo.getOrThrow("нет")).toThrow(NotFoundError);
   });

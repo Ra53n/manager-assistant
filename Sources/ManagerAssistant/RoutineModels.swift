@@ -89,6 +89,9 @@ struct Routine: Codable, Identifiable, Equatable {
     var model: String = ""
     var maxIterations: Int = 6
     var maxTokensBudget: Int = 20000
+    var mode: String = "simple"          // "simple" | "pipeline"
+    var swarm: Bool = true               // pipeline: рой подагентов волнами
+    var maxParallelAgents: Int = 3       // pipeline+swarm: параллельность (2…6)
     var sinks: [RoutineSinkConfig] = [RoutineSinkConfig()]
     var lastRunAt: String? = nil
     var nextRunAt: String? = nil
@@ -99,7 +102,8 @@ struct Routine: Codable, Identifiable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, prompt, cron, timezone, enabled, catchUpOnStart, model
-        case maxIterations, maxTokensBudget, sinks, lastRunAt, nextRunAt, cronHuman
+        case maxIterations, maxTokensBudget, mode, swarm, maxParallelAgents
+        case sinks, lastRunAt, nextRunAt, cronHuman
         case createdAt, updatedAt, rev
     }
 
@@ -117,6 +121,9 @@ struct Routine: Codable, Identifiable, Equatable {
         model = try c.decodeIfPresent(String.self, forKey: .model) ?? ""
         maxIterations = try c.decodeIfPresent(Int.self, forKey: .maxIterations) ?? 6
         maxTokensBudget = try c.decodeIfPresent(Int.self, forKey: .maxTokensBudget) ?? 20000
+        mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? "simple"
+        swarm = try c.decodeIfPresent(Bool.self, forKey: .swarm) ?? true
+        maxParallelAgents = try c.decodeIfPresent(Int.self, forKey: .maxParallelAgents) ?? 3
         sinks = try c.decodeIfPresent([RoutineSinkConfig].self, forKey: .sinks) ?? [RoutineSinkConfig()]
         lastRunAt = try c.decodeIfPresent(String.self, forKey: .lastRunAt)
         nextRunAt = try c.decodeIfPresent(String.self, forKey: .nextRunAt)
@@ -344,6 +351,9 @@ struct CreateRoutineRequest: Encodable {
     var model: String? = nil
     var maxIterations: Int? = nil
     var maxTokensBudget: Int? = nil
+    var mode: String? = nil
+    var swarm: Bool? = nil
+    var maxParallelAgents: Int? = nil
 }
 
 struct UpdateRoutineRequest: Encodable {
@@ -357,6 +367,9 @@ struct UpdateRoutineRequest: Encodable {
     var model: String? = nil
     var maxIterations: Int? = nil
     var maxTokensBudget: Int? = nil
+    var mode: String? = nil
+    var swarm: Bool? = nil
+    var maxParallelAgents: Int? = nil
 }
 
 struct EnableRequest: Encodable {

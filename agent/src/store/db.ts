@@ -79,6 +79,15 @@ const MIGRATIONS: string[] = [
     updated_at TEXT NOT NULL DEFAULT ''
   );
   `,
+
+  // ── v3: режим исполнения рутины (simple | pipeline) + параметры роя ──────────
+  // Дефолт mode='simple' для СУЩЕСТВУЮЩИХ рутин — чтобы их поведение не изменилось.
+  // Новые рутины из приложения присылают свой mode (по умолчанию pipeline).
+  `
+  ALTER TABLE routines ADD COLUMN mode TEXT NOT NULL DEFAULT 'simple';
+  ALTER TABLE routines ADD COLUMN swarm INTEGER NOT NULL DEFAULT 1;
+  ALTER TABLE routines ADD COLUMN max_parallel_agents INTEGER NOT NULL DEFAULT 3;
+  `,
 ];
 
 /** Применяет недостающие миграции (idempotent). */

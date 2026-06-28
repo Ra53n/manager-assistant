@@ -62,6 +62,9 @@ struct RoutineEditorView: View {
     @State private var catchUpOnStart: Bool
     @State private var model: String
     @State private var maxIterations: Int
+    @State private var mode: String
+    @State private var swarm: Bool
+    @State private var maxParallelAgents: Int
 
     init(vm: RoutinesViewModel, routine: Routine?) {
         self.vm = vm
@@ -75,6 +78,11 @@ struct RoutineEditorView: View {
         _catchUpOnStart = State(initialValue: r?.catchUpOnStart ?? false)
         _model = State(initialValue: r?.model ?? "")
         _maxIterations = State(initialValue: r?.maxIterations ?? 6)
+        // Новая рутина по умолчанию — pipeline (план→рой→проверка→ответ); существующую
+        // читаем как есть (legacy/дайджест → simple).
+        _mode = State(initialValue: r?.mode ?? "pipeline")
+        _swarm = State(initialValue: r?.swarm ?? true)
+        _maxParallelAgents = State(initialValue: r?.maxParallelAgents ?? 3)
     }
 
     private let presets: [(String, String)] = [
@@ -144,11 +152,42 @@ struct RoutineEditorView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
 
+                    FormCard("Режим исполнения") {
+                        Picker("Режим", selection: $mode) {
+                            Text("Действие (процедура за один проход)").tag("action")
+                            Text("Пайплайн (план → рой → проверка → ответ)").tag("pipeline")
+                            Text("Простой (дайджест)").tag("simple")
+                        }
+                        .pickerStyle(.radioGroup)
+                        if mode == "pipeline" {
+                            Text("Цель декомпозируется на план, шаги выполняются агентами, затем результат проверяется и собирается в итог. Подходит для исследований/целей, выигрывающих от декомпозиции и распараллеливания.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Toggle("Рой агентов (параллельные шаги волнами)", isOn: $swarm)
+                            if swarm {
+                                Stepper("Параллельных агентов: \(maxParallelAgents)", value: $maxParallelAgents, in: 2...6)
+                            }
+                        } else if mode == "action" {
+                            Text("Один проход агента с инструментами, который доводит ПРОЦЕДУРУ до конца (не обрывается рано и не повторяет шаги). Подходит, когда промпт рутины — это весь цикл работы (например, разбор колонки YouGile).")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Text("Один агентный проход «собери данные и оформи итог» — быстро и дёшево, для дайджестов. Для процедур-действий используй «Действие».")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+
                     FormCard("Дополнительно") {
                         LabeledField(label: "Модель (пусто = из настроек агента)") {
                             borderedField($model, prompt: "deepseek-chat")
                         }
-                        Stepper("Макс. итераций инструментов: \(maxIterations)", value: $maxIterations, in: 1...20)
+                        if mode == "action" {
+                            Text("Лимит итераций инструментов — автоматический (до завершения процедуры).")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Stepper(mode == "pipeline"
+                                    ? "Макс. итераций инструментов на шаг: \(maxIterations)"
+                                    : "Макс. итераций инструментов: \(maxIterations)",
+                                    value: $maxIterations, in: 1...20)
+                        }
                         Toggle("Догонять пропущенный слот при старте", isOn: $catchUpOnStart)
                     }
                 }
@@ -175,11 +214,13 @@ struct RoutineEditorView: View {
                 ok = await vm.update(id: r.id, UpdateRoutineRequest(
                     rev: r.rev, name: name, prompt: prompt, cron: cron, timezone: timezone,
                     enabled: enabled, catchUpOnStart: catchUpOnStart, model: model,
-                    maxIterations: maxIterations))
+                    maxIterations: maxIterations, mode: mode, swarm: swarm,
+                    maxParallelAgents: maxParallelAgents))
             } else {
                 ok = await vm.create(CreateRoutineRequest(
                     name: name, prompt: prompt, cron: cron, timezone: timezone, enabled: enabled,
-                    catchUpOnStart: catchUpOnStart, model: model, maxIterations: maxIterations))
+                    catchUpOnStart: catchUpOnStart, model: model, maxIterations: maxIterations,
+                    mode: mode, swarm: swarm, maxParallelAgents: maxParallelAgents))
             }
             if ok { dismiss() }
         }

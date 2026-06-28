@@ -236,9 +236,29 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     из приложения (`PUT /agent/settings`), хранятся в БД; секрет (`llmApiKey`) на чтение МАСКИРУЕТСЯ
     (`hasLlmKey`/`llmKeyHint`, паттерн write-only; пустой секрет в PUT не затирает). MCP-секреты (токены в
     args/env) — в `mcp_servers`, наружу (`GET /agent/mcp-servers`) НЕ отдаются (только статус/число инструментов).
+  • **Режим рутины `mode`: simple | action | pipeline** (поле рутины; дефолт новых из приложения —
+    `pipeline`, миграция старых рутин в БД ставит `simple` → поведение не меняется; для "action"
+    отдельной миграции НЕ нужно — колонка `mode` хранит произвольную строку, снисходительный декод).
+    **simple** — один агентный tool-loop с «дайджестовым» `RUNNER_SYSTEM_PROMPT` (рано выводит итог;
+    для рутин «собери данные и оформи»). **action** — ОДИН tool-loop, но с `ACTION_SYSTEM_PROMPT`
+    «доводи процедуру до конца» (`maxTokensBudget=undefined`, `ACTION_MAX_ITERATIONS=50`, таймаут как у
+    pipeline): для самодостаточных ПРОЦЕДУР, чей промпт = весь цикл работы (разбор колонки YouGile) —
+    НЕ декомпозирует и НЕ дублирует шаги, в отличие от pipeline (e2e: 1 план + 1 отчёт в журнале по
+    порядку; pipeline двоил/переставлял). **pipeline** — generic порт FSM-движка
+    приложения в `runner/pipeline/`: planning → execution (рой подагентов волнами при `swarm`, иначе
+    последовательно) → validation (вердикт; назад в execution до `MAX_EXECUTION_RETRIES=2`) → answer
+    (финальный текст = дайджест). НЕ привязан к YouGile: задача = `routine.prompt`, инструменты — любые
+    из McpHost. `pipeline/parsers.ts` — ЧИСТЫЙ порт `parsePlanSteps/parseDeps/computeWaves(Кан)/
+    parseVerdict/stripMarkers` (1:1 с `Models.swift`, свои тесты); `pipeline/prompts.ts` — ролевые
+    промпты этапов + `subAgentPrompt` (узкий контекст: план + ТОЛЬКО выводы зависимостей);
+    `pipeline/orchestrator.ts` — `runPipeline` поверх `runToolLoop` (под-вызов на этап/подагента;
+    `Promise.all` чанками по `maxParallelAgents`; `usage`/transcript суммируются; потолок переходов 60).
+    Headless-исключения (не портированы): инварианты, пауза-на-плане, роутер реплик, блокирующий
+    `ASK_USER`, крэш-resume промежуточного состояния. Бюджет pipeline — таймаут `pipelineTimeoutMs`
+    (деф. 600с), per-step — `maxIterations`; токен-budget внутри фазы не форсит стоп.
   • **Серверная логика** (`agent/src/`): `runner/llm.ts` — порт `DeepSeekClient.runToolLoop`;
     `runner/mcpHost.ts` — generic мульти-MCP хост; `runner/runner.ts` — прогон (инструменты из хоста→
-    tool-loop→persist, статусы running/ok/error/timeout/skipped_overlap/missed, таймаут, лимиты);
+    tool-loop ИЛИ pipeline по `routine.mode`→persist, статусы running/ok/error/timeout/skipped_overlap/missed, таймаут, лимиты);
     `scheduler/scheduler.ts` — croner (таймзоны), overlap-guard, catch-up (опц.), примирение зависших
     running→error; `http/` — Fastify, bearer-auth, единый формат ошибок, идемпотентность trigger,
     cursor-пагинация; эндпоинты `…/settings`, `…/mcp-servers`, `…/routines*`, `…/runs*`, `…/chat/ask`.

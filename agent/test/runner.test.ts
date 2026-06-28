@@ -72,6 +72,43 @@ describe("Runner.run", () => {
     expect(run.toolTranscript).toEqual([{ name: "yougile__list_tasks", ok: true }]);
   });
 
+  it("action-режим: НЕ обрывается после первого батча — гонит все tool-раунды до текста", async () => {
+    const routine = buildRoutine({ mode: "action" });
+    repos.routinesRepo.insert(routine);
+    const host = stubHost({ tools: [qtool("srv__do")], onCall: () => "ok" });
+    // 3 последовательных вызова инструмента, затем финальный текст
+    const llm = stubLlm([
+      toolCallCompletion("srv__do", { step: 1 }),
+      toolCallCompletion("srv__do", { step: 2 }),
+      toolCallCompletion("srv__do", { step: 3 }),
+      textCompletion("Процедура выполнена"),
+    ]);
+    const runner = makeRunner({ llmClientFactory: () => llm, mcpHost: host });
+
+    const run = await runner.run(routine, "manual", null);
+    expect(run.status).toBe("ok");
+    expect(run.outputMarkdown).toBe("Процедура выполнена");
+    expect(host.calls.length).toBe(3); // все три действия выполнены за ОДИН прогон
+    expect(llm.calls).toBe(4);
+  });
+
+  it("action-режим использует системный промпт «доводи процедуру до конца», не дайджестовый", async () => {
+    const routine = buildRoutine({ mode: "action" });
+    repos.routinesRepo.insert(routine);
+    let sys = "";
+    const capturing = {
+      calls: 0,
+      async chat(req: { messages: Array<{ role: string; content: string | null }> }) {
+        this.calls++;
+        sys = String(req.messages.find((m) => m.role === "system")?.content ?? "");
+        return { message: { content: "итог" }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      },
+    };
+    await makeRunner({ llmClientFactory: () => capturing as never }).run(routine, "manual", null);
+    expect(sys).toContain("ПРОЦЕДУРУ");
+    expect(sys).not.toContain("СРАЗУ выводи итог");
+  });
+
   it("без LLM-ключа — статус error, без сети", async () => {
     db.prepare("UPDATE settings SET llm_api_key='' WHERE id=1").run();
     const routine = buildRoutine();

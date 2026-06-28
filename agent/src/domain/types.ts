@@ -17,6 +17,19 @@ export type SinkKind = (typeof SINK_KINDS)[number];
 export const RUN_TRIGGERS = ["schedule", "manual", "catchup"] as const;
 export type RunTrigger = (typeof RUN_TRIGGERS)[number];
 
+// Режим исполнения рутины:
+//  • simple   — один агентный tool-loop с «дайджестовым» промптом (быстро; для рутин
+//    «собери данные и оформи»; рано выводит итог);
+//  • action   — один tool-loop с промптом «доводи процедуру до конца» (без FSM): для
+//    самодостаточных ПРОЦЕДУР, чей промпт = весь цикл работы (напр. разбор колонки YouGile).
+//    Не декомпозирует и не дублирует шаги, в отличие от pipeline;
+//  • pipeline — конечный автомат plan → рой подагентов → проверка → ответ (для ЦЕЛЕЙ,
+//    которые выигрывают от декомпозиции/распараллеливания).
+// Декодируется снисходительно (unknown → "simple"), как и прочие enum'ы. Новой миграции
+// БД для "action" НЕ нужно — колонка `mode` хранит произвольную строку.
+export const ROUTINE_MODES = ["simple", "action", "pipeline"] as const;
+export type RoutineMode = (typeof ROUTINE_MODES)[number];
+
 export const RUN_STATUSES = [
   "running",
   "ok",
@@ -69,6 +82,9 @@ export interface Routine {
   model: string; // "" → берётся defaultModel из настроек агента
   maxIterations: number;
   maxTokensBudget: number;
+  mode: RoutineMode; // simple (один tool-loop) | pipeline (plan→рой→проверка→ответ)
+  swarm: boolean; // pipeline: гнать шаги волнами параллельных подагентов
+  maxParallelAgents: number; // pipeline+swarm: размер чанка параллельности (2…6)
   sinks: SinkConfig[];
   lastRunAt: string | null; // ISO-8601 UTC
   nextRunAt: string | null; // ISO-8601 UTC (вычисляется планировщиком)
@@ -89,6 +105,9 @@ export interface CreateRoutineInput {
   model?: string;
   maxIterations?: number;
   maxTokensBudget?: number;
+  mode?: RoutineMode;
+  swarm?: boolean;
+  maxParallelAgents?: number;
   sinks?: SinkConfig[];
 }
 
@@ -170,6 +189,15 @@ export interface UpdateAgentSettingsInput {
 export const DEFAULT_MAX_ITERATIONS = 8;
 export const DEFAULT_MAX_TOKENS_BUDGET = 60000;
 export const MAX_OUTPUT_BYTES = 256 * 1024; // кап размера дайджеста в БД
+
+// Дефолты режима исполнения. ВАЖНО: дефолт режима для НОВЫХ рутин (из приложения) —
+// "pipeline"; здесь — серверный fallback для случаев без явного значения. Колонка БД
+// при миграции старых рутин ставит 'simple' (см. db.ts), чтобы не менять их поведение.
+export const DEFAULT_MODE: RoutineMode = "simple";
+export const DEFAULT_SWARM = true;
+export const DEFAULT_MAX_PARALLEL_AGENTS = 3;
+export const MIN_PARALLEL_AGENTS = 2;
+export const MAX_PARALLEL_AGENTS = 6;
 
 export function defaultSinks(): SinkConfig[] {
   return [{ kind: "vps_local" }];

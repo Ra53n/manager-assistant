@@ -6,9 +6,16 @@ import type { RoutinesRepo } from "../store/routinesRepo.js";
 import type { SchedulerService } from "../scheduler/scheduler.js";
 import {
   DEFAULT_MAX_ITERATIONS,
+  DEFAULT_MAX_PARALLEL_AGENTS,
   DEFAULT_MAX_TOKENS_BUDGET,
+  DEFAULT_MODE,
+  DEFAULT_SWARM,
+  MAX_PARALLEL_AGENTS,
+  MIN_PARALLEL_AGENTS,
+  ROUTINE_MODES,
   type CreateRoutineInput,
   type Routine,
+  type RoutineMode,
   type SinkConfig,
   type UpdateRoutineInput,
 } from "../domain/types.js";
@@ -18,6 +25,11 @@ import { ValidationError } from "../domain/errors.js";
 function clamp(v: number, min: number, max: number): number {
   if (!Number.isFinite(v)) return min;
   return Math.max(min, Math.min(max, Math.trunc(v)));
+}
+
+/** Снисходительный разбор режима: неизвестное → дефолт. */
+function normalizeMode(v: RoutineMode | undefined, fallback: RoutineMode): RoutineMode {
+  return v !== undefined && (ROUTINE_MODES as readonly string[]).includes(v) ? v : fallback;
 }
 
 /**
@@ -81,6 +93,13 @@ export class RoutineService {
       model: (input.model ?? "").trim(),
       maxIterations: clamp(input.maxIterations ?? DEFAULT_MAX_ITERATIONS, 1, 20),
       maxTokensBudget: clamp(input.maxTokensBudget ?? DEFAULT_MAX_TOKENS_BUDGET, 1000, 1_000_000),
+      mode: normalizeMode(input.mode, DEFAULT_MODE),
+      swarm: input.swarm ?? DEFAULT_SWARM,
+      maxParallelAgents: clamp(
+        input.maxParallelAgents ?? DEFAULT_MAX_PARALLEL_AGENTS,
+        MIN_PARALLEL_AGENTS,
+        MAX_PARALLEL_AGENTS,
+      ),
       sinks,
       lastRunAt: null,
       nextRunAt: nextRunISO(cron, timezone, nowDate),
@@ -133,6 +152,12 @@ export class RoutineService {
         input.maxTokensBudget !== undefined
           ? clamp(input.maxTokensBudget, 1000, 1_000_000)
           : existing.maxTokensBudget,
+      mode: input.mode !== undefined ? normalizeMode(input.mode, existing.mode) : existing.mode,
+      swarm: input.swarm ?? existing.swarm,
+      maxParallelAgents:
+        input.maxParallelAgents !== undefined
+          ? clamp(input.maxParallelAgents, MIN_PARALLEL_AGENTS, MAX_PARALLEL_AGENTS)
+          : existing.maxParallelAgents,
       sinks,
       nextRunAt: nextRunISO(cron, timezone, nowDate),
       cronHuman: describeCron(cron),

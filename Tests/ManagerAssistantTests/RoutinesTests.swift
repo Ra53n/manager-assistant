@@ -34,6 +34,23 @@ final class RoutinesTests: XCTestCase {
         XCTAssertTrue(r.enabled)
         XCTAssertEqual(r.maxIterations, 6)
         XCTAssertEqual(r.rev, 1)
+        // Новые поля режима: дефолты при отсутствии в JSON (legacy не падает).
+        XCTAssertEqual(r.mode, "simple")
+        XCTAssertTrue(r.swarm)
+        XCTAssertEqual(r.maxParallelAgents, 3)
+    }
+
+    func testRoutineDecodesPipelineFields() throws {
+        let json = #"{"id":"p","name":"n","mode":"pipeline","swarm":false,"maxParallelAgents":5}"#
+        let r = try dec.decode(Routine.self, from: Data(json.utf8))
+        XCTAssertEqual(r.mode, "pipeline")
+        XCTAssertFalse(r.swarm)
+        XCTAssertEqual(r.maxParallelAgents, 5)
+    }
+
+    func testRoutineDecodesActionMode() throws {
+        let r = try dec.decode(Routine.self, from: Data(#"{"id":"a","name":"n","mode":"action"}"#.utf8))
+        XCTAssertEqual(r.mode, "action")
     }
 
     func testOldYouGileSinkDecodesLeniently() throws {
@@ -83,10 +100,14 @@ final class RoutinesTests: XCTestCase {
         var r = Routine()
         r.id = "r9"; r.name = "Имя"; r.prompt = "p"; r.cron = "0 9 * * *"; r.rev = 2
         r.sinks = [RoutineSinkConfig(kind: .vpsLocal)]
+        r.mode = "pipeline"; r.swarm = false; r.maxParallelAgents = 5
         let back = try dec.decode(Routine.self, from: enc.encode(r))
         XCTAssertEqual(back.id, "r9")
         XCTAssertEqual(back.rev, 2)
         XCTAssertEqual(back.sinks.first?.kind, .vpsLocal)
+        XCTAssertEqual(back.mode, "pipeline")
+        XCTAssertFalse(back.swarm)
+        XCTAssertEqual(back.maxParallelAgents, 5)
     }
 
     // MARK: - MCP-серверы (синхронизация из приложения)
@@ -128,6 +149,17 @@ final class RoutinesTests: XCTestCase {
         XCTAssertTrue(s.contains("\"cron\""))
         XCTAssertFalse(s.contains("\"timezone\""))
         XCTAssertFalse(s.contains("\"sinks\""))
+        XCTAssertFalse(s.contains("\"mode\""))
+    }
+
+    func testCreateRequestIncludesModeFields() throws {
+        let req = CreateRoutineRequest(name: "N", prompt: "P", cron: "0 9 * * *",
+                                       mode: "pipeline", swarm: false, maxParallelAgents: 4)
+        let s = String(data: try enc.encode(req), encoding: .utf8)!
+        XCTAssertTrue(s.contains("\"mode\""))
+        XCTAssertTrue(s.contains("pipeline"))
+        XCTAssertTrue(s.contains("\"swarm\""))
+        XCTAssertTrue(s.contains("\"maxParallelAgents\""))
     }
 
     func testUpdateAgentSettingsOmitsNilSecret() throws {
