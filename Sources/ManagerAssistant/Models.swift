@@ -20,6 +20,8 @@ enum ChatRole: String, Codable {
     case system
     case user
     case assistant
+    /// Результат вызова инструмента (tool-calling): сообщение с role=tool.
+    case tool
 }
 
 /// Метрики ответа модели (для сравнения скорости и стоимости).
@@ -177,6 +179,13 @@ struct GenerationSettings: Equatable, Codable {
     /// Максимум одновременно работающих подагентов в одной волне.
     var maxParallelAgents: Int = 3
 
+    /// MCP-инструменты: дать агентам доступ к инструментам подключённых MCP-серверов
+    /// (см. MCPClient.swift) — и в конвейере FSM, и в обычном чате. По умолчанию ВКЛ.
+    /// Реальные вызовы происходят только если есть хотя бы один enabled-сервер.
+    var mcpEnabled: Bool = true
+    /// Какие MCP-серверы активны в этом чате. Пусто = все enabled-серверы (удобный дефолт).
+    var enabledMCPServerIDs: Set<UUID> = []
+
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -196,6 +205,7 @@ struct GenerationSettings: Equatable, Codable {
         case pipelineMode
         case invariantValidation
         case swarmEnabled, maxParallelAgents
+        case mcpEnabled, enabledMCPServerIDs
     }
 }
 
@@ -225,6 +235,8 @@ extension GenerationSettings {
         invariantValidation = try c.decodeIfPresent(InvariantValidationMode.self, forKey: .invariantValidation) ?? d.invariantValidation
         swarmEnabled = try c.decodeIfPresent(Bool.self, forKey: .swarmEnabled) ?? d.swarmEnabled
         maxParallelAgents = try c.decodeIfPresent(Int.self, forKey: .maxParallelAgents) ?? d.maxParallelAgents
+        mcpEnabled = try c.decodeIfPresent(Bool.self, forKey: .mcpEnabled) ?? d.mcpEnabled
+        enabledMCPServerIDs = try c.decodeIfPresent(Set<UUID>.self, forKey: .enabledMCPServerIDs) ?? d.enabledMCPServerIDs
     }
 }
 
@@ -1190,10 +1202,53 @@ struct ChatRequest: Encodable {
     let max_tokens: Int
     /// nil — ключ не отправляется (синтезированный Encodable использует encodeIfPresent).
     let stop: [String]?
+    /// Инструменты (MCP) в формате OpenAI. nil → ключ не отправляется (обычные запросы не меняются).
+    var tools: [Tool]? = nil
+    /// "auto" | "none". nil → не отправляется.
+    var tool_choice: String? = nil
 
     struct RequestMessage: Encodable {
         let role: String
-        let content: String
+        /// Опционально: assistant-сообщение с tool_calls может не иметь content.
+        let content: String?
+        /// Вызовы инструментов (в assistant-сообщении).
+        var tool_calls: [ToolCallDTO]? = nil
+        /// id вызова, на который отвечает сообщение role=tool.
+        var tool_call_id: String? = nil
+        var name: String? = nil
+    }
+
+    /// Описание инструмента для модели (OpenAI function-calling).
+    struct Tool: Encodable, Sendable {
+        let type: String
+        let function: Function
+        struct Function: Encodable, Sendable {
+            let name: String
+            let description: String?
+            let parameters: JSONValue   // JSON Schema
+        }
+        init(spec: ToolSpec) {
+            type = "function"
+            // Параметры обязаны быть объектом-схемой; иначе подставляем пустой объект.
+            let schema: JSONValue = (spec.schema.objectValue != nil)
+                ? spec.schema
+                : .object(["type": .string("object"), "properties": .object([:])])
+            function = Function(name: spec.qualifiedName,
+                                description: spec.description.isEmpty ? nil : spec.description,
+                                parameters: schema)
+        }
+    }
+}
+
+/// Вызов инструмента (общий для запроса и ответа, OpenAI-формат).
+struct ToolCallDTO: Codable, Sendable {
+    let id: String
+    let type: String
+    let function: Function
+    struct Function: Codable, Sendable {
+        let name: String
+        /// JSON-строка аргументов (как отдаёт модель).
+        let arguments: String
     }
 }
 
@@ -1209,7 +1264,9 @@ struct ChatResponse: Decodable {
 
     struct ResponseMessage: Decodable {
         let role: String
-        let content: String
+        /// Может отсутствовать, когда ответ — только вызовы инструментов.
+        let content: String?
+        let tool_calls: [ToolCallDTO]?
     }
 
     struct Usage: Decodable {
@@ -1217,6 +1274,25 @@ struct ChatResponse: Decodable {
         let completion_tokens: Int
         let total_tokens: Int
     }
+}
+
+/// Результат tool-loop: финальный текст + накопленные токены + краткий транскрипт вызовов.
+struct ToolLoopResult {
+    let text: String
+    let promptTokens: Int
+    let completionTokens: Int
+    let totalTokens: Int
+    let transcript: [ToolCallRecord]
+    var sendResult: SendResult {
+        SendResult(text: text, promptTokens: promptTokens,
+                   completionTokens: completionTokens, totalTokens: totalTokens)
+    }
+}
+
+/// Одна запись транскрипта вызова инструмента (для показа в ленте).
+struct ToolCallRecord: Sendable, Equatable {
+    let name: String
+    let ok: Bool
 }
 
 /// Результат отправки: текст ответа + потраченные на запрос токены.

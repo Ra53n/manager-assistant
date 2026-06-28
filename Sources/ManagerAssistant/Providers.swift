@@ -137,3 +137,44 @@ enum KeyStore {
         }
     }
 }
+
+// MARK: - Подключение к VPS-агенту рутин (bootstrap)
+
+/// Адрес и токен доступа к сервису-агенту рутин. Это ЕДИНСТВЕННОЕ, что хранится
+/// локально (всё остальное — провайдер/ключ/YouGile — живёт на VPS и задаётся
+/// через «Настройки агента»). Лежит вне репозитория: env приоритетнее файла.
+///   ~/.config/manager-assistant/agent.url   (или env MANAGER_AGENT_URL)
+///   ~/.config/manager-assistant/agent.token (или env MANAGER_AGENT_TOKEN)
+extension KeyStore {
+    private static var agentURLFile: URL { directory.appendingPathComponent("agent.url") }
+    private static var agentTokenFile: URL { directory.appendingPathComponent("agent.token") }
+
+    private static func read(_ url: URL, env: String) -> String {
+        if let v = ProcessInfo.processInfo.environment[env],
+           !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return v.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if let s = try? String(contentsOf: url, encoding: .utf8) {
+            return s.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return ""
+    }
+
+    private static func write(_ value: String, to url: URL) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if trimmed.isEmpty {
+            try? FileManager.default.removeItem(at: url)
+        } else {
+            try? trimmed.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Корневой адрес VPS, напр. «https://vps.example» (без /agent).
+    static var agentURL: String { read(agentURLFile, env: "MANAGER_AGENT_URL") }
+    static var agentToken: String { read(agentTokenFile, env: "MANAGER_AGENT_TOKEN") }
+    static var agentConfigured: Bool { !agentURL.isEmpty && !agentToken.isEmpty }
+
+    static func setAgentURL(_ value: String) { write(value, to: agentURLFile) }
+    static func setAgentToken(_ value: String) { write(value, to: agentTokenFile) }
+}

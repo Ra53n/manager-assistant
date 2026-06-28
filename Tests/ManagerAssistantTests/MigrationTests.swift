@@ -80,6 +80,46 @@ final class MigrationTests: XCTestCase {
         XCTAssertEqual(s.model, "deepseek-chat")
         XCTAssertEqual(s.swarmEnabled, true)
         XCTAssertEqual(s.maxParallelAgents, 3)
+        // MCP по умолчанию ВКЛ (реальные вызовы — только при наличии enabled-сервера),
+        // набор серверов пуст (= все enabled). Старый файл не падает.
+        XCTAssertEqual(s.mcpEnabled, true)
+        XCTAssertEqual(s.enabledMCPServerIDs, [])
+    }
+
+    func testGenerationSettingsRoundTripMCP() throws {
+        var s = GenerationSettings()
+        s.mcpEnabled = true
+        let id = UUID()
+        s.enabledMCPServerIDs = [id]
+        let back = try dec.decode(GenerationSettings.self, from: enc.encode(s))
+        XCTAssertEqual(back.mcpEnabled, true)
+        XCTAssertEqual(back.enabledMCPServerIDs, [id])
+    }
+
+    // MARK: MCPServer (конфиг сервера)
+
+    func testMCPServerOldJSONDefaults() throws {
+        // Конфиг без новых ключей (extraPATH) — дефолт, decode не падает.
+        let json = #"{"id":"\#(UUID().uuidString)","name":"yougile","command":"npx","args":["-y","mcp-remote"]}"#
+        let s = try dec.decode(MCPServer.self, from: Data(json.utf8))
+        XCTAssertEqual(s.name, "yougile")
+        XCTAssertEqual(s.command, "npx")
+        XCTAssertEqual(s.args, ["-y", "mcp-remote"])
+        XCTAssertEqual(s.extraPATH, "")
+        XCTAssertEqual(s.enabled, true)
+    }
+
+    func testMCPServerRoundTrip() throws {
+        var s = MCPServer()
+        s.name = "yougile"; s.command = "npx"
+        s.args = ["-y", "mcp-remote", "https://x/mcp"]
+        s.env = ["YOUGILE_API_KEY": "secret"]
+        s.extraPATH = "/opt/homebrew/bin"
+        let back = try dec.decode(MCPServer.self, from: enc.encode(s))
+        XCTAssertEqual(back.name, s.name)
+        XCTAssertEqual(back.args, s.args)
+        XCTAssertEqual(back.env, s.env)
+        XCTAssertEqual(back.extraPATH, s.extraPATH)
     }
 
     // MARK: MsgNode wave-поля (миграция дерева сообщений)

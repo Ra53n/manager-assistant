@@ -1,0 +1,22 @@
+# Маршрут Caddy для агента рутин. deploy.sh добавляет его автоматически и
+# идемпотентно (с бэкапом Caddyfile и `caddy validate` перед reload).
+#
+# Если делаешь вручную: ВНУТРИ существующего блока сайта добавь handle для
+# /agent/* ПЕРЕД общим reverse_proxy. Существующий маршрут к YouGile MCP
+# (127.0.0.1:3000, в т.ч. /mcp) НЕ меняем.
+#
+# Итоговый /etc/caddy/Caddyfile должен выглядеть так:
+#
+# <your-vps-domain> {
+#     encode gzip
+#     handle /agent/* {
+#         reverse_proxy 127.0.0.1:3100   # агент рутин (новое)
+#     }
+#     handle {
+#         reverse_proxy 127.0.0.1:3000   # существующий YouGile MCP — НЕ менять
+#     }
+# }
+#
+# Публичные адреса после этого:
+#   https://<your-vps-domain>/mcp      → YouGile MCP   (как было)
+#   https://<your-vps-domain>/agent/*  → агент рутин   (новое)

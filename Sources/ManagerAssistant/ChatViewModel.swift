@@ -43,6 +43,11 @@ final class ChatViewModel: ObservableObject {
     /// Инварианты — ограничения (стек/арх/бюджет/запреты/…). Хранятся ОТДЕЛЬНО от
     /// диалога (invariants.json), со скоупами global/project/chat (см. Invariant.swift).
     @Published var invariants: [Invariant] = []
+    /// MCP-серверы (конфиг как в Claude) — источники инструментов для агентов
+    /// (mcp-servers.json, см. MCPClient.swift).
+    @Published var mcpServers: [MCPServer] = []
+    /// Последние статусы соединений с MCP-серверами (для UI: подключён / ошибка / число инструментов).
+    @Published var mcpStatuses: [UUID: MCPServerStatus] = [:]
 
     /// Объединённый список моделей всех провайдеров с ключами (из их /models).
     @Published var availableModels: [ModelOption] = [
@@ -81,6 +86,8 @@ final class ChatViewModel: ObservableObject {
     }
 
     private let client = DeepSeekClient()
+    /// Менеджер MCP-серверов (actor): живые соединения + маршрутизация вызовов инструментов.
+    let mcp = MCPManager()
     /// Хэндлы активных прогонов FSM (для паузы/отмены), ключ — chatID.
     private var pipelineTasks: [UUID: Task<Void, Never>] = [:]
     private var saveCancellable: AnyCancellable?
@@ -88,6 +95,7 @@ final class ChatViewModel: ObservableObject {
     private var projectsSaveCancellable: AnyCancellable?
     private var profilesSaveCancellable: AnyCancellable?
     private var invariantsSaveCancellable: AnyCancellable?
+    private var mcpSaveCancellable: AnyCancellable?
 
     static let defaultTitle = "Новый чат"
 
@@ -107,12 +115,24 @@ final class ChatViewModel: ObservableObject {
         // живых Task нет, прогон должен остаться возобновляемым (не «висеть»).
         normalizeTaskRuns()
 
+        // Одноразовая миграция: MCP-инструменты теперь ВКЛ по умолчанию. Включаем их
+        // в УЖЕ существующих чатах ОДИН раз (новые получают дефолт сами). Будущие
+        // ручные выключения пользователем сохраняются — повторно не трогаем.
+        let mcpDefaultKey = "mcpEnabledByDefaultMigration.v1"
+        if !UserDefaults.standard.bool(forKey: mcpDefaultKey) {
+            for i in chats.indices where !chats[i].settings.mcpEnabled {
+                chats[i].settings.mcpEnabled = true
+            }
+            UserDefaults.standard.set(true, forKey: mcpDefaultKey)
+        }
+
         // Память: долговременная (глобальная) и проекты — из своих файлов.
         memory = MemoryStore.load()
         projects = ProjectStore.load()
         // Профили ответа (при первом запуске — стартовый набор).
         profiles = ProfileStore.load()
         invariants = InvariantStore.load()
+        mcpServers = MCPServerStore.load()
 
         // Автосохранение при любом изменении чатов. Дебаунс гасит шквал
         // обновлений (например, перетаскивание слайдеров в настройках).
@@ -142,6 +162,11 @@ final class ChatViewModel: ObservableObject {
             .sink { invariants in
                 DispatchQueue.global(qos: .utility).async { InvariantStore.save(invariants) }
             }
+        mcpSaveCancellable = $mcpServers
+            .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+            .sink { servers in
+                DispatchQueue.global(qos: .utility).async { MCPServerStore.save(servers) }
+            }
 
         // Лимиты контекста и цены нужны сразу (для предупреждения об усечении),
         // а не только при первом открытии настроек.
@@ -160,6 +185,7 @@ final class ChatViewModel: ObservableObject {
                 ProjectStore.save(self.projects)
                 ProfileStore.save(self.profiles)
                 InvariantStore.save(self.invariants)
+                MCPServerStore.save(self.mcpServers)
             }
         }
     }
@@ -284,6 +310,77 @@ final class ChatViewModel: ObservableObject {
     func clearInvariantConflict(chatID: UUID) {
         guard let i = chats.firstIndex(where: { $0.id == chatID }) else { return }
         chats[i].invariantConflict = nil
+    }
+
+    // MARK: - MCP-серверы (инструменты для агентов)
+
+    func addMCPServer(_ s: MCPServer) { mcpServers.insert(s, at: 0) }
+
+    func updateMCPServer(_ s: MCPServer) {
+        if let i = mcpServers.firstIndex(where: { $0.id == s.id }) { mcpServers[i] = s }
+        else { mcpServers.insert(s, at: 0) }
+        // Конфиг сервера мог поменяться — сбросим соединение, переподключится по требованию.
+        mcpStatuses[s.id] = nil
+        let mcp = self.mcp, id = s.id
+        Task { await mcp.disconnect(id) }
+    }
+
+    func removeMCPServer(id: UUID) {
+        mcpServers.removeAll { $0.id == id }
+        mcpStatuses[id] = nil
+        let mcp = self.mcp
+        Task { await mcp.disconnect(id) }
+    }
+
+    /// Импорт серверов из JSON-блока в стиле Claude (`mcpServers`). Возвращает число добавленных.
+    @discardableResult
+    func importMCPConfig(_ json: String) -> Int {
+        let parsed = MCPServer.parseClaudeConfig(json)
+        guard !parsed.isEmpty else { return 0 }
+        mcpServers.insert(contentsOf: parsed, at: 0)
+        return parsed.count
+    }
+
+    /// Тест соединения (подключить + получить список инструментов) — статус в mcpStatuses.
+    func testMCPServer(_ s: MCPServer) {
+        let mcp = self.mcp
+        Task { [weak self] in
+            let st = await mcp.testConnection(s)
+            self?.mcpStatuses[s.id] = st
+        }
+    }
+
+    /// Эффективные MCP-серверы для чата: если включён mcpEnabled — enabled-серверы
+    /// (пересечение с enabledMCPServerIDs, либо все, если множество пусто).
+    func effectiveMCPServers(for settings: GenerationSettings) -> [MCPServer] {
+        guard settings.mcpEnabled else { return [] }
+        let enabled = mcpServers.filter { $0.enabled }
+        if settings.enabledMCPServerIDs.isEmpty { return enabled }
+        return enabled.filter { settings.enabledMCPServerIDs.contains($0.id) }
+    }
+
+    /// Подключает нужные серверы и возвращает их инструменты как DTO для LLM.
+    /// Обновляет mcpStatuses (для UI). Пусто — если MCP выключен/нет серверов.
+    private func mcpToolDTOs(for settings: GenerationSettings) async -> [ChatRequest.Tool] {
+        let servers = effectiveMCPServers(for: settings)
+        guard !servers.isEmpty else { return [] }
+        await mcp.ensureConnected(servers)
+        for s in servers { if let st = await mcp.status(for: s.id) { mcpStatuses[s.id] = st } }
+        let specs = await mcp.availableTools(serverIDs: Set(servers.map { $0.id }))
+        return specs.map { ChatRequest.Tool(spec: $0) }
+    }
+
+    /// Замыкание-исполнитель для tool-loop: захватывает ТОЛЬКО actor `mcp` (Sendable),
+    /// не таща @MainActor-состояние — легально уходит в группу подагентов роя.
+    private func mcpExecutor() -> @Sendable (_ name: String, _ argsJSON: String) async -> String {
+        let mcp = self.mcp
+        return { name, argsJSON in await mcp.call(qualifiedName: name, argumentsJSON: argsJSON) }
+    }
+
+    /// Компактный блок «что вызвал агент» для ленты (перед текстом этапа).
+    static func toolTranscriptBlock(_ records: [ToolCallRecord]) -> String {
+        guard !records.isEmpty else { return "" }
+        return records.map { "🔧 \($0.name) → \($0.ok ? "ok" : "ошибка")" }.joined(separator: "\n")
     }
 
     /// Обновляет параметры генерации выбранного чата.
@@ -413,14 +510,34 @@ final class ChatViewModel: ObservableObject {
         Task {
             let start = Date()
             do {
-                let result = try await client.send(
-                    messages: payload.tail,
-                    settings: settings,
-                    facts: payload.facts,
-                    memory: memoryText,
-                    inProject: inProject,
-                    profile: profileText
-                )
+                // MCP в обычном чате: если включено и есть инструменты — агентный tool-loop
+                // (модель сама дёргает инструменты перед ответом). Иначе — обычный send().
+                let toolDTOs = settings.mcpEnabled ? await mcpToolDTOs(for: settings) : []
+                let result: SendResult
+                var toolTranscript: [ToolCallRecord] = []
+                if toolDTOs.isEmpty {
+                    result = try await client.send(
+                        messages: payload.tail,
+                        settings: settings,
+                        facts: payload.facts,
+                        memory: memoryText,
+                        inProject: inProject,
+                        profile: profileText
+                    )
+                } else {
+                    let loop = try await client.sendWithTools(
+                        messages: payload.tail,
+                        settings: settings,
+                        facts: payload.facts,
+                        memory: memoryText,
+                        inProject: inProject,
+                        profile: profileText,
+                        tools: toolDTOs,
+                        execute: mcpExecutor()
+                    )
+                    result = loop.sendResult
+                    toolTranscript = loop.transcript
+                }
                 let duration = Date().timeIntervalSince(start)
                 let metrics = MessageMetrics(
                     promptTokens: result.promptTokens,
@@ -431,7 +548,10 @@ final class ChatViewModel: ObservableObject {
                     completionCost: price.map { Double(result.completionTokens) * $0.completionPerToken }
                 )
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
-                    addMessage(i, role: .assistant, content: result.text, metrics: metrics)
+                    // В ленте — с блоком «что вызвал агент»; в память/секции — чистый текст.
+                    let toolBlock = Self.toolTranscriptBlock(toolTranscript)
+                    let display = toolBlock.isEmpty ? result.text : toolBlock + "\n\n" + result.text
+                    addMessage(i, role: .assistant, content: display, metrics: metrics)
                     chats[i].promptTokens += result.promptTokens
                     chats[i].completionTokens += result.completionTokens
                     chats[i].totalTokens += result.totalTokens
@@ -472,6 +592,13 @@ final class ChatViewModel: ObservableObject {
     /// выполнения). ВСЕ переходы — только через `ctx.transitioned(to:)` (сверка с таблицей).
     private func runStateMachine(chatID: UUID, gen: Int) async {
         while true {
+            // Инструменты MCP подключаем ДО основного guard — вне мутаций ctx, чтобы
+            // await не пересёкся с правкой состояния. Выключено → путь без MCP не меняется.
+            guard let settingsSnap = chats.first(where: { $0.id == chatID })?.settings,
+                  chats.first(where: { $0.id == chatID })?.taskContext?.status == .running else { break }
+            let toolDTOs = settingsSnap.mcpEnabled ? await mcpToolDTOs(for: settingsSnap) : []
+            guard pipelineGen[chatID] == gen else { return }
+
             guard let i = chats.firstIndex(where: { $0.id == chatID }),
                   var ctx = chats[i].taskContext, ctx.status == .running else { break }
 
@@ -525,7 +652,18 @@ final class ChatViewModel: ObservableObject {
 
             let start = Date()
             do {
-                let result = try await client.runPhase(systemPrompt: sys, userMessage: user, settings: settings)
+                let result: SendResult
+                var toolTranscript: [ToolCallRecord] = []
+                if toolDTOs.isEmpty {
+                    result = try await client.runPhase(systemPrompt: sys, userMessage: user, settings: settings)
+                } else {
+                    // Tool-loop: модель может вызывать инструменты MCP, прежде чем дать текст этапа.
+                    let loop = try await client.runPhaseWithTools(
+                        systemPrompt: sys, userMessage: user, settings: settings,
+                        tools: toolDTOs, execute: mcpExecutor())
+                    result = loop.sendResult
+                    toolTranscript = loop.transcript
+                }
                 // Прогон сменили (новый startPipeline) — этот молча выходит, состояние чужое.
                 guard pipelineGen[chatID] == gen else { return }
                 // Отмена «на проводе» (пауза) → тот же этап/шаг, не коммитим.
@@ -543,7 +681,10 @@ final class ChatViewModel: ObservableObject {
                 guard let j = chats.firstIndex(where: { $0.id == chatID }),
                       var c = chats[j].taskContext else { clearTask(chatID, gen: gen); return }
 
-                let cleaned = PipelinePrompts.stripMarkers(result.text)
+                let pure = PipelinePrompts.stripMarkers(result.text)
+                let toolBlock = Self.toolTranscriptBlock(toolTranscript)
+                // В ленту показываем «что вызвал агент» + текст; в ctx (done/feedback) — чистый текст.
+                let cleaned = toolBlock.isEmpty ? pure : toolBlock + "\n\n" + pure
                 let metrics = MessageMetrics(
                     promptTokens: result.promptTokens,
                     completionTokens: result.completionTokens,
@@ -663,12 +804,12 @@ final class ChatViewModel: ObservableObject {
                     let stepIdx = c.step, total = c.total
                     if PipelinePrompts.wantsReplan(result.text), c.planRetries < TaskContext.maxPlanRetries {
                         c.planRetries += 1
-                        c.planFeedback = cleaned                      // причина → в планирование
+                        c.planFeedback = pure                         // причина → в планирование (чистый текст)
                         addMessage(j, role: .assistant, content: cleaned, metrics: metrics, state: .execution, step: stepIdx, total: total)
                         accumulateTokens(j, result, metrics)
                         c = c.transitioned(to: .planning)            // шаг назад: перепланировать
                     } else {
-                        c.done.append(cleaned)
+                        c.done.append(pure)
                         addMessage(j, role: .assistant, content: cleaned, metrics: metrics, state: .execution, step: stepIdx, total: total)
                         accumulateTokens(j, result, metrics)
                         c.step += 1
@@ -1079,6 +1220,12 @@ final class ChatViewModel: ObservableObject {
     /// подагентами (узкий контекст: только их зависимости), оркестратор агрегирует.
     /// Коммит волны — атомарно ПОСЛЕ успеха всех подагентов (краш/пауза → повтор волны).
     private func runWave(chatID: UUID, gen: Int) async {
+        // Инструменты MCP подключаем ДО снимка/группы (await вне мутаций состояния).
+        guard let settingsSnap = chats.first(where: { $0.id == chatID })?.settings else { return }
+        let toolDTOs = settingsSnap.mcpEnabled ? await mcpToolDTOs(for: settingsSnap) : []
+        guard pipelineGen[chatID] == gen else { return }
+        let mcpExec = mcpExecutor()
+
         guard let i = chats.firstIndex(where: { $0.id == chatID }),
               let snap = chats[i].taskContext, snap.status == .running,
               snap.waveIndex < snap.waves.count else { return }
@@ -1107,26 +1254,35 @@ final class ChatViewModel: ObservableObject {
 
         // Параллельный прогон волны, чанками по cap (захват только value-типов).
         var results: [Int: SendResult] = [:]
+        var transcripts: [Int: [ToolCallRecord]] = [:]   // вызовы инструментов по подагенту (для ленты)
         do {
             for chunk in wave.chunked(into: cap) {
-                let collected = try await withThrowingTaskGroup(of: (Int, SendResult).self) { group -> [(Int, SendResult)] in
+                let collected = try await withThrowingTaskGroup(of: (Int, SendResult, [ToolCallRecord]).self) { group -> [(Int, SendResult, [ToolCallRecord])] in
                     for idx in chunk {
                         let deps = idx < stepDeps.count ? Set(stepDeps[idx]) : []
                         let user = PipelinePrompts.subAgentPrompt(task: task, stepIndex: idx, plan: plan,
                                                                   deps: deps, stepResults: stepResults,
                                                                   profile: profileText, invariants: invs,
                                                                   guidance: guidance)
-                        group.addTask {                       // ТОЛЬКО value-типы, НЕ self
-                            let r = try await localClient.runPhase(systemPrompt: sys, userMessage: user, settings: settings)
-                            return (idx, r)
+                        group.addTask {                       // ТОЛЬКО value-типы (+ actor mcp), НЕ self
+                            if toolDTOs.isEmpty {
+                                let r = try await localClient.runPhase(systemPrompt: sys, userMessage: user, settings: settings)
+                                return (idx, r, [])
+                            } else {
+                                // Подагент тоже может вызывать инструменты MCP (узкий контекст + tools).
+                                let loop = try await localClient.runPhaseWithTools(
+                                    systemPrompt: sys, userMessage: user, settings: settings,
+                                    tools: toolDTOs, execute: mcpExec)
+                                return (idx, loop.sendResult, loop.transcript)
+                            }
                         }
                     }
-                    var acc: [(Int, SendResult)] = []
+                    var acc: [(Int, SendResult, [ToolCallRecord])] = []
                     // Тело группы наследует изоляцию runWave (@MainActor) — обновляем плитку
                     // по мере готовности каждого подагента (живой прогресс, до коммита).
-                    for try await pair in group {
-                        acc.append(pair)
-                        let (idx, r) = pair
+                    for try await triple in group {
+                        acc.append(triple)
+                        let (idx, r, _) = triple
                         if pipelineGen[chatID] == gen,
                            let k = chats.firstIndex(where: { $0.id == chatID }),
                            let t = chats[k].liveSubAgents.firstIndex(where: { $0.id == idx }) {
@@ -1137,7 +1293,7 @@ final class ChatViewModel: ObservableObject {
                     }
                     return acc
                 }
-                for (idx, r) in collected { results[idx] = r }
+                for (idx, r, tr) in collected { results[idx] = r; transcripts[idx] = tr }
             }
         } catch {
             // Отмена (пауза) → тот же waveIndex, без коммита. Иначе — failed (возобновляемо).
@@ -1232,15 +1388,18 @@ final class ChatViewModel: ObservableObject {
         }
         for idx in waveSorted {
             guard let r = results[idx] else { continue }
-            let cleaned = PipelinePrompts.stripMarkers(r.text)
+            let cleaned = PipelinePrompts.stripMarkers(r.text)   // в stepResults/done — ЧИСТЫЙ текст
             c.stepResults[idx] = cleaned
             c.done.append(cleaned)
+            // В ленту — с блоком «что вызвал подагент» (если были вызовы инструментов).
+            let toolBlock = Self.toolTranscriptBlock(transcripts[idx] ?? [])
+            let display = toolBlock.isEmpty ? cleaned : toolBlock + "\n\n" + cleaned
             let m = MessageMetrics(
                 promptTokens: r.promptTokens, completionTokens: r.completionTokens,
                 totalTokens: r.totalTokens, duration: Date().timeIntervalSince(start),
                 promptCost: price.map { Double(r.promptTokens) * $0.promptPerToken },
                 completionCost: price.map { Double(r.completionTokens) * $0.completionPerToken })
-            addMessage(j, role: .assistant, content: cleaned, metrics: m, state: .execution, step: idx, total: c.total,
+            addMessage(j, role: .assistant, content: display, metrics: m, state: .execution, step: idx, total: c.total,
                        waveGroupID: groupID, waveSize: waveCount)
         }
         accumulateWaveTokens(j, results, price)

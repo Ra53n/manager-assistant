@@ -30,9 +30,15 @@ import MarkdownUI
 
 /// Вкладки сайдбара: обычные чаты vs проекты (cowork).
 enum SidebarMode: String, CaseIterable, Identifiable {
-    case chats, projects
+    case chats, projects, routines
     var id: String { rawValue }
-    var label: String { self == .chats ? "Чаты" : "Проекты" }
+    var label: String {
+        switch self {
+        case .chats: return "Чаты"
+        case .projects: return "Проекты"
+        case .routines: return "Рутины"
+        }
+    }
 }
 
 struct ContentView: View {
@@ -40,6 +46,14 @@ struct ContentView: View {
     @State private var showingKeys = false
     @State private var showingComparison = false
     @State private var mode: SidebarMode = .chats
+
+    // Вкладка «Рутины» (агент на VPS)
+    @StateObject private var routinesVM = RoutinesViewModel()
+    @State private var selectedRoutineID: String?
+    @State private var editingRoutine: Routine?
+    @State private var creatingRoutine = false
+    @State private var showingAgentConnection = false
+    @State private var showingAgentSettings = false
     @State private var showingCreateProject = false
     @State private var panelProjectID: UUID?              // открытая панель проекта
     @State private var expanded: Set<UUID> = []           // раскрытые проекты
@@ -56,6 +70,11 @@ struct ContentView: View {
         .sheet(isPresented: $showingComparison) {
             ComparisonView(vm: vm)
         }
+        .sheet(isPresented: $creatingRoutine) { RoutineEditorView(vm: routinesVM, routine: nil) }
+        .sheet(item: $editingRoutine) { r in RoutineEditorView(vm: routinesVM, routine: r) }
+        .sheet(isPresented: $showingAgentConnection) { ConnectionSettingsView(vm: routinesVM) }
+        .sheet(isPresented: $showingAgentSettings) { AgentSettingsView(vm: routinesVM) }
+        .onChange(of: mode) { m in if m == .routines { Task { await enterRoutines() } } }
         .sheet(isPresented: $showingCreateProject) {
             ProjectCreateView { title, instructions in
                 let pid = vm.newProject(title: title, brief: instructions)
@@ -82,7 +101,11 @@ struct ContentView: View {
             .padding(8)
             Divider()
             Group {
-                if mode == .chats { chatsList } else { projectsList }
+                switch mode {
+                case .chats: chatsList
+                case .projects: projectsList
+                case .routines: routinesSidebar
+                }
             }
         }
         .frame(minWidth: 220)
@@ -98,17 +121,129 @@ struct ContentView: View {
                 }
                 .help("Ключи, сравнение моделей")
             }
+            // Действия агента рутин (только во вкладке «Рутины»).
+            if mode == .routines {
+                ToolbarItem {
+                    Menu {
+                        Button { showingAgentSettings = true } label: { Label("Настройки агента", systemImage: "gearshape") }
+                        Button { showingAgentConnection = true } label: { Label("Подключение к VPS", systemImage: "network") }
+                        Button { Task { await routinesVM.syncMcpServers(vm.mcpServers) } } label: { Label("Синхронизировать MCP", systemImage: "arrow.triangle.2.circlepath") }
+                        Button { Task { await routinesVM.refresh() } } label: { Label("Обновить", systemImage: "arrow.clockwise") }
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .help("Агент рутин: настройки, подключение, синхронизация MCP")
+                    .disabled(!routinesVM.isConfigured)
+                }
+            }
             // Одна заметная «+», контекст-зависимая.
             ToolbarItem {
                 Button {
-                    if mode == .chats { vm.newChat() } else { showingCreateProject = true }
+                    switch mode {
+                    case .chats: vm.newChat()
+                    case .projects: showingCreateProject = true
+                    case .routines: creatingRoutine = true
+                    }
                 } label: {
-                    Label(mode == .chats ? "Новый чат" : "Новый проект",
-                          systemImage: mode == .chats ? "square.and.pencil" : "folder.badge.plus")
+                    Label(newItemLabel, systemImage: newItemIcon)
                 }
-                .help(mode == .chats ? "Новый чат" : "Новый проект")
+                .help(newItemLabel)
+                .disabled(mode == .routines && !routinesVM.isConfigured)
             }
         }
+    }
+
+    private var newItemLabel: String {
+        switch mode {
+        case .chats: return "Новый чат"
+        case .projects: return "Новый проект"
+        case .routines: return "Новая рутина"
+        }
+    }
+    private var newItemIcon: String {
+        switch mode {
+        case .chats: return "square.and.pencil"
+        case .projects: return "folder.badge.plus"
+        case .routines: return "plus"
+        }
+    }
+
+    // MARK: Вкладка «Рутины»
+
+    @ViewBuilder private var routinesSidebar: some View {
+        if !routinesVM.isConfigured {
+            VStack(spacing: 10) {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.title2).foregroundStyle(.secondary)
+                Text("Подключение к VPS не настроено")
+                    .font(.callout).multilineTextAlignment(.center)
+                Button("Настроить подключение") { showingAgentConnection = true }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            .padding().frame(maxWidth: .infinity)
+        } else {
+            List(selection: $selectedRoutineID) {
+                if let s = routinesVM.settings, !s.hasLlmKey {
+                    Button { showingAgentSettings = true } label: {
+                        Label("LLM не настроен — задай ключ", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                    }.buttonStyle(.plain)
+                }
+                if routinesVM.routines.isEmpty {
+                    Text("Рутин пока нет. Нажми «+».")
+                        .font(.callout).foregroundColor(.secondary)
+                }
+                ForEach(routinesVM.routines) { r in
+                    RoutineRowView(vm: routinesVM, routine: r).tag(r.id)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var routinesDetail: some View {
+        if !routinesVM.isConfigured {
+            VStack(spacing: 12) {
+                Image(systemName: "clock.arrow.2.circlepath").font(.largeTitle).foregroundStyle(.secondary)
+                Text("Рутины — агент на VPS").font(.title3.bold())
+                Text("Подключись к VPS, чтобы управлять рутинами и видеть результаты.")
+                    .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+                Button("Настроить подключение") { showingAgentConnection = true }.buttonStyle(.borderedProminent)
+            }
+            .frame(minWidth: 480, minHeight: 600)
+        } else if let id = selectedRoutineID, routinesVM.routines.contains(where: { $0.id == id }) {
+            RoutineDetailPane(vm: routinesVM, routineID: id, onEdit: { editingRoutine = $0 })
+                .id(id)
+                .overlay(alignment: .bottom) { routinesErrorBar }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "sidebar.left").font(.largeTitle).foregroundStyle(.tertiary)
+                Text("Выбери рутину слева или создай новую").foregroundStyle(.secondary)
+            }
+            .frame(minWidth: 480, minHeight: 600)
+            .overlay(alignment: .bottom) { routinesErrorBar }
+        }
+    }
+
+    @ViewBuilder private var routinesErrorBar: some View {
+        if let err = routinesVM.errorText {
+            HStack {
+                Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+                Text(err).font(.callout).lineLimit(2)
+                Spacer()
+                Button { routinesVM.errorText = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+            }
+            .padding(10).background(.regularMaterial).cornerRadius(8)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.red.opacity(0.4)))
+            .padding(10)
+        }
+    }
+
+    /// При входе во вкладку «Рутины»: обновить данные и синхронизировать MCP из приложения.
+    private func enterRoutines() async {
+        guard routinesVM.isConfigured else { return }
+        await routinesVM.refresh()
+        await routinesVM.syncMcpServers(vm.mcpServers)
+        if selectedRoutineID == nil { selectedRoutineID = routinesVM.routines.first?.id }
     }
 
     // Список обычных чатов (без проекта).
@@ -191,7 +326,9 @@ struct ContentView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if vm.selectedChat != nil {
+        if mode == .routines {
+            routinesDetail
+        } else if vm.selectedChat != nil {
             ChatDetailView(vm: vm)
         } else {
             VStack(spacing: 12) {
@@ -220,6 +357,7 @@ struct ChatDetailView: View {
     @State private var showingMemory = false
     @State private var showingProjectPanel = false
     @State private var showingInvariants = false
+    @State private var showingMCP = false
     /// Черновик записи памяти (сохранение из сообщения / добавление вручную).
     @State private var memoryDraft: MemoryDraft?
     /// Черновик секции проекта (сохранение сообщения «В проект»).
@@ -305,6 +443,15 @@ struct ChatDetailView: View {
                 .help("Инварианты: ограничения (стек/архитектура/бюджет/запреты/правила)")
 
                 Button {
+                    showingMCP = true
+                } label: {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .foregroundStyle((vm.selectedChat?.settings.mcpEnabled ?? false)
+                                         ? Color.accentColor : Color.secondary)
+                }
+                .help("MCP-серверы: инструменты для агентов (YouGile и т.п.)")
+
+                Button {
                     showingMemory = true
                 } label: {
                     Image(systemName: "brain")
@@ -334,6 +481,9 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingInvariants) {
             InvariantsPanelView(vm: vm)
+        }
+        .sheet(isPresented: $showingMCP) {
+            MCPServersPanelView(vm: vm)
         }
         .sheet(isPresented: $showingProjectPanel) {
             if let p = attachedProject {
@@ -762,6 +912,16 @@ struct ChatDetailView: View {
                             .font(.caption2)
                             .foregroundColor(.purple)
                             .help("Параллельно работают \(run.waves[run.waveIndex].count) подагентов (волна \(run.waveIndex + 1)/\(run.waves.count))")
+                    }
+                    // MCP: инструменты доступны агентам на этом прогоне.
+                    if chat.settings.mcpEnabled {
+                        let n = vm.effectiveMCPServers(for: chat.settings).count
+                        if n > 0 {
+                            Text("🔧×\(n)")
+                                .font(.caption2)
+                                .foregroundColor(.teal)
+                                .help("Агентам доступны инструменты \(n) MCP-сервер(ов)")
+                        }
                     }
                     if run.executionRetries > 0 {
                         Text("↻\(run.executionRetries)")
@@ -1234,6 +1394,33 @@ struct ChatSettingsView: View {
                         }
                     }
                     Text("На этапе «Выполнение» независимые шаги плана выполняются параллельно подагентами со своим узким контекстом (только их зависимости) — быстрее и экономнее по токенам. Зависимые шаги идут по порядку (планировщик указывает зависимости, шаги раскладываются по волнам). Выкл — последовательное выполнение с полным контекстом, как раньше.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("MCP-инструменты (для агентов)") {
+                    Toggle("Дать агентам доступ к инструментам MCP-серверов", isOn: $settings.mcpEnabled)
+                    if settings.mcpEnabled {
+                        let active = vm.effectiveMCPServers(for: settings)
+                        if active.isEmpty {
+                            Text("Нет включённых серверов. Добавь их через кнопку «гаечный ключ» в шапке чата.")
+                                .font(.caption).foregroundColor(.orange)
+                        } else {
+                            ForEach(active) { srv in
+                                HStack {
+                                    Image(systemName: "wrench.and.screwdriver.fill")
+                                        .foregroundColor(.teal).font(.caption)
+                                    Text(srv.name.isEmpty ? "(без имени)" : srv.name)
+                                    Spacer()
+                                    if let st = vm.mcpStatuses[srv.id] {
+                                        Text(st.connected ? "\(st.toolCount) инстр." : "ошибка")
+                                            .font(.caption).foregroundColor(st.connected ? .secondary : .orange)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Text("Когда включено (по умолчанию), агент может вызывать инструменты подключённых MCP-серверов (например, читать/менять задачи в YouGile) — и в обычном чате, и на всех этапах конвейера (план → выполнение → проверка → ответ). Реальные вызовы происходят только если есть включённый сервер. Управление серверами — кнопка «гаечный ключ» в шапке.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -2153,6 +2340,211 @@ struct InvariantEditorView: View {
 
     private func parseList(_ s: String) -> [String] {
         s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+}
+
+// MARK: - MCP-серверы (панель / редактор / импорт)
+
+/// Панель управления MCP-серверами: список с статусом подключения, тест, добавление
+/// (вручную / шаблон YouGile / импорт конфига Claude), правка, удаление.
+struct MCPServersPanelView: View {
+    @ObservedObject var vm: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var editTarget: MCPServer?
+    @State private var showingImport = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("MCP-серверы").font(.headline)
+                Spacer()
+                Button { editTarget = MCPServer.youGileTemplate() } label: {
+                    Label("YouGile", systemImage: "square.grid.2x2")
+                }
+                .help("Шаблон удалённого YouGile (вставь свой токен)")
+                Button { showingImport = true } label: { Label("Импорт", systemImage: "doc.on.clipboard") }
+                    .help("Вставить конфиг в стиле Claude (mcpServers)")
+                Button { editTarget = MCPServer() } label: { Label("Новый", systemImage: "plus") }
+                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Серверы") {
+                    if vm.mcpServers.isEmpty {
+                        Text("Пока нет серверов. «YouGile» — готовый шаблон; «Импорт» — вставить блок mcpServers из конфига Claude; «Новый» — вручную.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    ForEach(vm.mcpServers) { srv in row(srv) }
+                }
+                Section {
+                    Text("Сервер запускается как подпроцесс: /usr/bin/env <command> <args…>. Так работают и локальные серверы (node …), и удалённые через мост npx -y mcp-remote <url> --header \"Authorization: Bearer …\". Включи «MCP-инструменты» в ⚙ настройках чата, чтобы агенты могли вызывать инструменты. Конфиг и секреты хранятся в mcp-servers.json (вне репозитория).")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 640, height: 600)
+        .sheet(item: $editTarget) { srv in
+            MCPServerEditorView(server: srv) { edited in
+                if vm.mcpServers.contains(where: { $0.id == edited.id }) { vm.updateMCPServer(edited) }
+                else { vm.addMCPServer(edited) }
+            }
+        }
+        .sheet(isPresented: $showingImport) {
+            MCPImportView { json in
+                let n = vm.importMCPConfig(json)
+                return n
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ srv: MCPServer) -> some View {
+        let status = vm.mcpStatuses[srv.id]
+        HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(dotColor(status, enabled: srv.enabled))
+                .frame(width: 9, height: 9)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(srv.name.isEmpty ? "(без имени)" : srv.name).fontWeight(.medium)
+                    if !srv.enabled {
+                        Text("выкл").font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+                Text(([srv.command] + srv.args).joined(separator: " "))
+                    .font(.caption).foregroundColor(.secondary).lineLimit(2)
+                if let st = status {
+                    if st.connected {
+                        Text("подключён · \(st.toolCount) инструм.")
+                            .font(.caption2).foregroundColor(.green)
+                    } else if let err = st.error {
+                        Text(err).font(.caption2).foregroundColor(.orange).lineLimit(3)
+                    }
+                }
+            }
+            Spacer()
+            Button("Тест") { vm.testMCPServer(srv) }.buttonStyle(.borderless)
+            Button("Править") { editTarget = srv }.buttonStyle(.borderless)
+            Button { vm.removeMCPServer(id: srv.id) } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless).foregroundColor(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func dotColor(_ status: MCPServerStatus?, enabled: Bool) -> Color {
+        guard enabled else { return .secondary }
+        guard let s = status else { return .gray }
+        return s.connected ? .green : .orange
+    }
+}
+
+/// Редактор одного MCP-сервера (имя, команда, аргументы, env, доп. PATH).
+struct MCPServerEditorView: View {
+    @State var server: MCPServer
+    let onSave: (MCPServer) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var argsText = ""
+    @State private var envText = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("MCP-сервер").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") {
+                    server.args = parseLines(argsText)
+                    server.env = parseEnv(envText)
+                    onSave(server); dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Сервер") {
+                    TextField("Имя", text: $server.name, prompt: Text("yougile"))
+                    TextField("Команда", text: $server.command, prompt: Text("npx / node"))
+                    Toggle("Включён", isOn: $server.enabled)
+                }
+                Section("Аргументы — по одному на строку") {
+                    TextEditor(text: $argsText)
+                        .frame(minHeight: 110).font(.system(.body, design: .monospaced))
+                    Text("Напр.: -y / mcp-remote / https://…/mcp / --header / Authorization: Bearer …")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Section("Переменные окружения — KEY=VALUE на строку") {
+                    TextEditor(text: $envText)
+                        .frame(minHeight: 70).font(.system(.body, design: .monospaced))
+                    Text("Для локального YouGile: YOUGILE_API_KEY=…")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Section("Доп. PATH (через ‘:’) — если node/npx не находится") {
+                    TextField("PATH", text: $server.extraPATH, prompt: Text("/opt/homebrew/bin"))
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 600, height: 600)
+        .onAppear {
+            argsText = server.args.joined(separator: "\n")
+            envText = server.env.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "\n")
+        }
+    }
+
+    private func parseLines(_ s: String) -> [String] {
+        s.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    private func parseEnv(_ s: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for line in s.split(whereSeparator: \.isNewline) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard let eq = t.firstIndex(of: "=") else { continue }
+            let k = String(t[..<eq]).trimmingCharacters(in: .whitespaces)
+            let v = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if !k.isEmpty { out[k] = v }
+        }
+        return out
+    }
+}
+
+/// Лист импорта конфига в стиле Claude (вставка JSON-блока mcpServers).
+struct MCPImportView: View {
+    let onImport: (String) -> Int
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var note: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Импорт конфига Claude").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Добавить") {
+                    let n = onImport(text)
+                    if n > 0 { dismiss() } else { note = "Не нашёл серверов в блоке mcpServers." }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Вставь JSON (как в Claude Desktop)") {
+                    TextEditor(text: $text)
+                        .frame(minHeight: 240).font(.system(.body, design: .monospaced))
+                    if let note { Text(note).font(.caption).foregroundColor(.orange) }
+                    Text("{\n  \"mcpServers\": {\n    \"yougile\": { \"command\": \"npx\", \"args\": [\"-y\", \"mcp-remote\", \"https://…/mcp\", \"--header\", \"Authorization: Bearer …\"] }\n  }\n}")
+                        .font(.caption2).foregroundColor(.secondary).textSelection(.enabled)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 620, height: 480)
     }
 }
 

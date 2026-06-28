@@ -210,6 +210,57 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   строго»). Активный — `Chat.profileID`; создаётся/выбирается/правится/удаляется в
   настройках чата ⚙︎ (секция «Профиль ответа», `ProfileEditorView`). Только ТЕКСТ
   в промпт — токены/температуру НЕ трогает (это GenerationSettings). В сравнении нет.
+- **Агент рутин (VPS) — планировщик задач 24/7 + интеграция в приложение** —
+  ОТДЕЛЬНЫЙ бэкенд в каталоге `agent/` (Node 20/TypeScript), независимый от сборки
+  Swift (SwiftPM видит только `Sources/`/`Tests/`). Пользователь ставит **рутины**
+  (как Routines в Claude Code): промпт + расписание (cron) → агент по крону выполняет
+  промпт через LLM (DeepSeek), при необходимости собирает данные через **любые MCP-серверы,
+  подключённые в приложении** (generic, БЕЗ привязки к конкретному MCP), агрегирует результат
+  и сохраняет локально (история видна во вкладке «Рутины»).
+  • **Топология**: сервис слушает `127.0.0.1:3100` под systemd (`manager-agent.service`),
+    наружу — через **Caddy** `https://<your-vps-domain>/agent/*`; агент — **generic MCP-ХОСТ**:
+    подключается (stdio, SDK `StdioClientTransport`) к MCP-серверам, СИНХРОНИЗИРОВАННЫМ из приложения
+    (`runner/mcpHost.ts`: спавнит те же `npx mcp-remote …`-спеки, агрегирует инструменты, квалифицирует
+    `<slug>__<tool>` — порт `MCPManager`). НЕ трогать VPN(Amnezia/docker)/x-ui/xray, `yougile-mcp.service`,
+    маршрут `/mcp`. Всё добавочно.
+  • **Источник истины по MCP — ПРИЛОЖЕНИЕ.** Список MCP-серверов ведётся в приложении (существующая
+    панель MCP, `mcp-servers.json`); приложение пушит его на агент (`PUT /agent/mcp-servers`) при входе
+    во вкладку/подключении (`RoutinesViewModel.syncMcpServers`). Никаких хардкод-привязок к YouGile в коде:
+    смена доски/MCP = правка только промпта рутины. Сохранение во внешние системы — через промпт (у агента
+    есть все эти инструменты); встроенный sink один — `vps_local`.
+  • **Источник истины по рутинам — VPS** (SQLite, better-sqlite3: `routines`/`runs`/`settings`/`mcp_servers`).
+    Приложение — тонкий клиент с in-memory кэшем; мутации идут на сервер с `rev` (оптимистическая блокировка,
+    409 при устаревшем). Фича НЕ участвует в локальном автосохранении.
+  • **Единственная панель конфигурации — приложение.** На VPS в `/etc/manager-agent.env`
+    только bootstrap (`AGENT_API_TOKEN` + порт + путь к БД). Провайдер/LLM-ключ/модель/таймзона задаются
+    из приложения (`PUT /agent/settings`), хранятся в БД; секрет (`llmApiKey`) на чтение МАСКИРУЕТСЯ
+    (`hasLlmKey`/`llmKeyHint`, паттерн write-only; пустой секрет в PUT не затирает). MCP-секреты (токены в
+    args/env) — в `mcp_servers`, наружу (`GET /agent/mcp-servers`) НЕ отдаются (только статус/число инструментов).
+  • **Серверная логика** (`agent/src/`): `runner/llm.ts` — порт `DeepSeekClient.runToolLoop`;
+    `runner/mcpHost.ts` — generic мульти-MCP хост; `runner/runner.ts` — прогон (инструменты из хоста→
+    tool-loop→persist, статусы running/ok/error/timeout/skipped_overlap/missed, таймаут, лимиты);
+    `scheduler/scheduler.ts` — croner (таймзоны), overlap-guard, catch-up (опц.), примирение зависших
+    running→error; `http/` — Fastify, bearer-auth, единый формат ошибок, идемпотентность trigger,
+    cursor-пагинация; эндпоинты `…/settings`, `…/mcp-servers`, `…/routines*`, `…/runs*`, `…/chat/ask`.
+  • **Приложение**: `RoutineModels.swift` (DTO, ленивый декод, unknown-enum→`.unknown`; `MCPServerDTO`/
+    `McpServerStatusDTO`), `VPSAgentClient.swift` (struct; ЧИСТЫЕ static-построители запроса — тестируемы
+    без сети; `get/putMcpServers`), `RoutinesViewModel.swift` (тонкий клиент + `syncMcpServers`),
+    `RoutinesPanelView.swift` (вью-кирпичики: строка/детали/прогон) + `RoutineEditorView.swift`
+    (редактор/«Подключение к VPS»/«Настройки агента»). **Вход — отдельная вкладка «Рутины»**
+    (`SidebarMode.routines` в `ContentView`: сегмент «Чаты|Проекты|Рутины», сайдбар = список рутин,
+    detail = `RoutineDetailPane` с историей и дайджестом на виду). Подключение (адрес+токен) — bootstrap
+    в `KeyStore.agentURL`/`agentToken` (не в git).
+  • **Тесты**: сервер — Vitest (`agent/test/`, без сети/LLM: заглушки + `:memory:` SQLite,
+    Fastify `inject`); приложение — `RoutinesTests.swift` (round-trip DTO, unknown-fallback,
+    маскирование, построители запроса). Запуск: `cd agent && npm test` и `swift test`.
+  • **Деплой**: `agent/deploy/deploy.sh` (идемпотентно, по SSH от root) — выкладка в
+    `/opt/manager-agent`, `npm ci --omit=dev`, systemd-юнит, маршрут Caddy (с бэкапом+validate),
+    генерирует `AGENT_API_TOKEN` (вводится в приложении). БД переживает передеплой. Подробности +
+    **грабли передеплоя** (рестарт ТОЛЬКО `systemctl restart --no-block`; флакающий scp по паролю — проверять
+    перенос; `npx mcp-remote` нужен HOME/npm-кэш — уже в юните; ~15с старт) + end-to-end проверка —
+    `agent/README.md`. Конкретные адрес/домен/токен инстанса в git НЕТ: см. `agent/deploy/instance.local.md`
+    (gitignored) или локальную память. **Как расширять** (новый sink/endpoint/поле рутины) — в README; новые
+    поля/статусы декодировать снисходительно С ОБЕИХ сторон.
 - **Мультипровайдер** — добавить провайдера = новый case в `Provider` +
   endpoints/keyFileName/envVar; UI подхватит сам через `allCases`.
 - **Ключи API — никогда в коде/git.** Лежат в `~/.config/manager-assistant/<p>.key`
@@ -237,7 +288,10 @@ bash install.sh      # run.sh + установка в /Applications (так по
 
 # Тесты (юнит-тесты чистой логики FSM/роя/парсеров, таргет ManagerAssistantTests):
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer  # XCTest есть ТОЛЬКО в Xcode
-swift test           # 43+ теста; CommandLineTools НЕ годится (нет модуля XCTest)
+swift test           # 90+ тестов; CommandLineTools НЕ годится (нет модуля XCTest)
+
+# Агент рутин (отдельный бэкенд, Node 20) — свои сборка/тесты, независимы от SwiftPM:
+cd agent && npm ci && npm run build && npm test   # Vitest, всё офлайн (55+ тестов)
 ```
 
 - Полный Xcode установлен, но его лицензия может быть не принята — поэтому
