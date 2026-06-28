@@ -137,6 +137,30 @@ export function trimLeadingChatter(text: string): string {
   return text.trim();
 }
 
+/**
+ * Строка с текущими датой/временем для инъекции в начало запроса рутины. Даёт агенту
+ * опору для дедлайнов/«выходных»: локальные дата/время в таймзоне рутины (+ день недели) и
+ * epoch-ms для вычислений. Используется во ВСЕХ режимах.
+ */
+export function dateContextLine(now: Date, timezone: string): string {
+  const tz = timezone || "UTC";
+  let local: string;
+  try {
+    local = now.toLocaleString("ru-RU", {
+      timeZone: tz,
+      weekday: "long",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    local = now.toISOString();
+  }
+  return `Текущие дата и время: ${local} (таймзона ${tz}; epoch ms сейчас: ${now.getTime()}).`;
+}
+
 /** Обрезает текст до лимита байт (UTF-8) с маркером усечения. */
 function capOutput(text: string): string {
   const buf = Buffer.from(text, "utf8");
@@ -208,6 +232,9 @@ export class Runner {
     }
 
     const model = routine.model || settings.defaultModel || "deepseek-chat";
+    // Префикс с текущей датой/временем — чтобы агент мог корректно ставить дедлайны и
+    // понимать «сегодня»/«в выходные». Идёт в начало задачи во всех режимах.
+    const userTask = `${dateContextLine(this.now(), routine.timezone)}\n\n${routine.prompt}`;
 
     try {
       const toolDefs = this.host.availableTools().map(buildToolDef);
@@ -226,7 +253,7 @@ export class Runner {
               maxTokens: DEFAULT_MAX_TOKENS,
               tools: toolDefs,
               execute: this.executor(),
-              task: routine.prompt,
+              task: userTask,
               swarm: routine.swarm,
               maxParallelAgents: routine.maxParallelAgents,
               perStepMaxIterations: routine.maxIterations,
@@ -247,7 +274,7 @@ export class Runner {
               maxTokens: DEFAULT_MAX_TOKENS,
               messages: [
                 { role: "system", content: ACTION_SYSTEM_PROMPT },
-                { role: "user", content: routine.prompt },
+                { role: "user", content: userTask },
               ] as ChatMessage[],
               tools: toolDefs,
               maxIterations: ACTION_MAX_ITERATIONS,
@@ -265,7 +292,7 @@ export class Runner {
             maxTokens: DEFAULT_MAX_TOKENS,
             messages: [
               { role: "system", content: RUNNER_SYSTEM_PROMPT },
-              { role: "user", content: routine.prompt },
+              { role: "user", content: userTask },
             ] as ChatMessage[],
             tools: toolDefs,
             maxIterations: routine.maxIterations,

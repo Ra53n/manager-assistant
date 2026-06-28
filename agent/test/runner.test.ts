@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import type { DB } from "../src/store/db.js";
-import { Runner } from "../src/runner/runner.js";
+import { Runner, dateContextLine } from "../src/runner/runner.js";
 import {
   makeDb,
   makeRepos,
@@ -107,6 +107,30 @@ describe("Runner.run", () => {
     await makeRunner({ llmClientFactory: () => capturing as never }).run(routine, "manual", null);
     expect(sys).toContain("ПРОЦЕДУРУ");
     expect(sys).not.toContain("СРАЗУ выводи итог");
+  });
+
+  it("инъектирует текущие дату/время в начало запроса", async () => {
+    const routine = buildRoutine({ mode: "action", timezone: "Europe/Moscow" });
+    repos.routinesRepo.insert(routine);
+    let userMsg = "";
+    const capturing = {
+      calls: 0,
+      async chat(req: { messages: Array<{ role: string; content: string | null }> }) {
+        this.calls++;
+        userMsg = String(req.messages.find((m) => m.role === "user")?.content ?? "");
+        return { message: { content: "ок" }, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 } };
+      },
+    };
+    await makeRunner({ llmClientFactory: () => capturing as never }).run(routine, "manual", null);
+    expect(userMsg).toContain("Текущие дата и время");
+    expect(userMsg).toContain("epoch ms");
+    expect(userMsg).toContain(routine.prompt); // исходный промпт сохранён
+  });
+
+  it("dateContextLine: epoch + таймзона + день недели", () => {
+    const s = dateContextLine(new Date("2026-06-28T18:00:00Z"), "Europe/Moscow");
+    expect(s).toMatch(/epoch ms сейчас: \d+/);
+    expect(s).toContain("Europe/Moscow");
   });
 
   it("без LLM-ключа — статус error, без сети", async () => {
