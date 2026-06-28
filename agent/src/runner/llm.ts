@@ -87,10 +87,53 @@ export interface HttpLlmConfig {
   url: string;
   apiKey: string;
   provider: Provider;
+  /** Число ПОВТОРОВ (сверх первой попытки) при транзиентных сбоях. По умолчанию 3. */
+  maxRetries?: number;
+  /** Внедряемый fetch (для тестов); по умолчанию глобальный fetch. */
+  fetchImpl?: typeof fetch;
+  /** Внедряемая пауза бэкоффа (для тестов — мгновенная); по умолчанию abortable-таймер. */
+  sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+}
+
+// Статусы, на которых имеет смысл повторить запрос (перегрузка/временные сбои upstream).
+const RETRIABLE_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+const BACKOFF_BASE_MS = 500;
+const BACKOFF_CAP_MS = 8000;
+
+/** Пауза, прерываемая по AbortSignal (чтобы пауза/таймаут прогона не зависали в бэкоффе). */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new DOMException("Aborted", "AbortError"));
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function isAbort(e: unknown, signal?: AbortSignal): boolean {
+  return !!signal?.aborted || (e instanceof Error && e.name === "AbortError");
 }
 
 export class HttpLlmClient implements LlmCompletionClient {
-  constructor(private readonly cfg: HttpLlmConfig) {}
+  private readonly maxRetries: number;
+  private readonly fetchImpl: typeof fetch;
+  private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+
+  constructor(private readonly cfg: HttpLlmConfig) {
+    this.maxRetries = cfg.maxRetries ?? 3;
+    this.fetchImpl = cfg.fetchImpl ?? fetch;
+    this.sleep = cfg.sleep ?? abortableDelay;
+  }
 
   async chat(req: ChatRequest): Promise<ChatCompletion> {
     const body: Record<string, unknown> = {
@@ -112,49 +155,75 @@ export class HttpLlmClient implements LlmCompletionClient {
     if (this.cfg.provider === "openrouter") {
       headers["X-Title"] = "Manager assistant — routine agent";
     }
+    const payload = JSON.stringify(body);
 
-    let resp: Response;
-    try {
-      resp = await fetch(this.cfg.url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: req.signal,
-      });
-    } catch (e) {
-      throw new UpstreamError(`Сбой запроса к LLM: ${(e as Error).message}`);
-    }
-
-    const raw = await resp.text();
-    if (!resp.ok) {
-      let message = raw;
+    // Транзиентные сбои (обрыв сети «fetch failed», 429, 5xx) переживаем повтором с
+    // экспоненциальным бэкоффом — иначе единичный блип убивает весь прогон и оставляет
+    // внешние действия (стикеры/комментарии) в неконсистентном состоянии. Отмену
+    // (пауза/таймаут) и клиентские 4xx НЕ ретраим.
+    let lastError = "Сбой запроса к LLM";
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      let resp: Response;
       try {
-        const j = JSON.parse(raw);
-        message = j?.error?.message ?? raw;
-      } catch {
-        /* оставляем raw */
+        resp = await this.fetchImpl(this.cfg.url, {
+          method: "POST",
+          headers,
+          body: payload,
+          signal: req.signal,
+        });
+      } catch (e) {
+        if (isAbort(e, req.signal)) throw e; // пауза/таймаут — пробрасываем как есть
+        lastError = `Сбой запроса к LLM: ${(e as Error).message}`;
+        if (attempt < this.maxRetries) {
+          await this.backoff(attempt, null, req.signal);
+          continue;
+        }
+        throw new UpstreamError(lastError);
       }
-      throw new UpstreamError(`Ошибка LLM (${resp.status}): ${message}`);
-    }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      throw new UpstreamError("Некорректный JSON от LLM");
-    }
+      const raw = await resp.text();
+      if (!resp.ok) {
+        let message = raw;
+        try {
+          message = JSON.parse(raw)?.error?.message ?? raw;
+        } catch {
+          /* оставляем raw */
+        }
+        if (RETRIABLE_STATUSES.has(resp.status) && attempt < this.maxRetries) {
+          lastError = `Ошибка LLM (${resp.status}): ${message}`;
+          await this.backoff(attempt, resp.headers.get("retry-after"), req.signal);
+          continue;
+        }
+        throw new UpstreamError(`Ошибка LLM (${resp.status}): ${message}`);
+      }
 
-    const choice = parsed?.choices?.[0]?.message;
-    if (!choice) throw new UpstreamError("Пустой ответ от LLM (нет choices)");
-    const u = parsed?.usage ?? {};
-    return {
-      message: { content: choice.content ?? null, tool_calls: choice.tool_calls },
-      usage: {
-        promptTokens: u.prompt_tokens ?? 0,
-        completionTokens: u.completion_tokens ?? 0,
-        totalTokens: u.total_tokens ?? 0,
-      },
-    };
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new UpstreamError("Некорректный JSON от LLM");
+      }
+      const choice = parsed?.choices?.[0]?.message;
+      if (!choice) throw new UpstreamError("Пустой ответ от LLM (нет choices)");
+      const u = parsed?.usage ?? {};
+      return {
+        message: { content: choice.content ?? null, tool_calls: choice.tool_calls },
+        usage: {
+          promptTokens: u.prompt_tokens ?? 0,
+          completionTokens: u.completion_tokens ?? 0,
+          totalTokens: u.total_tokens ?? 0,
+        },
+      };
+    }
+    throw new UpstreamError(lastError);
+  }
+
+  /** Пауза перед повтором: max(экспонента, Retry-After). Прерывается отменой. */
+  private async backoff(attempt: number, retryAfter: string | null, signal?: AbortSignal): Promise<void> {
+    let ms = Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** attempt);
+    const ra = retryAfter ? Number.parseInt(retryAfter, 10) : NaN;
+    if (Number.isFinite(ra) && ra > 0) ms = Math.max(ms, Math.min(BACKOFF_CAP_MS * 4, ra * 1000));
+    await this.sleep(ms, signal);
   }
 }
 
