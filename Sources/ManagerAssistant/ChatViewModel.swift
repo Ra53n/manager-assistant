@@ -510,6 +510,10 @@ final class ChatViewModel: ObservableObject {
         Task {
             let start = Date()
             do {
+                // RAG: релевантные фрагменты из выбранного индекса (async, не блокирует UI).
+                // Дописываются к блоку памяти — модель видит их как контекст (см. PromptBuilder).
+                let ragBlock = await ragRetrieval(settings: settings, query: text)
+                let memoryForSend = Self.mergeMemory(memoryText, ragBlock)
                 // MCP в обычном чате: если включено и есть инструменты — агентный tool-loop
                 // (модель сама дёргает инструменты перед ответом). Иначе — обычный send().
                 let toolDTOs = settings.mcpEnabled ? await mcpToolDTOs(for: settings) : []
@@ -520,7 +524,7 @@ final class ChatViewModel: ObservableObject {
                         messages: payload.tail,
                         settings: settings,
                         facts: payload.facts,
-                        memory: memoryText,
+                        memory: memoryForSend,
                         inProject: inProject,
                         profile: profileText
                     )
@@ -529,7 +533,7 @@ final class ChatViewModel: ObservableObject {
                         messages: payload.tail,
                         settings: settings,
                         facts: payload.facts,
-                        memory: memoryText,
+                        memory: memoryForSend,
                         inProject: inProject,
                         profile: profileText,
                         tools: toolDTOs,
@@ -591,6 +595,14 @@ final class ChatViewModel: ObservableObject {
     /// Главный цикл автомата. Один проход = один запрос модели (этап ИЛИ один шаг
     /// выполнения). ВСЕ переходы — только через `ctx.transitioned(to:)` (сверка с таблицей).
     private func runStateMachine(chatID: UUID, gen: Int) async {
+        // RAG-контекст задачи (один раз на весь прогон): релевантные фрагменты по тексту
+        // задачи. Одинаков для всех этапов/шагов/подагентов → эмбеддер не гоняется повторно.
+        // Пусто, если RAG выключен/не выбран индекс (см. ragRetrieval). Инжектится в
+        // buildPrompt/subAgentPrompt ортогонально контекст-стратегиям и памяти.
+        var ragBlock = ""
+        if let chat = chats.first(where: { $0.id == chatID }), let ctx0 = chat.taskContext {
+            ragBlock = await ragRetrieval(settings: chat.settings, query: ctx0.task) ?? ""
+        }
         while true {
             // Инструменты MCP подключаем ДО основного guard — вне мутаций ctx, чтобы
             // await не пересёкся с правкой состояния. Выключено → путь без MCP не меняется.
@@ -637,7 +649,7 @@ final class ChatViewModel: ObservableObject {
                     if ctx.waves.isEmpty { ctx.waves = (0..<ctx.plan.count).map { [$0] } }
                     ctx.waveIndex = min(max(0, ctx.waveIndex), ctx.waves.count - 1)
                     chats[i].taskContext = ctx
-                    await runWave(chatID: chatID, gen: gen)
+                    await runWave(chatID: chatID, gen: gen, rag: ragBlock)
                     if pipelineGen[chatID] != gen { return }
                     continue                                          // следующий проход: новая волна / проверка
                 }
@@ -647,7 +659,7 @@ final class ChatViewModel: ObservableObject {
             }
 
             let sys = PipelinePrompts.systemPrompt(for: state, swarm: settings.swarmEnabled, invariants: invs)
-            let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs)
+            let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs, rag: ragBlock)
             chats[i].isLoading = true
 
             let start = Date()
@@ -1219,7 +1231,7 @@ final class ChatViewModel: ObservableObject {
     /// Выполняет ТЕКУЩУЮ волну (`waves[waveIndex]`): независимые шаги — параллельно
     /// подагентами (узкий контекст: только их зависимости), оркестратор агрегирует.
     /// Коммит волны — атомарно ПОСЛЕ успеха всех подагентов (краш/пауза → повтор волны).
-    private func runWave(chatID: UUID, gen: Int) async {
+    private func runWave(chatID: UUID, gen: Int, rag: String = "") async {
         // Инструменты MCP подключаем ДО снимка/группы (await вне мутаций состояния).
         guard let settingsSnap = chats.first(where: { $0.id == chatID })?.settings else { return }
         let toolDTOs = settingsSnap.mcpEnabled ? await mcpToolDTOs(for: settingsSnap) : []
@@ -1263,7 +1275,7 @@ final class ChatViewModel: ObservableObject {
                         let user = PipelinePrompts.subAgentPrompt(task: task, stepIndex: idx, plan: plan,
                                                                   deps: deps, stepResults: stepResults,
                                                                   profile: profileText, invariants: invs,
-                                                                  guidance: guidance)
+                                                                  guidance: guidance, rag: rag)
                         group.addTask {                       // ТОЛЬКО value-типы (+ actor mcp), НЕ self
                             if toolDTOs.isEmpty {
                                 let r = try await localClient.runPhase(systemPrompt: sys, userMessage: user, settings: settings)
@@ -1513,6 +1525,24 @@ final class ChatViewModel: ObservableObject {
             shortTerm: chat.memory,
             settings: chat.settings
         )
+    }
+
+    /// RAG-ретрив для чата: релевантные фрагменты выбранного индекса по запросу.
+    /// nil — RAG выключен / индекс не выбран / ничего не нашлось / ошибка (ретрив НИКОГДА
+    /// не роняет отправку). Читает индекс лениво с диска (RagRetriever), поэтому не зависит
+    /// от RagViewModel; тяжёлая часть — в await, MainActor не блокируется. Бюджет — половина
+    /// бюджета памяти, чтобы фрагменты не вытесняли остальную память.
+    func ragRetrieval(settings: GenerationSettings, query: String) async -> String? {
+        guard settings.ragEnabled, let id = settings.ragIndexID else { return nil }
+        return await RagRetriever.retrieveBlock(indexID: id, query: query,
+                                                topK: settings.ragTopK,
+                                                budgetTokens: max(200, settings.memoryTokenBudget / 2))
+    }
+
+    /// Склеивает блок памяти и блок RAG в один параметр `memory:` (пустое → nil).
+    static func mergeMemory(_ parts: String?...) -> String? {
+        let joined = parts.compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        return joined.isEmpty ? nil : joined
     }
 
     // MARK: Долговременная / краткосрочная память (короткие записи)

@@ -47,6 +47,9 @@ struct ContentView: View {
     @State private var showingComparison = false
     @State private var mode: SidebarMode = .chats
 
+    // Локальный RAG (база знаний): один экземпляр на приложение, список индексов общий.
+    @StateObject private var ragVM = RagViewModel()
+
     // Вкладка «Рутины» (агент на VPS)
     @StateObject private var routinesVM = RoutinesViewModel()
     @State private var selectedRoutineID: String?
@@ -329,7 +332,7 @@ struct ContentView: View {
         if mode == .routines {
             routinesDetail
         } else if vm.selectedChat != nil {
-            ChatDetailView(vm: vm)
+            ChatDetailView(vm: vm, ragVM: ragVM)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: mode == .chats ? "bubble.left.and.bubble.right" : "folder")
@@ -352,12 +355,14 @@ private struct IDBox: Identifiable { let id: UUID }
 /// Область одного чата: список сообщений + поле ввода.
 struct ChatDetailView: View {
     @ObservedObject var vm: ChatViewModel
+    @ObservedObject var ragVM: RagViewModel
     @State private var showingSettings = false
     @State private var showingFacts = false
     @State private var showingMemory = false
     @State private var showingProjectPanel = false
     @State private var showingInvariants = false
     @State private var showingMCP = false
+    @State private var showingRag = false
     /// Черновик записи памяти (сохранение из сообщения / добавление вручную).
     @State private var memoryDraft: MemoryDraft?
     /// Черновик секции проекта (сохранение сообщения «В проект»).
@@ -452,6 +457,15 @@ struct ChatDetailView: View {
                 .help("MCP-серверы: инструменты для агентов (YouGile и т.п.)")
 
                 Button {
+                    showingRag = true
+                } label: {
+                    Image(systemName: "text.magnifyingglass")
+                        .foregroundStyle((vm.selectedChat?.settings.ragEnabled ?? false)
+                                         ? Color.accentColor : Color.secondary)
+                }
+                .help("RAG: локальная база знаний (индексация файлов/папок + ретрив в чате)")
+
+                Button {
                     showingMemory = true
                 } label: {
                     Image(systemName: "brain")
@@ -469,7 +483,10 @@ struct ChatDetailView: View {
             }
         }
         .sheet(isPresented: $showingSettings) {
-            ChatSettingsView(vm: vm, settings: settingsBinding)
+            ChatSettingsView(vm: vm, settings: settingsBinding, ragVM: ragVM)
+        }
+        .sheet(isPresented: $showingRag) {
+            RagPanelView(ragVM: ragVM)
         }
         .sheet(isPresented: $showingFacts) {
             FactsEditorView(text: vm.selectedChat?.facts ?? "") { edited in
@@ -1201,6 +1218,8 @@ struct ChatSettingsView: View {
     var showMemorySection: Bool = true
     /// Профиль ответа — на чат; в сравнении прячем.
     var showProfileSection: Bool = true
+    /// RAG (база знаний) — на чат; в сравнении не участвует (ragVM = nil → секция скрыта).
+    var ragVM: RagViewModel? = nil
     @Environment(\.dismiss) private var dismiss
 
     /// Стоп-последовательности редактируем как строку «через запятую».
@@ -1480,6 +1499,35 @@ struct ChatSettingsView: View {
                     Text(settings.autoProjectSections
                          ? "Вкл: содержательный ответ целиком добавляется секцией в привязанный проект (нужен проект)."
                          : "Выкл: ответы попадают в проект только вручную кнопкой «В проект».")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                }
+
+                if let ragVM {
+                Section("RAG · база знаний") {
+                    Toggle("Использовать ретрив из индекса", isOn: $settings.ragEnabled)
+                    if settings.ragEnabled {
+                        let ready = ragVM.indexes.filter { $0.isReady }
+                        Picker("Индекс", selection: $settings.ragIndexID) {
+                            Text("Не выбран").tag(UUID?.none)
+                            ForEach(ready) { ix in Text(ix.name).tag(Optional(ix.id)) }
+                        }
+                        Stepper(value: $settings.ragTopK, in: GenerationSettings.ragTopKRange) {
+                            HStack {
+                                Text("Фрагментов (top-K)")
+                                Spacer()
+                                Text("\(settings.ragTopK)")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                        if ready.isEmpty {
+                            Text("Пока нет готовых индексов. Создай индекс кнопкой «лупа» в шапке чата.")
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                    Text("Ретрив достаёт релевантные фрагменты из выбранного индекса и добавляет их в контекст запроса (под половину бюджета памяти) — ортогонально стратегии контекста. Индексами (выбор файла/папки, чанкинг, эмбеддинги) управляет панель RAG — иконка-лупа в шапке чата.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }

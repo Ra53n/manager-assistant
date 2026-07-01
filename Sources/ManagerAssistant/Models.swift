@@ -186,6 +186,14 @@ struct GenerationSettings: Equatable, Codable {
     /// Какие MCP-серверы активны в этом чате. Пусто = все enabled-серверы (удобный дефолт).
     var enabledMCPServerIDs: Set<UUID> = []
 
+    // MARK: RAG (локальная база знаний) — ортогонально памяти и стратегии контекста.
+    /// Подставлять ли в этот чат релевантные фрагменты из RAG-индекса (см. RagRetriever).
+    var ragEnabled: Bool = false
+    /// Выбранный индекс (nil — ничего не подставляем).
+    var ragIndexID: UUID? = nil
+    /// Сколько top-K фрагментов доставать и подставлять в контекст.
+    var ragTopK: Int = 4
+
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -196,6 +204,7 @@ struct GenerationSettings: Equatable, Codable {
     static let historyWindowRange = 4...50
     static let memoryTokenBudgetRange = 200...4000
     static let maxParallelAgentsRange = 2...6
+    static let ragTopKRange = 1...12
 
     enum CodingKeys: String, CodingKey {
         case provider, model, temperature, topP, maxTokens, stop, responseFormat
@@ -206,6 +215,7 @@ struct GenerationSettings: Equatable, Codable {
         case invariantValidation
         case swarmEnabled, maxParallelAgents
         case mcpEnabled, enabledMCPServerIDs
+        case ragEnabled, ragIndexID, ragTopK
     }
 }
 
@@ -237,6 +247,9 @@ extension GenerationSettings {
         maxParallelAgents = try c.decodeIfPresent(Int.self, forKey: .maxParallelAgents) ?? d.maxParallelAgents
         mcpEnabled = try c.decodeIfPresent(Bool.self, forKey: .mcpEnabled) ?? d.mcpEnabled
         enabledMCPServerIDs = try c.decodeIfPresent(Set<UUID>.self, forKey: .enabledMCPServerIDs) ?? d.enabledMCPServerIDs
+        ragEnabled = try c.decodeIfPresent(Bool.self, forKey: .ragEnabled) ?? d.ragEnabled
+        ragIndexID = try c.decodeIfPresent(UUID.self, forKey: .ragIndexID) ?? d.ragIndexID
+        ragTopK = try c.decodeIfPresent(Int.self, forKey: .ragTopK) ?? d.ragTopK
     }
 }
 
@@ -608,7 +621,7 @@ enum PipelinePrompts {
     }
 
     /// User-сообщение = структурный блок контекста (аналог тела `buildPrompt(query, ctx, profile, invariants)`).
-    static func buildPrompt(query: String, ctx: TaskContext, profile: String, invariants: [Invariant] = []) -> String {
+    static func buildPrompt(query: String, ctx: TaskContext, profile: String, invariants: [Invariant] = [], rag: String = "") -> String {
         func numbered(_ items: [String]) -> String {
             items.isEmpty ? "—"
                 : items.enumerated().map { "\($0.offset + 1). \($0.element)" }
@@ -636,6 +649,10 @@ enum PipelinePrompts {
             s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их в текущей стадии, приоритетно]\n"
                 + ctx.guidance.map { "- \($0)" }.joined(separator: "\n")
         }
+        // База знаний RAG (релевантные фрагменты по задаче) — как справочный контекст
+        // на всех генерирующих этапах. Блок уже сформирован RagRetriever под бюджет.
+        let ragBlock = rag.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ragBlock.isEmpty { s += "\n\n\(ragBlock)" }
         // Инварианты (ограничения) — агент ОБЯЗАН их учитывать. Этапу «Проверка» НЕ кладём
         // (он обсуждает нарушения по роли; см. systemPrompt). Соблюдение обеспечивают
         // генерирующие этапы (планирование/выполнение/ответ).
@@ -820,7 +837,7 @@ enum PipelinePrompts {
     static func subAgentPrompt(task: String, stepIndex: Int, plan: [String],
                                deps: Set<Int>, stepResults: [String],
                                profile: String, invariants: [Invariant] = [],
-                               guidance: [String] = []) -> String {
+                               guidance: [String] = [], rag: String = "") -> String {
         func numberedPlan() -> String {
             plan.isEmpty ? "—" : plan.enumerated()
                 .map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n           ")
@@ -852,6 +869,9 @@ enum PipelinePrompts {
             s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их, приоритетно]\n"
                 + guidance.map { "- \($0)" }.joined(separator: "\n")
         }
+        // База знаний RAG (узкий контекст задачи) — тот же блок, что и у основных этапов.
+        let ragBlock = rag.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ragBlock.isEmpty { s += "\n\n\(ragBlock)" }
         let invBlock = InvariantValidator.promptBlock(invariants)
         if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
         return s

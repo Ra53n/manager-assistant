@@ -193,6 +193,44 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   `Task{}`). Системный промпт НЕ форсирует краткость; в проекте
   `PromptBuilder(inProject:)` просит развёрнутые секции. В сравнении — ТОЛЬКО
   долговременная, read-only (`MemoryContext.assembleLongTermOnly`).
+- **Локальный RAG (база знаний) — pipeline индексации + ретрив в чате** — ОТДЕЛЬНЫЙ от
+  памяти слой: пользователь выбирает файл/папку → индексация (чанкинг → эмбеддинги →
+  векторный индекс) → при вопросе достаются релевантные чанки и дописываются к `memory:`
+  в `ChatViewModel.send()` (модель видит их как контекст). Всё в `Rag*.swift`, чистая
+  логика тестируется офлайн (`RagTests.swift`).
+  • **Слои**: `RagModels.swift` (Codable-типы `RagChunk`/`RagChunkMetadata`/`RagSource`/
+    `RagIndexConfig`/`RagIndexMeta` + enum'ы `ChunkingKind`/`EmbedderKind`/`IndexBackend`;
+    ручной `init(from:)`+дефолты, enum'ы декодируются снисходительно — как везде);
+    `RagChunking.swift` (≥2 стратегии по ТЗ: `FixedSizeChunker` размер+нахлёст и
+    `StructureChunker` по Markdown-заголовкам/разделам; чистые функции); `RagEmbedding.swift`
+    (`protocol Embedder` + `Vector` cosine/L2/normalize + `HashingEmbedder` детерм./тесты +
+    `NLLocalEmbedder` Apple NaturalLanguage офлайн + `OllamaEmbedder` HTTP `:11434`;
+    `RemoteEmbedder` — шов); `RagVectorIndex.swift`/`RagSQLiteIndex.swift` (`protocol
+    VectorIndexStore`: `JSONVectorIndex` дефолт, `FlatVectorIndex` бинарный аналог FAISS
+    IndexFlatL2, `SQLiteVectorIndex` через `import SQLite3` — системный модуль, БЕЗ
+    зависимости в Package.swift; поиск top-K общий — `Vector.topK`, brute-force косинус);
+    `RagStore.swift` (реестр `rag-indexes.json` + каталоги `rag/<id>/chunks.json`+`vectors.*`
+    в Application Support, `.corrupt.json`-фолбэк, ОТДЕЛЬНО от `$chats`-автосейва);
+    `RagPipeline.swift` (`RagIndexer.build` — enumerate→chunk→embed(батчи)→save→commit,
+    прогресс/отмена/краш-safety: `isReady=true` ТОЛЬКО после атомарной записи → недостроенный
+    индекс переживает краш «черновиком» и ретривом не берётся); `RagRetriever.swift`
+    (вопрос→embed→top-K→блок под бюджет `memoryTokenBudget/2`; ЛЮБАЯ ошибка → nil, ретрив
+    НИКОГДА не роняет `send()`); `RagViewModel.swift` (`@MainActor`, тонкий клиент + async
+    индексация, как `RoutinesViewModel`).
+  • **Эмбеддер выбирается на индекс** (`RagIndexConfig.embedder`, дефолт `.ollama`): Ollama —
+    лучшее качество (нужен `ollama serve` + `ollama pull nomic-embed-text`; для русского `bge-m3`;
+    панель проверяет доступность `OllamaEmbedder.isAvailable`); `.local` (Apple NL) — офлайн без
+    сервера; `.hashing` — детерминизм для тестов/фолбэк. Размерность и (для `.local`) язык
+    пиннятся в `RagIndexMeta` на момент индексации — ретрив берёт ТОТ ЖЕ эмбеддер, иначе не
+    совпадёт по размерности (guard → переиндексировать). Бэкенд хранилища — pluggable
+    (`VectorIndexes.make`), дефолт JSON (консистентно с приложением). Настоящий C++-FAISS НЕ
+    подключён (нет чистого SwiftPM-пакета) — `flat` честно называется «аналог IndexFlatL2».
+  • **UI**: панель `RagPanelView`/`RagIndexEditorView` (иконка-лупа `text.magnifyingglass`
+    в шапке чата; NSOpenPanel — единственный файл-пикер в проекте; стратегия/бэкенд/эмбеддер,
+    `ProgressView`, health-бейдж Ollama, «тестовый поиск» без LLM). Включение ретрива — per-chat
+    в `ChatSettingsView` (секция «RAG»: `ragEnabled`/`ragIndexID`/`ragTopK` в `GenerationSettings`).
+    Владелец списка — `@StateObject ragVM` в `ContentView` (общий на приложение). Ретрив в `send()`
+    ортогонален контекст-стратегиям (идёт в память, не в историю). В FSM/сравнении RAG нет (шов).
 - **Миграция chats.json/projects.json** — у Chat, GenerationSettings, Project,
   ProjectEntry, MemoryItem РУЧНЫЕ init(from:) в extension с decodeIfPresent+дефолтами.
   Новые поля добавлять ТОЛЬКО так (поле + CodingKeys + init(from:)), иначе старый
@@ -308,7 +346,7 @@ bash install.sh      # run.sh + установка в /Applications (так по
 
 # Тесты (юнит-тесты чистой логики FSM/роя/парсеров, таргет ManagerAssistantTests):
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer  # XCTest есть ТОЛЬКО в Xcode
-swift test           # 90+ тестов; CommandLineTools НЕ годится (нет модуля XCTest)
+swift test           # 120+ тестов; CommandLineTools НЕ годится (нет модуля XCTest)
 
 # Агент рутин (отдельный бэкенд, Node 20) — свои сборка/тесты, независимы от SwiftPM:
 cd agent && npm ci && npm run build && npm test   # Vitest, всё офлайн (55+ тестов)
@@ -330,8 +368,10 @@ cd agent && npm ci && npm run build && npm test   # Vitest, всё офлайн 
 2. `swift test` (под Xcode-тулчейном, см. «Сборка и запуск») — все тесты зелёные.
    Покрывают ЧИСТУЮ логику: таблицу переходов TaskFSM, планировщик волн роя
    (parseDeps/computeWaves), парсеры PipelinePrompts (план/вердикт/ASK_USER/смена
-   стадии/маркеры), миграцию Codable (новые поля + старый JSON без них). При правке
-   FSM/роя/парсеров — гонять тесты.
+   стадии/маркеры), миграцию Codable (новые поля + старый JSON без них), RAG
+   (`RagTests`: обе стратегии чанкинга, cosine/top-K на HashingEmbedder, round-trip
+   каждого бэкенда JSON/flat/SQLite, e2e `RagIndexer.build`). При правке
+   FSM/роя/парсеров/RAG — гонять тесты.
 3. `bash install.sh && open -a /Applications/ManagerAssistant.app` — поднять реальное приложение.
 4. UI-проверки делались через computer-use (скриншоты): отправить сообщение,
    проверить фичу глазами. У пользователя поверх поля ввода бывает невидимый
