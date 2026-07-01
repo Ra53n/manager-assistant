@@ -45,6 +45,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
     }
+
+    /// Глушим локальный Ollama, если поднимали его МЫ (ленивый запуск под RAG). Чужой/
+    /// официальный сервер не трогаем — он не наш (см. OllamaLauncher.stopIfSpawned).
+    func applicationWillTerminate(_ notification: Notification) {
+        OllamaLauncher.shared.stopIfSpawned()
+    }
 }
 
 @main

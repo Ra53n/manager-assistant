@@ -32,6 +32,10 @@ enum RagRetriever {
         guard !q.isEmpty,
               let meta = meta(for: indexID), meta.isReady, meta.chunkCount > 0 else { return [] }
         do {
+            // Ленивый запуск Ollama по требованию (как при индексации). Не поднялась → пусто.
+            if meta.config.embedder == .ollama {
+                guard await OllamaLauncher.shared.ensureRunning(baseURL: meta.config.ollamaBaseURL) else { return [] }
+            }
             let language: NLLanguage? = meta.embedLanguage.isEmpty ? nil : NLLanguage(meta.embedLanguage)
             let embedder = Embedders.make(meta.config, language: language)
             let queryVec = try await embedder.embedOne(q)

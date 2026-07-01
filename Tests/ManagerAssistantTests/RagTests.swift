@@ -261,6 +261,22 @@ final class RagTests: XCTestCase {
         XCTAssertFalse(without.contains("База знаний RAG"))
     }
 
+    // MARK: - OllamaLauncher (чистые помощники; спавн процесса не трогаем)
+
+    func testOllamaLauncherIsLocal() {
+        XCTAssertTrue(OllamaLauncher.isLocal("http://localhost:11434"))
+        XCTAssertTrue(OllamaLauncher.isLocal("http://127.0.0.1:11434"))
+        XCTAssertFalse(OllamaLauncher.isLocal("http://ollama.mysever.com:11434"))
+        XCTAssertFalse(OllamaLauncher.isLocal("http://192.168.1.50:11434"))
+    }
+
+    func testOllamaLauncherHostPort() {
+        XCTAssertEqual(OllamaLauncher.hostPort("http://localhost:11434"), "localhost:11434")
+        XCTAssertEqual(OllamaLauncher.hostPort("http://127.0.0.1:11500"), "127.0.0.1:11500")
+        // Без порта — дефолт 11434.
+        XCTAssertEqual(OllamaLauncher.hostPort("http://127.0.0.1"), "127.0.0.1:11434")
+    }
+
     // MARK: - End-to-end пайплайн (реальный RagIndexer.build → чтение обратно)
 
     /// Прогоняет весь пайплайн офлайн (эмбеддер .hashing): временная папка с двумя .md →

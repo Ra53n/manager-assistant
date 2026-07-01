@@ -83,6 +83,10 @@ final class RagViewModel: ObservableObject {
                     self.replace(built)
                     self.persist()
                     self.finish()
+                    // После индексации на Ollama сервер уже поднят — обновим бейдж на «доступна».
+                    if built.config.embedder == .ollama {
+                        self.checkOllama(baseURL: built.config.ollamaBaseURL)
+                    }
                 }
             } catch is CancellationError {
                 // Отмена — не ошибка: индекс остаётся «черновиком» (isReady=false).

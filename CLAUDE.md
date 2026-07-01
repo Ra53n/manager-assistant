@@ -218,8 +218,13 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     НИКОГДА не роняет `send()`); `RagViewModel.swift` (`@MainActor`, тонкий клиент + async
     индексация, как `RoutinesViewModel`).
   • **Эмбеддер выбирается на индекс** (`RagIndexConfig.embedder`, дефолт `.ollama`): Ollama —
-    лучшее качество (нужен `ollama serve` + `ollama pull nomic-embed-text`; для русского `bge-m3`;
-    панель проверяет доступность `OllamaEmbedder.isAvailable`); `.local` (Apple NL) — офлайн без
+    лучшее качество (`ollama pull nomic-embed-text`; для русского `bge-m3`; панель проверяет
+    доступность `OllamaEmbedder.isAvailable`). **Ленивый запуск сервера** (`RagOllamaLauncher.swift`):
+    Ollama НЕ крутится постоянно — `OllamaLauncher.ensureRunning` поднимает `ollama serve` (ищет
+    бинарь в `~/ollama-dist`/`/Applications/Ollama.app`/brew) ТОЛЬКО при индексации/ретриве
+    (`RagIndexer`/`RagRetriever`), а `AppDelegate.applicationWillTerminate`→`stopIfSpawned` глушит
+    его при выходе — но только тот процесс, что запустили МЫ (чужой/официальный не трогаем; уже
+    поднятый — переиспользуем, второй не плодим). `.local` (Apple NL) — офлайн без
     сервера; `.hashing` — детерминизм для тестов/фолбэк. Размерность и (для `.local`) язык
     пиннятся в `RagIndexMeta` на момент индексации — ретрив берёт ТОТ ЖЕ эмбеддер, иначе не
     совпадёт по размерности (guard → переиндексировать). Бэкенд хранилища — pluggable

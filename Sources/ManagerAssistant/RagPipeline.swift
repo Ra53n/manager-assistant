@@ -88,6 +88,13 @@ enum RagIndexer {
         for i in chunks.indices { chunks[i].ordinal = i }
 
         // 3. Эмбеддинги (батчами, последовательно — без гонок Sendable) -----------
+        // Ollama поднимаем ЛЕНИВО и только сейчас (по требованию): до этого сервер не крутится.
+        if config.embedder == .ollama {
+            progress(IndexProgress(phase: .enumerating, currentFile: "запуск Ollama…", fraction: 0.14))
+            guard await OllamaLauncher.shared.ensureRunning(baseURL: config.ollamaBaseURL) else {
+                throw EmbeddingError.ollamaUnavailable("сервер не запущен и не удалось запустить — установите Ollama или запустите `ollama serve`")
+            }
+        }
         let language = resolveLanguage(config: config, chunks: chunks)
         meta.embedLanguage = (config.embedder == .local) ? language.rawValue : ""
         let embedder = Embedders.make(config, language: language)

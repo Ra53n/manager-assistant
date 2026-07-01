@@ -308,7 +308,7 @@ struct RagIndexEditorView: View {
                     Button("Проверить") { ragVM.checkOllama(baseURL: config.ollamaBaseURL) }
                         .buttonStyle(.borderless)
                 }
-                Text("Нужен запущенный Ollama и стянутая модель: `brew install ollama` → `ollama pull nomic-embed-text`. Для русского лучше `bge-m3`.")
+                Text("Сервер поднимается автоматически при индексации/поиске (и глушится при выходе) — постоянно ничего не крутится. Нужна лишь установленная Ollama и стянутая модель: `ollama pull nomic-embed-text` (для русского лучше `bge-m3`). Бейдж «не запущена» до первого использования — это нормально.")
                     .font(.caption).foregroundColor(.secondary)
             } else if config.embedder == .local {
                 Text("On-device Apple NaturalLanguage: офлайн, без сервера и ключей. Качество ниже трансформерных эмбеддингов; язык определяется автоматически.")
