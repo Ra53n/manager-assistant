@@ -71,7 +71,7 @@ struct ContentView: View {
             ProviderKeysView(vm: vm)
         }
         .sheet(isPresented: $showingComparison) {
-            ComparisonView(vm: vm)
+            ComparisonView(vm: vm, ragVM: ragVM)
         }
         .sheet(isPresented: $creatingRoutine) { RoutineEditorView(vm: routinesVM, routine: nil) }
         .sheet(item: $editingRoutine) { r in RoutineEditorView(vm: routinesVM, routine: r) }

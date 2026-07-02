@@ -5,6 +5,12 @@
 // заполненные дорожки ПАРАЛЛЕЛЬНО (каждая со своим провайдером/ключом). Под
 // ответом — метрики (время, токены, стоимость), сверху колонки — её итоги.
 //
+// RAG per-lane: у каждой дорожки свой тумблер/индекс/topK (settings.ragEnabled и
+// друзья — те же поля GenerationSettings, что в обычном чате); ретрив мержится в
+// memory поверх долговременной памяти. Так один вопрос даёт ответы «без RAG» и
+// «с RAG» бок о бок (одна и та же модель в двух колонках — честное сравнение).
+// Индикатор-лупа в шапке колонки показывает, где RAG включён и какой индекс.
+//
 // Компакция дорожки повторяет логику ChatViewModel.maybeCompact (тот же
 // client.summarize), но на своей структуре Track.
 
@@ -89,11 +95,22 @@ final class ComparisonViewModel: ObservableObject {
             Task {
                 let start = Date()
                 do {
+                    // RAG per-lane: если у дорожки включён ретрив и выбран индекс — достаём
+                    // релевантные фрагменты и мержим с памятью (как в обычном чате). Ошибка
+                    // ретрива невозможна (retrieveBlock возвращает nil) — send не ломается.
+                    let ragBlock: String?
+                    if settings.ragEnabled, let ragID = settings.ragIndexID {
+                        ragBlock = await RagRetriever.retrieveBlock(
+                            indexID: ragID, query: text, topK: settings.ragTopK,
+                            budgetTokens: max(200, settings.memoryTokenBudget / 2))
+                    } else {
+                        ragBlock = nil
+                    }
                     let result = try await client.send(
                         messages: payload.tail,
                         settings: settings,
                         facts: payload.facts,
-                        memory: memoryText
+                        memory: ChatViewModel.mergeMemory(memoryText, ragBlock)
                     )
                     let duration = Date().timeIntervalSince(start)
                     let metrics = MessageMetrics(
@@ -172,6 +189,8 @@ final class ComparisonViewModel: ObservableObject {
 
 struct ComparisonView: View {
     @ObservedObject var vm: ChatViewModel          // для списка моделей и цен
+    /// RAG-индексы (для per-lane ретрива): секция в настройках дорожки + индикатор в шапке.
+    @ObservedObject var ragVM: RagViewModel
     @StateObject private var comp = ComparisonViewModel()
     @Environment(\.dismiss) private var dismiss
 
@@ -257,10 +276,17 @@ struct ComparisonView: View {
                     showModelSection: false,
                     allowBranching: false,
                     showMemorySection: false,
-                    showProfileSection: false
+                    showProfileSection: false,
+                    ragVM: ragVM        // per-lane RAG: тумблер/индекс/topK в секции «RAG»
                 )
             }
         }
+    }
+
+    /// Имя RAG-индекса по id (для индикатора в шапке дорожки).
+    private func ragIndexName(_ id: UUID?) -> String? {
+        guard let id else { return nil }
+        return ragVM.indexes.first(where: { $0.id == id })?.name
     }
 
     /// Ширина колонки: total/count, но не уже 300pt (тогда включается горизонтальный скролл).
@@ -292,6 +318,25 @@ struct ComparisonView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+
+                // Индикатор RAG дорожки: вкл — accent + имя индекса (видно на скриншотах,
+                // какая колонка «с RAG»). Тап открывает настройки дорожки (секция «RAG»).
+                Button { settingsTrack = IndexBox(value: i) } label: {
+                    HStack(spacing: 2) {
+                        Image(systemName: "text.magnifyingglass")
+                        if comp.tracks[i].settings.ragEnabled {
+                            Text(ragIndexName(comp.tracks[i].settings.ragIndexID) ?? "RAG")
+                                .font(.caption2)
+                                .lineLimit(1)
+                                .frame(maxWidth: 90)
+                        }
+                    }
+                    .foregroundStyle(comp.tracks[i].settings.ragEnabled ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(comp.tracks[i].settings.ragEnabled
+                      ? "RAG включён: \(ragIndexName(comp.tracks[i].settings.ragIndexID) ?? "индекс не выбран")"
+                      : "RAG выключен — включить в настройках дорожки")
 
                 Button { settingsTrack = IndexBox(value: i) } label: {
                     Image(systemName: "slider.horizontal.3")

@@ -235,7 +235,12 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     `ProgressView`, health-бейдж Ollama, «тестовый поиск» без LLM). Включение ретрива — per-chat
     в `ChatSettingsView` (секция «RAG»: `ragEnabled`/`ragIndexID`/`ragTopK` в `GenerationSettings`).
     Владелец списка — `@StateObject ragVM` в `ContentView` (общий на приложение). Ретрив в `send()`
-    ортогонален контекст-стратегиям (идёт в память, не в историю). В FSM/сравнении RAG нет (шов).
+    ортогонален контекст-стратегиям (идёт в память, не в историю). В FSM ретрив ЕСТЬ: один
+    RAG-блок на прогон (по тексту задачи) инжектится в `buildPrompt`/`subAgentPrompt` (параметр
+    `rag:`). В сравнении RAG ЕСТЬ per-lane: те же поля `settings.ragEnabled/ragIndexID/ragTopK`
+    у дорожки, секция «RAG» в настройках дорожки (`ChatSettingsView(ragVM:)`), ретрив мержится в
+    `memory` поверх долговременной памяти (`ComparisonViewModel.send`); индикатор-лупа в шапке
+    колонки. Одна модель в двух колонках (RAG вкл/выкл) = честное сравнение «с RAG / без RAG».
 - **Миграция chats.json/projects.json** — у Chat, GenerationSettings, Project,
   ProjectEntry, MemoryItem РУЧНЫЕ init(from:) в extension с decodeIfPresent+дефолтами.
   Новые поля добавлять ТОЛЬКО так (поле + CodingKeys + init(from:)), иначе старый
