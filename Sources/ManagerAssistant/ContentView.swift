@@ -30,9 +30,15 @@ import MarkdownUI
 
 /// Вкладки сайдбара: обычные чаты vs проекты (cowork).
 enum SidebarMode: String, CaseIterable, Identifiable {
-    case chats, projects
+    case chats, projects, routines
     var id: String { rawValue }
-    var label: String { self == .chats ? "Чаты" : "Проекты" }
+    var label: String {
+        switch self {
+        case .chats: return "Чаты"
+        case .projects: return "Проекты"
+        case .routines: return "Рутины"
+        }
+    }
 }
 
 struct ContentView: View {
@@ -40,6 +46,17 @@ struct ContentView: View {
     @State private var showingKeys = false
     @State private var showingComparison = false
     @State private var mode: SidebarMode = .chats
+
+    // Локальный RAG (база знаний): один экземпляр на приложение, список индексов общий.
+    @StateObject private var ragVM = RagViewModel()
+
+    // Вкладка «Рутины» (агент на VPS)
+    @StateObject private var routinesVM = RoutinesViewModel()
+    @State private var selectedRoutineID: String?
+    @State private var editingRoutine: Routine?
+    @State private var creatingRoutine = false
+    @State private var showingAgentConnection = false
+    @State private var showingAgentSettings = false
     @State private var showingCreateProject = false
     @State private var panelProjectID: UUID?              // открытая панель проекта
     @State private var expanded: Set<UUID> = []           // раскрытые проекты
@@ -54,8 +71,13 @@ struct ContentView: View {
             ProviderKeysView(vm: vm)
         }
         .sheet(isPresented: $showingComparison) {
-            ComparisonView(vm: vm)
+            ComparisonView(vm: vm, ragVM: ragVM)
         }
+        .sheet(isPresented: $creatingRoutine) { RoutineEditorView(vm: routinesVM, routine: nil) }
+        .sheet(item: $editingRoutine) { r in RoutineEditorView(vm: routinesVM, routine: r) }
+        .sheet(isPresented: $showingAgentConnection) { ConnectionSettingsView(vm: routinesVM) }
+        .sheet(isPresented: $showingAgentSettings) { AgentSettingsView(vm: routinesVM) }
+        .onChange(of: mode) { m in if m == .routines { Task { await enterRoutines() } } }
         .sheet(isPresented: $showingCreateProject) {
             ProjectCreateView { title, instructions in
                 let pid = vm.newProject(title: title, brief: instructions)
@@ -82,7 +104,11 @@ struct ContentView: View {
             .padding(8)
             Divider()
             Group {
-                if mode == .chats { chatsList } else { projectsList }
+                switch mode {
+                case .chats: chatsList
+                case .projects: projectsList
+                case .routines: routinesSidebar
+                }
             }
         }
         .frame(minWidth: 220)
@@ -98,17 +124,129 @@ struct ContentView: View {
                 }
                 .help("Ключи, сравнение моделей")
             }
+            // Действия агента рутин (только во вкладке «Рутины»).
+            if mode == .routines {
+                ToolbarItem {
+                    Menu {
+                        Button { showingAgentSettings = true } label: { Label("Настройки агента", systemImage: "gearshape") }
+                        Button { showingAgentConnection = true } label: { Label("Подключение к VPS", systemImage: "network") }
+                        Button { Task { await routinesVM.syncMcpServers(vm.mcpServers) } } label: { Label("Синхронизировать MCP", systemImage: "arrow.triangle.2.circlepath") }
+                        Button { Task { await routinesVM.refresh() } } label: { Label("Обновить", systemImage: "arrow.clockwise") }
+                    } label: {
+                        Image(systemName: "gearshape")
+                    }
+                    .help("Агент рутин: настройки, подключение, синхронизация MCP")
+                    .disabled(!routinesVM.isConfigured)
+                }
+            }
             // Одна заметная «+», контекст-зависимая.
             ToolbarItem {
                 Button {
-                    if mode == .chats { vm.newChat() } else { showingCreateProject = true }
+                    switch mode {
+                    case .chats: vm.newChat()
+                    case .projects: showingCreateProject = true
+                    case .routines: creatingRoutine = true
+                    }
                 } label: {
-                    Label(mode == .chats ? "Новый чат" : "Новый проект",
-                          systemImage: mode == .chats ? "square.and.pencil" : "folder.badge.plus")
+                    Label(newItemLabel, systemImage: newItemIcon)
                 }
-                .help(mode == .chats ? "Новый чат" : "Новый проект")
+                .help(newItemLabel)
+                .disabled(mode == .routines && !routinesVM.isConfigured)
             }
         }
+    }
+
+    private var newItemLabel: String {
+        switch mode {
+        case .chats: return "Новый чат"
+        case .projects: return "Новый проект"
+        case .routines: return "Новая рутина"
+        }
+    }
+    private var newItemIcon: String {
+        switch mode {
+        case .chats: return "square.and.pencil"
+        case .projects: return "folder.badge.plus"
+        case .routines: return "plus"
+        }
+    }
+
+    // MARK: Вкладка «Рутины»
+
+    @ViewBuilder private var routinesSidebar: some View {
+        if !routinesVM.isConfigured {
+            VStack(spacing: 10) {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.title2).foregroundStyle(.secondary)
+                Text("Подключение к VPS не настроено")
+                    .font(.callout).multilineTextAlignment(.center)
+                Button("Настроить подключение") { showingAgentConnection = true }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            .padding().frame(maxWidth: .infinity)
+        } else {
+            List(selection: $selectedRoutineID) {
+                if let s = routinesVM.settings, !s.hasLlmKey {
+                    Button { showingAgentSettings = true } label: {
+                        Label("LLM не настроен — задай ключ", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                    }.buttonStyle(.plain)
+                }
+                if routinesVM.routines.isEmpty {
+                    Text("Рутин пока нет. Нажми «+».")
+                        .font(.callout).foregroundColor(.secondary)
+                }
+                ForEach(routinesVM.routines) { r in
+                    RoutineRowView(vm: routinesVM, routine: r).tag(r.id)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private var routinesDetail: some View {
+        if !routinesVM.isConfigured {
+            VStack(spacing: 12) {
+                Image(systemName: "clock.arrow.2.circlepath").font(.largeTitle).foregroundStyle(.secondary)
+                Text("Рутины — агент на VPS").font(.title3.bold())
+                Text("Подключись к VPS, чтобы управлять рутинами и видеть результаты.")
+                    .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+                Button("Настроить подключение") { showingAgentConnection = true }.buttonStyle(.borderedProminent)
+            }
+            .frame(minWidth: 480, minHeight: 600)
+        } else if let id = selectedRoutineID, routinesVM.routines.contains(where: { $0.id == id }) {
+            RoutineDetailPane(vm: routinesVM, routineID: id, onEdit: { editingRoutine = $0 })
+                .id(id)
+                .overlay(alignment: .bottom) { routinesErrorBar }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "sidebar.left").font(.largeTitle).foregroundStyle(.tertiary)
+                Text("Выбери рутину слева или создай новую").foregroundStyle(.secondary)
+            }
+            .frame(minWidth: 480, minHeight: 600)
+            .overlay(alignment: .bottom) { routinesErrorBar }
+        }
+    }
+
+    @ViewBuilder private var routinesErrorBar: some View {
+        if let err = routinesVM.errorText {
+            HStack {
+                Image(systemName: "exclamationmark.octagon.fill").foregroundStyle(.red)
+                Text(err).font(.callout).lineLimit(2)
+                Spacer()
+                Button { routinesVM.errorText = nil } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+            }
+            .padding(10).background(.regularMaterial).cornerRadius(8)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.red.opacity(0.4)))
+            .padding(10)
+        }
+    }
+
+    /// При входе во вкладку «Рутины»: обновить данные и синхронизировать MCP из приложения.
+    private func enterRoutines() async {
+        guard routinesVM.isConfigured else { return }
+        await routinesVM.refresh()
+        await routinesVM.syncMcpServers(vm.mcpServers)
+        if selectedRoutineID == nil { selectedRoutineID = routinesVM.routines.first?.id }
     }
 
     // Список обычных чатов (без проекта).
@@ -191,8 +329,10 @@ struct ContentView: View {
 
     @ViewBuilder
     private var detail: some View {
-        if vm.selectedChat != nil {
-            ChatDetailView(vm: vm)
+        if mode == .routines {
+            routinesDetail
+        } else if vm.selectedChat != nil {
+            ChatDetailView(vm: vm, ragVM: ragVM)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: mode == .chats ? "bubble.left.and.bubble.right" : "folder")
@@ -215,11 +355,14 @@ private struct IDBox: Identifiable { let id: UUID }
 /// Область одного чата: список сообщений + поле ввода.
 struct ChatDetailView: View {
     @ObservedObject var vm: ChatViewModel
+    @ObservedObject var ragVM: RagViewModel
     @State private var showingSettings = false
     @State private var showingFacts = false
     @State private var showingMemory = false
     @State private var showingProjectPanel = false
     @State private var showingInvariants = false
+    @State private var showingMCP = false
+    @State private var showingRag = false
     /// Черновик записи памяти (сохранение из сообщения / добавление вручную).
     @State private var memoryDraft: MemoryDraft?
     /// Черновик секции проекта (сохранение сообщения «В проект»).
@@ -254,6 +397,8 @@ struct ChatDetailView: View {
             Divider()
             errorBar
             invariantConflictBar
+            stateChangeErrorBar
+            clarificationBar
             truncationBar
             pipelineModeBar
             inputBar
@@ -303,6 +448,24 @@ struct ChatDetailView: View {
                 .help("Инварианты: ограничения (стек/архитектура/бюджет/запреты/правила)")
 
                 Button {
+                    showingMCP = true
+                } label: {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .foregroundStyle((vm.selectedChat?.settings.mcpEnabled ?? false)
+                                         ? Color.accentColor : Color.secondary)
+                }
+                .help("MCP-серверы: инструменты для агентов (YouGile и т.п.)")
+
+                Button {
+                    showingRag = true
+                } label: {
+                    Image(systemName: "text.magnifyingglass")
+                        .foregroundStyle((vm.selectedChat?.settings.ragEnabled ?? false)
+                                         ? Color.accentColor : Color.secondary)
+                }
+                .help("RAG: локальная база знаний (индексация файлов/папок + ретрив в чате)")
+
+                Button {
                     showingMemory = true
                 } label: {
                     Image(systemName: "brain")
@@ -320,7 +483,10 @@ struct ChatDetailView: View {
             }
         }
         .sheet(isPresented: $showingSettings) {
-            ChatSettingsView(vm: vm, settings: settingsBinding)
+            ChatSettingsView(vm: vm, settings: settingsBinding, ragVM: ragVM)
+        }
+        .sheet(isPresented: $showingRag) {
+            RagPanelView(ragVM: ragVM)
         }
         .sheet(isPresented: $showingFacts) {
             FactsEditorView(text: vm.selectedChat?.facts ?? "") { edited in
@@ -332,6 +498,9 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingInvariants) {
             InvariantsPanelView(vm: vm)
+        }
+        .sheet(isPresented: $showingMCP) {
+            MCPServersPanelView(vm: vm)
         }
         .sheet(isPresented: $showingProjectPanel) {
             if let p = attachedProject {
@@ -372,38 +541,30 @@ struct ChatDetailView: View {
                     }
                     compactionBanner
                     memorySuggestionBanner
-                    ForEach(messages) { message in
-                        MessageBubble(
-                            message: message,
-                            onBranch: branchingActive ? {
-                                if let chatID = vm.selectedChatID {
-                                    vm.makeBranchFrom(chatID: chatID, messageID: message.id)
-                                }
-                            } : nil,
-                            onSaveToMemory: {
-                                let kind: MemoryKind = message.role == .user ? .note : .knowledge
-                                memoryDraft = MemoryDraft(item: MemoryItem(
-                                    scope: kind.defaultScope,
-                                    kind: kind,
-                                    text: message.content,
-                                    sourceChatID: vm.selectedChatID
-                                ))
-                            },
-                            onSaveToProject: attachedProject.map { project in
-                                {
-                                    projectDraft = ProjectEntryDraft(
-                                        entry: ProjectEntry(
-                                            title: ProjectEntry.deriveTitle(from: message.content),
-                                            body: message.content,
-                                            kind: message.role == .user ? .note : .knowledge,
-                                            sourceChatID: vm.selectedChatID),
-                                        projectID: project.id, isNew: true)
-                                }
-                            }
-                        )
-                        .id(message.id)
+                    ForEach(feedItems) { item in
+                        switch item {
+                        case .single(let message):
+                            messageBubble(message).id(message.id)
+                        case .wave(let id, let msgs):
+                            WaveTilesView(messages: msgs).id(msgs.last?.id ?? id)
+                        }
                     }
-                    if isLoading {
+                    // Живые плитки подагентов текущей волны роя (как в Claude Code).
+                    if let chat = vm.selectedChat, !chat.liveSubAgents.isEmpty {
+                        WaveTilesView(live: chat.liveSubAgents).id("live-wave")
+                    }
+                    // Диспетчер решает, что делать с репликой пользователя.
+                    if vm.selectedChat?.isDeciding == true {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Агент решает, что делать с вашим сообщением…")
+                                .foregroundColor(.secondary)
+                                .font(.callout)
+                        }
+                        .id("deciding")
+                    }
+                    // Обычный спиннер «печатает…» — скрываем, когда уже показаны живые плитки.
+                    if isLoading, (vm.selectedChat?.liveSubAgents.isEmpty ?? true), vm.selectedChat?.isDeciding != true {
                         HStack(spacing: 8) {
                             ProgressView().controlSize(.small)
                             Text("\(vm.selectedChat?.settings.model ?? "Модель") печатает…")
@@ -424,7 +585,74 @@ struct ChatDetailView: View {
             .onChange(of: vm.selectedChatID) { _ in
                 scrollToBottom(proxy)
             }
+            .onChange(of: vm.selectedChat?.liveSubAgents.map(\.status)) { _ in
+                scrollToBottom(proxy)
+            }
         }
+    }
+
+    /// Элемент ленты: обычное сообщение или группа волны роя (рендерится плитками).
+    enum FeedItem: Identifiable {
+        case single(ChatMessage)
+        case wave(id: UUID, [ChatMessage])
+        var id: UUID {
+            switch self {
+            case .single(let m): return m.id
+            case .wave(let id, _): return id
+            }
+        }
+    }
+
+    /// Группирует подряд идущие сообщения одной волны роя (общий waveGroupID, waveSize>1)
+    /// в `.wave`; остальные — `.single` (как раньше). Группа рвётся на любом не-волновом
+    /// сообщении или смене группы.
+    private var feedItems: [FeedItem] {
+        var out: [FeedItem] = []
+        for m in messages {
+            if let gid = m.waveGroupID, (m.waveSize ?? 1) > 1 {
+                if case .wave(let id, var arr)? = out.last, id == gid {
+                    arr.append(m)
+                    out[out.count - 1] = .wave(id: id, arr)
+                } else {
+                    out.append(.wave(id: gid, [m]))
+                }
+            } else {
+                out.append(.single(m))
+            }
+        }
+        return out
+    }
+
+    @ViewBuilder
+    private func messageBubble(_ message: ChatMessage) -> some View {
+        MessageBubble(
+            message: message,
+            onBranch: branchingActive ? {
+                if let chatID = vm.selectedChatID {
+                    vm.makeBranchFrom(chatID: chatID, messageID: message.id)
+                }
+            } : nil,
+            onSaveToMemory: {
+                let kind: MemoryKind = message.role == .user ? .note : .knowledge
+                memoryDraft = MemoryDraft(item: MemoryItem(
+                    scope: kind.defaultScope,
+                    kind: kind,
+                    text: message.content,
+                    sourceChatID: vm.selectedChatID
+                ))
+            },
+            onSaveToProject: attachedProject.map { project in
+                {
+                    projectDraft = ProjectEntryDraft(
+                        entry: ProjectEntry(
+                            title: ProjectEntry.deriveTitle(from: message.content),
+                            body: message.content,
+                            kind: message.role == .user ? .note : .knowledge,
+                            sourceChatID: vm.selectedChatID),
+                        projectID: project.id, isNew: true)
+                }
+            }
+        )
     }
 
     /// Плашка вверху ленты: сколько старых сообщений свёрнуто в саммари.
@@ -548,6 +776,75 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Баннер отказа в смене стадии (запрошенный переход запрещён таблицей)
+
+    @ViewBuilder
+    private var stateChangeErrorBar: some View {
+        if let chat = vm.selectedChat, let err = chat.stateChangeError {
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "arrow.triangle.swap")
+                    .foregroundColor(.orange)
+                Text(err)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button {
+                    if let id = vm.selectedChatID { vm.clearStateChangeError(chatID: id) }
+                } label: { Image(systemName: "xmark.circle.fill") }
+                .buttonStyle(.borderless)
+                .foregroundColor(.secondary.opacity(0.6))
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.orange.opacity(0.12))
+        }
+    }
+
+    // MARK: - Уточняющий вопрос агента (с вариантами ответа, как AskUserQuestion)
+
+    @ViewBuilder
+    private var clarificationBar: some View {
+        if let chat = vm.selectedChat, let run = chat.taskContext,
+           run.status == .awaitingInput, let pq = run.pendingQuestion {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "questionmark.bubble.fill")
+                        .foregroundColor(.accentColor)
+                    Text(pq.question)
+                        .fontWeight(.medium)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(pq.options.enumerated()), id: \.offset) { _, opt in
+                        Button {
+                            vm.answerClarification(chatID: chat.id, answer: opt)
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "circle")
+                                    .font(.caption2)
+                                    .foregroundColor(.accentColor)
+                                Text(opt)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                Text("Выбери вариант или ответь своим текстом в поле ниже.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .font(.caption)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.accentColor.opacity(0.10))
+        }
+    }
+
     // MARK: - Ветвление: панель веток над лентой
 
     @ViewBuilder
@@ -624,6 +921,24 @@ struct ChatDetailView: View {
                             .font(.caption2)
                             .foregroundColor(.accentColor)
                             .help("Текущий шаг плана")
+                    }
+                    // Рой: индикатор параллельной волны (несколько подагентов разом).
+                    if run.state == .execution, chat.settings.swarmEnabled,
+                       run.waveIndex < run.waves.count, run.waves[run.waveIndex].count > 1 {
+                        Text("рой ×\(run.waves[run.waveIndex].count)")
+                            .font(.caption2)
+                            .foregroundColor(.purple)
+                            .help("Параллельно работают \(run.waves[run.waveIndex].count) подагентов (волна \(run.waveIndex + 1)/\(run.waves.count))")
+                    }
+                    // MCP: инструменты доступны агентам на этом прогоне.
+                    if chat.settings.mcpEnabled {
+                        let n = vm.effectiveMCPServers(for: chat.settings).count
+                        if n > 0 {
+                            Text("🔧×\(n)")
+                                .font(.caption2)
+                                .foregroundColor(.teal)
+                                .help("Агентам доступны инструменты \(n) MCP-сервер(ов)")
+                        }
                     }
                     if run.executionRetries > 0 {
                         Text("↻\(run.executionRetries)")
@@ -710,6 +1025,12 @@ struct ChatDetailView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Перепланировать заново")
+            case .awaitingInput:
+                HStack(spacing: 3) {
+                    Image(systemName: "questionmark.circle.fill").foregroundColor(.accentColor)
+                    Text("Ждёт ответа").foregroundColor(.accentColor)
+                }
+                .help("Агент задал вопрос — выбери вариант ниже или ответь в поле ввода")
             case .paused:
                 Button { vm.resumePipeline(chatID: chat.id) } label: {
                     Label("Продолжить", systemImage: "play.fill")
@@ -736,6 +1057,35 @@ struct ChatDetailView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Шаг назад: вернуться к планированию")
+            }
+            // Меню «→ этап»: переход активен ТОЛЬКО если он легален по таблице И этап-источник
+            // реально выполнен (нельзя «перепрыгнуть» через невыполненный этап). Серые —
+            // с пояснением почему (недопустим / этап ещё не завершён).
+            if run.status != .finished {
+                Menu {
+                    ForEach(TaskState.allCases.filter { $0 != run.state }) { st in
+                        let ok = run.canTransition(to: st)
+                        let reason = run.transitionBlockReason(to: st)
+                        Button {
+                            vm.requestStateChange(chatID: chat.id, to: st)
+                        } label: {
+                            if ok {
+                                Text("В «\(st.label)»")
+                            } else if let reason {
+                                Text("В «\(st.label)» — \(reason)")
+                            } else {
+                                Text("В «\(st.label)» — недоступно")
+                            }
+                        }
+                        .disabled(!ok)
+                    }
+                } label: {
+                    Label("этап", systemImage: "arrow.triangle.swap")
+                }
+                .menuStyle(.button)
+                .buttonStyle(.borderless)
+                .fixedSize()
+                .help("Сменить стадию (вперёд — только если предыдущий этап выполнен)")
             }
             Button { vm.cancelRun(chatID: chat.id) } label: {
                 Image(systemName: "xmark.circle.fill")
@@ -796,28 +1146,28 @@ struct ChatDetailView: View {
 
     // MARK: - Поле ввода
 
+    /// Плейсхолдер поля ввода: при активном прогоне FSM подсказывает, что сообщение —
+    /// уточнение/ответ/смена стадии, а не новый запуск.
+    private var inputPlaceholder: String {
+        guard let run = vm.selectedChat?.taskContext, run.status != .finished else { return "Сообщение…" }
+        switch run.status {
+        case .awaitingInput: return "Ответь на вопрос или выбери вариант выше…"
+        case .awaitingPlan:  return "Правки к плану…"
+        default:             return "Уточнение к текущему этапу (или «вернись к проверке»)…"
+        }
+    }
+
     private var inputBar: some View {
         HStack(alignment: .bottom, spacing: 10) {
-            // Поле в ScrollView: TextField растёт без ограничения, контейнер
-            // ограничивает высоту до inputMaxHeight и даёт скролл колесом мыши.
-            // (TextField с lineLimit обрезал, но колёсиком не скроллился — только
-            // переходом курсора по тексту.)
-            ScrollView(.vertical) {
-                TextField("Сообщение…", text: $vm.input, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.body)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        GeometryReader { geo in
-                            Color.clear.preference(key: InputHeightKey.self, value: geo.size.height)
-                        }
-                    )
-                    .onSubmit(vm.send)
-            }
+            // Поле ввода: Enter отправляет, Shift+Enter — перенос (NSTextView-обёртка,
+            // см. GrowingTextView). Авто-высота клэмпится min…max, дальше — скролл.
+            GrowingTextEditor(
+                text: $vm.input,
+                placeholder: inputPlaceholder,
+                onSubmit: { if vm.canSend { vm.send() } },
+                measuredHeight: $inputContentHeight
+            )
             .frame(height: min(max(Self.inputMinHeight, inputContentHeight), Self.inputMaxHeight))
-            // Пока текст влезает — скролл выключен (нет лишнего «отскока»).
-            .scrollDisabled(inputContentHeight <= Self.inputMaxHeight)
-            .onPreferenceChange(InputHeightKey.self) { inputContentHeight = $0 }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(
@@ -868,6 +1218,8 @@ struct ChatSettingsView: View {
     var showMemorySection: Bool = true
     /// Профиль ответа — на чат; в сравнении прячем.
     var showProfileSection: Bool = true
+    /// RAG (база знаний) — на чат; в сравнении не участвует (ragVM = nil → секция скрыта).
+    var ragVM: RagViewModel? = nil
     @Environment(\.dismiss) private var dismiss
 
     /// Стоп-последовательности редактируем как строку «через запятую».
@@ -1041,7 +1393,53 @@ struct ChatSettingsView: View {
                             Text(m.label).tag(m)
                         }
                     }
-                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskContext.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент.")
+                    Text("Обычный — обычный чат без конвейера. Авто — задача проходит этапы план → выполнение → проверка → ответ автоматически (каждый этап — отдельный запрос; последний этап «Ответ» — это сам ответ на задачу). План — после планирования останавливается на «Принять план», как в Claude Code. Проверка при «не выполнено» возвращает к выполнению (до \(TaskContext.maxExecutionRetries) раз). Паузу/продолжение можно жать в любой момент. На паузе можно дослать уточнение (агент доработает текущий этап) или попросить сменить стадию («→ этап» / текстом).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("Рой агентов (параллельное выполнение)") {
+                    Toggle("Распараллеливать независимые шаги", isOn: $settings.swarmEnabled)
+                    if settings.swarmEnabled {
+                        Stepper(value: $settings.maxParallelAgents,
+                                in: GenerationSettings.maxParallelAgentsRange) {
+                            HStack {
+                                Text("Макс. подагентов в волне")
+                                Spacer()
+                                Text("\(settings.maxParallelAgents)")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                    }
+                    Text("На этапе «Выполнение» независимые шаги плана выполняются параллельно подагентами со своим узким контекстом (только их зависимости) — быстрее и экономнее по токенам. Зависимые шаги идут по порядку (планировщик указывает зависимости, шаги раскладываются по волнам). Выкл — последовательное выполнение с полным контекстом, как раньше.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Section("MCP-инструменты (для агентов)") {
+                    Toggle("Дать агентам доступ к инструментам MCP-серверов", isOn: $settings.mcpEnabled)
+                    if settings.mcpEnabled {
+                        let active = vm.effectiveMCPServers(for: settings)
+                        if active.isEmpty {
+                            Text("Нет включённых серверов. Добавь их через кнопку «гаечный ключ» в шапке чата.")
+                                .font(.caption).foregroundColor(.orange)
+                        } else {
+                            ForEach(active) { srv in
+                                HStack {
+                                    Image(systemName: "wrench.and.screwdriver.fill")
+                                        .foregroundColor(.teal).font(.caption)
+                                    Text(srv.name.isEmpty ? "(без имени)" : srv.name)
+                                    Spacer()
+                                    if let st = vm.mcpStatuses[srv.id] {
+                                        Text(st.connected ? "\(st.toolCount) инстр." : "ошибка")
+                                            .font(.caption).foregroundColor(st.connected ? .secondary : .orange)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Text("Когда включено (по умолчанию), агент может вызывать инструменты подключённых MCP-серверов (например, читать/менять задачи в YouGile) — и в обычном чате, и на всех этапах конвейера (план → выполнение → проверка → ответ). Реальные вызовы происходят только если есть включённый сервер. Управление серверами — кнопка «гаечный ключ» в шапке.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1101,6 +1499,63 @@ struct ChatSettingsView: View {
                     Text(settings.autoProjectSections
                          ? "Вкл: содержательный ответ целиком добавляется секцией в привязанный проект (нужен проект)."
                          : "Выкл: ответы попадают в проект только вручную кнопкой «В проект».")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                }
+
+                if let ragVM {
+                Section("RAG · база знаний") {
+                    Toggle("Использовать ретрив из индекса", isOn: $settings.ragEnabled)
+                    if settings.ragEnabled {
+                        let ready = ragVM.indexes.filter { $0.isReady }
+                        Picker("Индекс", selection: $settings.ragIndexID) {
+                            Text("Не выбран").tag(UUID?.none)
+                            ForEach(ready) { ix in Text(ix.name).tag(Optional(ix.id)) }
+                        }
+                        Stepper(value: $settings.ragCandidateK, in: GenerationSettings.ragCandidateKRange) {
+                            HStack {
+                                Text("Кандидатов из индекса")
+                                Spacer()
+                                Text("\(settings.ragCandidateK)")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                        Stepper(value: $settings.ragTopK, in: GenerationSettings.ragTopKRange) {
+                            HStack {
+                                Text("Фрагментов в контекст (top-K)")
+                                Spacer()
+                                Text("\(settings.ragTopK)")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
+                        HStack {
+                            Text("Порог релевантности")
+                            Slider(value: $settings.ragMinScore, in: GenerationSettings.ragMinScoreRange, step: 0.05)
+                            Text(settings.ragMinScore <= 0 ? "выкл" : String(format: "%.2f", settings.ragMinScore))
+                                .foregroundColor(.secondary)
+                                .monospacedDigit()
+                                .frame(width: 38, alignment: .trailing)
+                        }
+                        Text("Кандидаты с косинусной близостью ниже порога отбрасываются (0 — фильтр выключен; разумные значения 0.3–0.5). Если порог отсёк всех — фрагменты не подставляются.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Toggle("LLM-переранжирование кандидатов", isOn: $settings.ragRerankEnabled)
+                        Text("Вкл: модель чата одним доп. запросом сортирует кандидатов по релевантности и оставляет top-K лучших (точнее порога, но дороже). Ошибка запроса → порядок по score.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Toggle("Переформулировать вопрос для поиска", isOn: $settings.ragQueryRewrite)
+                        Text("Модель переписывает вопрос в самодостаточный поисковый запрос (раскрывает «он»/«это» по последним репликам). Ошибка → ищем по исходному вопросу.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Toggle("Строгий режим: источники + «не знаю»", isOn: $settings.ragStrictMode)
+                        Text("Вкл: ответ строится только по базе знаний, в конце — раздел «Источники» (файл · раздел · № фрагмента + цитата). Если ничего релевантного не нашлось — модель обязана сказать «не знаю» и задать уточняющий вопрос. Выкл: фрагменты — просто дополнительный контекст.")
+                            .font(.caption).foregroundColor(.secondary)
+                        if ready.isEmpty {
+                            Text("Пока нет готовых индексов. Создай индекс кнопкой «лупа» в шапке чата.")
+                                .font(.caption).foregroundColor(.orange)
+                        }
+                    }
+                    Text("Ретрив достаёт релевантные фрагменты из выбранного индекса и добавляет их в контекст запроса (под половину бюджета памяти) — ортогонально стратегии контекста. Индексами (выбор файла/папки, чанкинг, эмбеддинги) управляет панель RAG — иконка-лупа в шапке чата.")
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -1964,6 +2419,211 @@ struct InvariantEditorView: View {
     }
 }
 
+// MARK: - MCP-серверы (панель / редактор / импорт)
+
+/// Панель управления MCP-серверами: список с статусом подключения, тест, добавление
+/// (вручную / шаблон YouGile / импорт конфига Claude), правка, удаление.
+struct MCPServersPanelView: View {
+    @ObservedObject var vm: ChatViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var editTarget: MCPServer?
+    @State private var showingImport = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("MCP-серверы").font(.headline)
+                Spacer()
+                Button { editTarget = MCPServer.youGileTemplate() } label: {
+                    Label("YouGile", systemImage: "square.grid.2x2")
+                }
+                .help("Шаблон удалённого YouGile (вставь свой токен)")
+                Button { showingImport = true } label: { Label("Импорт", systemImage: "doc.on.clipboard") }
+                    .help("Вставить конфиг в стиле Claude (mcpServers)")
+                Button { editTarget = MCPServer() } label: { Label("Новый", systemImage: "plus") }
+                Button("Готово") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Серверы") {
+                    if vm.mcpServers.isEmpty {
+                        Text("Пока нет серверов. «YouGile» — готовый шаблон; «Импорт» — вставить блок mcpServers из конфига Claude; «Новый» — вручную.")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    ForEach(vm.mcpServers) { srv in row(srv) }
+                }
+                Section {
+                    Text("Сервер запускается как подпроцесс: /usr/bin/env <command> <args…>. Так работают и локальные серверы (node …), и удалённые через мост npx -y mcp-remote <url> --header \"Authorization: Bearer …\". Включи «MCP-инструменты» в ⚙ настройках чата, чтобы агенты могли вызывать инструменты. Конфиг и секреты хранятся в mcp-servers.json (вне репозитория).")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 640, height: 600)
+        .sheet(item: $editTarget) { srv in
+            MCPServerEditorView(server: srv) { edited in
+                if vm.mcpServers.contains(where: { $0.id == edited.id }) { vm.updateMCPServer(edited) }
+                else { vm.addMCPServer(edited) }
+            }
+        }
+        .sheet(isPresented: $showingImport) {
+            MCPImportView { json in
+                let n = vm.importMCPConfig(json)
+                return n
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ srv: MCPServer) -> some View {
+        let status = vm.mcpStatuses[srv.id]
+        HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(dotColor(status, enabled: srv.enabled))
+                .frame(width: 9, height: 9)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(srv.name.isEmpty ? "(без имени)" : srv.name).fontWeight(.medium)
+                    if !srv.enabled {
+                        Text("выкл").font(.caption2).foregroundColor(.secondary)
+                    }
+                }
+                Text(([srv.command] + srv.args).joined(separator: " "))
+                    .font(.caption).foregroundColor(.secondary).lineLimit(2)
+                if let st = status {
+                    if st.connected {
+                        Text("подключён · \(st.toolCount) инструм.")
+                            .font(.caption2).foregroundColor(.green)
+                    } else if let err = st.error {
+                        Text(err).font(.caption2).foregroundColor(.orange).lineLimit(3)
+                    }
+                }
+            }
+            Spacer()
+            Button("Тест") { vm.testMCPServer(srv) }.buttonStyle(.borderless)
+            Button("Править") { editTarget = srv }.buttonStyle(.borderless)
+            Button { vm.removeMCPServer(id: srv.id) } label: { Image(systemName: "trash") }
+                .buttonStyle(.borderless).foregroundColor(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func dotColor(_ status: MCPServerStatus?, enabled: Bool) -> Color {
+        guard enabled else { return .secondary }
+        guard let s = status else { return .gray }
+        return s.connected ? .green : .orange
+    }
+}
+
+/// Редактор одного MCP-сервера (имя, команда, аргументы, env, доп. PATH).
+struct MCPServerEditorView: View {
+    @State var server: MCPServer
+    let onSave: (MCPServer) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var argsText = ""
+    @State private var envText = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("MCP-сервер").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Сохранить") {
+                    server.args = parseLines(argsText)
+                    server.env = parseEnv(envText)
+                    onSave(server); dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Сервер") {
+                    TextField("Имя", text: $server.name, prompt: Text("yougile"))
+                    TextField("Команда", text: $server.command, prompt: Text("npx / node"))
+                    Toggle("Включён", isOn: $server.enabled)
+                }
+                Section("Аргументы — по одному на строку") {
+                    TextEditor(text: $argsText)
+                        .frame(minHeight: 110).font(.system(.body, design: .monospaced))
+                    Text("Напр.: -y / mcp-remote / https://…/mcp / --header / Authorization: Bearer …")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Section("Переменные окружения — KEY=VALUE на строку") {
+                    TextEditor(text: $envText)
+                        .frame(minHeight: 70).font(.system(.body, design: .monospaced))
+                    Text("Для локального YouGile: YOUGILE_API_KEY=…")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+                Section("Доп. PATH (через ‘:’) — если node/npx не находится") {
+                    TextField("PATH", text: $server.extraPATH, prompt: Text("/opt/homebrew/bin"))
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 600, height: 600)
+        .onAppear {
+            argsText = server.args.joined(separator: "\n")
+            envText = server.env.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "\n")
+        }
+    }
+
+    private func parseLines(_ s: String) -> [String] {
+        s.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+    private func parseEnv(_ s: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for line in s.split(whereSeparator: \.isNewline) {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard let eq = t.firstIndex(of: "=") else { continue }
+            let k = String(t[..<eq]).trimmingCharacters(in: .whitespaces)
+            let v = String(t[t.index(after: eq)...]).trimmingCharacters(in: .whitespaces)
+            if !k.isEmpty { out[k] = v }
+        }
+        return out
+    }
+}
+
+/// Лист импорта конфига в стиле Claude (вставка JSON-блока mcpServers).
+struct MCPImportView: View {
+    let onImport: (String) -> Int
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+    @State private var note: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Импорт конфига Claude").font(.headline)
+                Spacer()
+                Button("Отмена") { dismiss() }
+                Button("Добавить") {
+                    let n = onImport(text)
+                    if n > 0 { dismiss() } else { note = "Не нашёл серверов в блоке mcpServers." }
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding()
+            Divider()
+            Form {
+                Section("Вставь JSON (как в Claude Desktop)") {
+                    TextEditor(text: $text)
+                        .frame(minHeight: 240).font(.system(.body, design: .monospaced))
+                    if let note { Text(note).font(.caption).foregroundColor(.orange) }
+                    Text("{\n  \"mcpServers\": {\n    \"yougile\": { \"command\": \"npx\", \"args\": [\"-y\", \"mcp-remote\", \"https://…/mcp\", \"--header\", \"Authorization: Bearer …\"] }\n  }\n}")
+                        .font(.caption2).foregroundColor(.secondary).textSelection(.enabled)
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(width: 620, height: 480)
+    }
+}
+
 /// Лист создания проекта: только название + необязательные инструкции.
 /// Никакого «ИИ предлагает бриф» — назвал и сразу пишешь.
 struct ProjectCreateView: View {
@@ -2147,6 +2807,100 @@ private struct BubbleContent: View, Equatable {
                 .stroke(Color.gray.opacity(isUser ? 0 : 0.25), lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+/// Рой агентов — ряд компактных плиток-подагентов (как в Claude Code): каждая плитка =
+/// один подагент шага со статусом (⟳ работает / ✓ готово / ✗ ошибка); клик по плитке
+/// раскрывает её вывод ПОД рядом. Источник — живые плитки волны (`live`) или
+/// историческая группа сообщений волны (`messages`).
+struct WaveTilesView: View {
+    private struct Tile: Identifiable {
+        let id: Int            // индекс шага
+        let title: String
+        let status: LiveSubAgent.Status
+        let output: String
+    }
+    private let tiles: [Tile]
+    private let isLive: Bool
+    @State private var expanded: Int?
+
+    init(live agents: [LiveSubAgent]) {
+        isLive = true
+        tiles = agents.map { Tile(id: $0.id, title: $0.title, status: $0.status, output: $0.output) }
+    }
+    init(messages: [ChatMessage]) {
+        isLive = false
+        tiles = messages.enumerated().map { (k, m) in
+            Tile(id: m.step ?? k, title: WaveTilesView.shortLabel(m.content), status: .done, output: m.content)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "square.grid.2x2.fill").foregroundColor(.purple).font(.caption)
+                Text("Рой агентов · \(tiles.count)")
+                    .font(.caption).fontWeight(.medium).foregroundColor(.secondary)
+                if isLive, tiles.contains(where: { $0.status == .running }) {
+                    Text("· работают параллельно")
+                        .font(.caption2).foregroundColor(.secondary.opacity(0.7))
+                }
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(tiles) { tile($0) }
+                }
+                .padding(.bottom, 2)
+            }
+            if let sel = expanded, let t = tiles.first(where: { $0.id == sel }) {
+                BubbleContent(content: t.output.isEmpty ? "…" : t.output, isUser: false)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func tile(_ tile: Tile) -> some View {
+        let isSel = expanded == tile.id
+        Button {
+            guard tile.status != .running else { return }     // пока работает — раскрывать нечего
+            expanded = isSel ? nil : tile.id
+        } label: {
+            HStack(spacing: 6) {
+                statusIcon(tile.status)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Шаг \(tile.id + 1)").font(.caption2).foregroundColor(.secondary)
+                    Text(tile.title).font(.caption).lineLimit(1)
+                }
+                Image(systemName: isSel ? "chevron.up" : "chevron.down")
+                    .font(.caption2).foregroundColor(.secondary.opacity(0.5))
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            .frame(width: 190, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(isSel ? Color.purple.opacity(0.12) : Color(nsColor: .windowBackgroundColor)))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.gray.opacity(0.25), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
+        .help(tile.status == .running ? "Подагент работает…" : "Открыть/свернуть вывод подагента")
+    }
+
+    @ViewBuilder
+    private func statusIcon(_ s: LiveSubAgent.Status) -> some View {
+        switch s {
+        case .running: ProgressView().controlSize(.mini)
+        case .done:    Image(systemName: "checkmark.circle.fill").foregroundColor(.green).font(.caption)
+        case .failed:  Image(systemName: "xmark.circle.fill").foregroundColor(.orange).font(.caption)
+        }
+    }
+
+    private static func shortLabel(_ content: String) -> String {
+        let line = content.split(whereSeparator: \.isNewline).first.map(String.init) ?? content
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? "шаг" : String(trimmed.prefix(40))
     }
 }
 

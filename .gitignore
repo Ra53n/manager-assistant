@@ -10,6 +10,11 @@ DerivedData/
 Secrets.swift
 Secrets.plist
 
+# Локальные файлы с личными данными (RAG-бенчмарк по личной базе и т.п.)
+*.local.md
+*.local.json
+*.local.py
+
 # Icon working files
 *.iconset/
 

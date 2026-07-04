@@ -76,6 +76,23 @@ struct DeepSeekClient {
         )
     }
 
+    /// То же, но с переопределением temperature/maxTokens (для дешёвых служебных
+    /// запросов — например, диспетчера переходов: короткий ответ, низкая температура).
+    func runPhase(systemPrompt: String, userMessage: String, settings: GenerationSettings,
+                  temperature: Double, maxTokens: Int) async throws -> SendResult {
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: systemPrompt),
+            .init(role: ChatRole.user.rawValue, content: userMessage),
+        ]
+        return try await post(
+            payloadMessages: payloadMessages,
+            settings: settings,
+            temperature: temperature,
+            maxTokens: maxTokens,
+            stop: []
+        )
+    }
+
     /// Доп. запрос-валидатор инвариантов: проверяет ОТВЕТ на список ограничений и
     /// возвращает нарушенные (парсит строки «НАРУШЕН: <название>»). Best-effort.
     func checkInvariants(response: String, invariants: [Invariant], settings: GenerationSettings) async throws -> [InvariantViolation] {
@@ -260,6 +277,29 @@ struct DeepSeekClient {
                               temperature: 0.2, maxTokens: 32, stop: [])
     }
 
+    /// RAG: переписывает вопрос в самодостаточный поисковый запрос (query rewrite).
+    /// Best-effort: промпт/парсер — в RagRerank, ошибка вызова гасится вызывающим
+    /// (фолбэк на исходный вопрос — ретрив никогда не роняет отправку).
+    func rewriteRagQuery(question: String, history: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: RagRerank.rewriteSystemPrompt),
+            .init(role: ChatRole.user.rawValue, content: RagRerank.rewriteUserPrompt(question: question, history: history)),
+        ]
+        return try await post(payloadMessages: payloadMessages, settings: settings,
+                              temperature: 0.1, maxTokens: 128, stop: [])
+    }
+
+    /// RAG: переранжирование кандидатов одним запросом (LLM как аналог cross-encoder).
+    /// Возвращает сырой текст («3,1,5» / «0»); разбор — RagRerank.parseRerankIndices.
+    func rerankChunks(query: String, candidates: [String], settings: GenerationSettings) async throws -> SendResult {
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: RagRerank.rerankSystemPrompt),
+            .init(role: ChatRole.user.rawValue, content: RagRerank.rerankUserPrompt(query: query, candidates: candidates)),
+        ]
+        return try await post(payloadMessages: payloadMessages, settings: settings,
+                              temperature: 0.0, maxTokens: 64, stop: [])
+    }
+
     /// «Собрать»: сшивает ПОЛНЫЕ тела секций проекта в единый итоговый документ.
     func assembleProject(title: String, brief: String, entries: [ProjectEntry], settings: GenerationSettings) async throws -> SendResult {
         let system = """
@@ -284,7 +324,89 @@ struct DeepSeekClient {
                               temperature: 0.3, maxTokens: max(settings.maxTokens, 4096), stop: [])
     }
 
-    /// Общий POST chat/completions для send() и summarize().
+    /// Один шаг FSM с доступом к инструментам MCP (tool-calling). Гоняет агентный
+    /// цикл: запрос с `tools` → если модель вернула tool_calls, исполняем каждый
+    /// через `execute` (роутится в MCPManager), добавляем assistant-сообщение с
+    /// вызовами + сообщения role=tool с результатами, повторяем — до `maxIterations`.
+    /// На последней итерации форсируем текстовый ответ (tool_choice=none). Токены
+    /// со всех итераций суммируются. Клиент НЕ знает про MCP — только замыкание.
+    func runPhaseWithTools(
+        systemPrompt: String,
+        userMessage: String,
+        settings: GenerationSettings,
+        tools: [ChatRequest.Tool],
+        maxIterations: Int = 6,
+        execute: @Sendable (_ name: String, _ argsJSON: String) async -> String
+    ) async throws -> ToolLoopResult {
+        let messages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: systemPrompt),
+            .init(role: ChatRole.user.rawValue, content: userMessage),
+        ]
+        return try await runToolLoop(messages: messages, settings: settings, tools: tools,
+                                     maxIterations: maxIterations, execute: execute)
+    }
+
+    /// Обычный чат С инструментами (tool-loop поверх системного промпта + истории).
+    /// Аналог send(), но модель может вызывать инструменты MCP перед ответом.
+    func sendWithTools(messages: [ChatMessage], settings: GenerationSettings,
+                       summary: String? = nil, facts: String? = nil, memory: String? = nil,
+                       inProject: Bool = false, profile: String? = nil,
+                       tools: [ChatRequest.Tool], maxIterations: Int = 6,
+                       execute: @Sendable (_ name: String, _ argsJSON: String) async -> String
+    ) async throws -> ToolLoopResult {
+        var payload: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: PromptBuilder.systemPrompt(for: settings, summary: summary, facts: facts, memory: memory, inProject: inProject, profile: profile))
+        ]
+        payload.append(contentsOf: messages.map { .init(role: $0.role.rawValue, content: $0.content) })
+        return try await runToolLoop(messages: payload, settings: settings, tools: tools,
+                                     maxIterations: maxIterations, execute: execute)
+    }
+
+    /// Ядро агентного tool-loop: запрос с `tools` → если модель вернула tool_calls,
+    /// исполняем через `execute`, добавляем assistant+tool сообщения, повторяем — до
+    /// `maxIterations`; на последней итерации форсируем текст (tool_choice=none).
+    private func runToolLoop(
+        messages initial: [ChatRequest.RequestMessage],
+        settings: GenerationSettings,
+        tools: [ChatRequest.Tool],
+        maxIterations: Int,
+        execute: @Sendable (_ name: String, _ argsJSON: String) async -> String
+    ) async throws -> ToolLoopResult {
+        var messages = initial
+        var pTok = 0, cTok = 0, tTok = 0
+        var transcript: [ToolCallRecord] = []
+
+        for iter in 0..<max(1, maxIterations) {
+            let isLast = (iter == max(1, maxIterations) - 1)
+            let resp = try await postRaw(
+                messages: messages, settings: settings,
+                temperature: settings.temperature, maxTokens: settings.maxTokens,
+                stop: settings.stop, tools: tools,
+                toolChoice: isLast ? "none" : "auto")
+            if let u = resp.usage { pTok += u.prompt_tokens; cTok += u.completion_tokens; tTok += u.total_tokens }
+            guard let msg = resp.choices.first?.message else { throw DeepSeekError.emptyResponse }
+
+            let calls = msg.tool_calls ?? []
+            if calls.isEmpty || isLast {
+                let text = msg.content ?? ""
+                guard !text.isEmpty else { throw DeepSeekError.emptyResponse }
+                return ToolLoopResult(text: text, promptTokens: pTok, completionTokens: cTok,
+                                      totalTokens: tTok, transcript: transcript)
+            }
+
+            // Модель просит инструменты: фиксируем её сообщение, исполняем, отвечаем.
+            messages.append(.init(role: ChatRole.assistant.rawValue, content: msg.content, tool_calls: calls))
+            for call in calls {
+                let out = await execute(call.function.name, call.function.arguments)
+                transcript.append(ToolCallRecord(name: call.function.name, ok: !out.hasPrefix("ERROR")))
+                messages.append(.init(role: ChatRole.tool.rawValue, content: out, tool_call_id: call.id))
+            }
+        }
+        // Недостижимо (isLast обрабатывается выше), но компилятору нужен возврат.
+        throw DeepSeekError.emptyResponse
+    }
+
+    /// Общий POST chat/completions для send()/runPhase()/служебных запросов.
     private func post(
         payloadMessages: [ChatRequest.RequestMessage],
         settings: GenerationSettings,
@@ -292,6 +414,32 @@ struct DeepSeekClient {
         maxTokens: Int,
         stop: [String]
     ) async throws -> SendResult {
+        let decoded = try await postRaw(
+            messages: payloadMessages, settings: settings,
+            temperature: temperature, maxTokens: maxTokens, stop: stop,
+            tools: nil, toolChoice: nil)
+        guard let text = decoded.choices.first?.message.content, !text.isEmpty else {
+            throw DeepSeekError.emptyResponse
+        }
+        return SendResult(
+            text: text,
+            promptTokens: decoded.usage?.prompt_tokens ?? 0,
+            completionTokens: decoded.usage?.completion_tokens ?? 0,
+            totalTokens: decoded.usage?.total_tokens ?? 0
+        )
+    }
+
+    /// HTTP-ядро: строит ChatRequest (с инструментами или без), POST, декодирует
+    /// ChatResponse. Единая точка для текстовых и tool-calling запросов.
+    private func postRaw(
+        messages: [ChatRequest.RequestMessage],
+        settings: GenerationSettings,
+        temperature: Double,
+        maxTokens: Int,
+        stop: [String],
+        tools: [ChatRequest.Tool]?,
+        toolChoice: String?
+    ) async throws -> ChatResponse {
         let provider = settings.provider
         let key = KeyStore.key(for: provider)
         guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
@@ -300,12 +448,14 @@ struct DeepSeekClient {
         let model = settings.model.isEmpty ? Config.model : settings.model
         let body = ChatRequest(
             model: model,
-            messages: payloadMessages,
+            messages: messages,
             stream: false,
             temperature: temperature,
             top_p: settings.topP,
             max_tokens: maxTokens,
-            stop: stop.isEmpty ? nil : stop
+            stop: stop.isEmpty ? nil : stop,
+            tools: (tools?.isEmpty ?? true) ? nil : tools,
+            tool_choice: toolChoice
         )
 
         var request = URLRequest(url: url)
@@ -331,16 +481,7 @@ struct DeepSeekClient {
             throw DeepSeekError.badStatus(code: http.statusCode, message: message)
         }
 
-        let decoded = try JSONDecoder().decode(ChatResponse.self, from: data)
-        guard let text = decoded.choices.first?.message.content, !text.isEmpty else {
-            throw DeepSeekError.emptyResponse
-        }
-        return SendResult(
-            text: text,
-            promptTokens: decoded.usage?.prompt_tokens ?? 0,
-            completionTokens: decoded.usage?.completion_tokens ?? 0,
-            totalTokens: decoded.usage?.total_tokens ?? 0
-        )
+        return try JSONDecoder().decode(ChatResponse.self, from: data)
     }
 
     /// Загружает модели провайдера (id + цены, если они есть в /models).

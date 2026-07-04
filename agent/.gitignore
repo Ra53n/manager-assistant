@@ -1,0 +1,23 @@
+# Зависимости и сборка
+node_modules/
+dist/
+
+# Данные сервиса (БД рутин/прогонов) — никогда не коммитим
+data/
+*.db
+*.db-shm
+*.db-wal
+
+# Секреты — только пример в репозитории; реальные значения на VPS в /etc/manager-agent.env
+*.env
+.env
+!deploy/manager-agent.env.example
+
+# Локальные координаты инстанса (конкретные адрес/домен) — НЕ на GitHub.
+# Шаблон instance.example.md коммитится; instance.local.md — нет.
+*.local.md
+
+# Прочее
+*.log
+.DS_Store
+coverage/

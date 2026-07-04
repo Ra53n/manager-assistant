@@ -66,6 +66,14 @@ enum InvariantStore {
     static func save(_ invariants: [Invariant]) { saveJSON(invariants, to: fileURL) }
 }
 
+/// MCP-серверы (конфиг в стиле Claude: command/args/env) — mcp-servers.json.
+/// ОТДЕЛЬНО от диалога (chats.json). Содержит секреты в args/env → вне репозитория.
+enum MCPServerStore {
+    static var fileURL: URL { appSupportFile("mcp-servers.json") }
+    static func load() -> [MCPServer] { loadJSON([MCPServer].self, from: fileURL) ?? [] }
+    static func save(_ servers: [MCPServer]) { saveJSON(servers, to: fileURL) }
+}
+
 /// Проекты (контейнеры рабочей памяти: бриф + полнотекстовые секции).
 enum ProjectStore {
     static var fileURL: URL { appSupportFile("projects.json") }

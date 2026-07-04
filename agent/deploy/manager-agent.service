@@ -1,0 +1,37 @@
+# systemd-юнит сервиса-агента рутин. deploy.sh ставит копию в
+# /etc/systemd/system/manager-agent.service. Зеркалит подход yougile-mcp.service.
+# Сервис слушает 127.0.0.1:3100; наружу — только через Caddy (/agent/*).
+
+[Unit]
+Description=Manager Assistant — агент рутин (REST API + планировщик 24/7)
+After=network-online.target yougile-mcp.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=manageragent
+Group=manageragent
+EnvironmentFile=/etc/manager-agent.env
+WorkingDirectory=/opt/manager-agent
+# HOME/кэш для дочерних процессов (агент спавнит `npx mcp-remote …` как MCP-серверы;
+# без записываемого HOME/npm-кэша npx падает → «Connection closed»).
+Environment=HOME=/opt/manager-agent
+Environment=XDG_CACHE_HOME=/opt/manager-agent/.cache
+Environment=npm_config_cache=/opt/manager-agent/.npm
+ExecStart=/usr/bin/node /opt/manager-agent/dist/index.js
+Restart=on-failure
+RestartSec=5
+
+# Усиление безопасности (как у yougile-mcp.service)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+# БД рутин/прогонов — единственный путь на запись
+ReadWritePaths=/opt/manager-agent/data
+
+[Install]
+WantedBy=multi-user.target

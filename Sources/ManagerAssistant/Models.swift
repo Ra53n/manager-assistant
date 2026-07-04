@@ -20,6 +20,8 @@ enum ChatRole: String, Codable {
     case system
     case user
     case assistant
+    /// Результат вызова инструмента (tool-calling): сообщение с role=tool.
+    case tool
 }
 
 /// Метрики ответа модели (для сравнения скорости и стоимости).
@@ -48,6 +50,9 @@ struct ChatMessage: Identifiable, Codable {
     var state: TaskState? = nil
     var step: Int? = nil
     var total: Int? = nil
+    /// Группа волны роя (см. MsgNode.waveGroupID): общие у параллельных шагов одной волны.
+    var waveGroupID: UUID? = nil
+    var waveSize: Int? = nil
 }
 
 /// Стратегия управления контекстом (по ТЗ).
@@ -167,6 +172,39 @@ struct GenerationSettings: Equatable, Codable {
     /// off — только промпт; code — вхождение запрещённых слов; llm — доп. запрос; both.
     var invariantValidation: InvariantValidationMode = .code
 
+    /// Рой агентов (FSM): на этапе «Выполнение» независимые шаги плана выполняются
+    /// ПАРАЛЛЕЛЬНО подагентами со своим узким контекстом (экономия токенов/времени).
+    /// По умолчанию ВКЛ. Зависимые шаги всё равно идут по порядку (топосортировка волн).
+    var swarmEnabled: Bool = true
+    /// Максимум одновременно работающих подагентов в одной волне.
+    var maxParallelAgents: Int = 3
+
+    /// MCP-инструменты: дать агентам доступ к инструментам подключённых MCP-серверов
+    /// (см. MCPClient.swift) — и в конвейере FSM, и в обычном чате. По умолчанию ВКЛ.
+    /// Реальные вызовы происходят только если есть хотя бы один enabled-сервер.
+    var mcpEnabled: Bool = true
+    /// Какие MCP-серверы активны в этом чате. Пусто = все enabled-серверы (удобный дефолт).
+    var enabledMCPServerIDs: Set<UUID> = []
+
+    // MARK: RAG (локальная база знаний) — ортогонально памяти и стратегии контекста.
+    /// Подставлять ли в этот чат релевантные фрагменты из RAG-индекса (см. RagRetriever).
+    var ragEnabled: Bool = false
+    /// Выбранный индекс (nil — ничего не подставляем).
+    var ragIndexID: UUID? = nil
+    /// Сколько top-K фрагментов подставлять в контекст (ПОСЛЕ фильтрации/реранка).
+    var ragTopK: Int = 4
+    /// Сколько кандидатов доставать из векторного индекса ДО фильтрации/переранжирования.
+    var ragCandidateK: Int = 20
+    /// Порог косинусной близости: кандидаты со score ниже отбрасываются. 0 = фильтр выключен.
+    var ragMinScore: Double = 0.0
+    /// Второй этап: LLM-переранжирование кандидатов моделью чата (доп. запрос, точнее, но дороже).
+    var ragRerankEnabled: Bool = false
+    /// Переформулировать вопрос в самодостаточный поисковый запрос перед ретривом (LLM).
+    var ragQueryRewrite: Bool = true
+    /// Строгий grounded-режим: ответ только по базе, в конце — раздел «Источники»
+    /// (файл · раздел · #чанк + цитата); ниже порога — обязательное «не знаю» + уточнение.
+    var ragStrictMode: Bool = true
+
     static let `default` = GenerationSettings()
 
     /// Диапазоны/границы для UI.
@@ -176,6 +214,10 @@ struct GenerationSettings: Equatable, Codable {
     static let maxStopCount = 16
     static let historyWindowRange = 4...50
     static let memoryTokenBudgetRange = 200...4000
+    static let maxParallelAgentsRange = 2...6
+    static let ragTopKRange = 1...12
+    static let ragCandidateKRange = 4...50
+    static let ragMinScoreRange = 0.0...0.9
 
     enum CodingKeys: String, CodingKey {
         case provider, model, temperature, topP, maxTokens, stop, responseFormat
@@ -184,6 +226,10 @@ struct GenerationSettings: Equatable, Codable {
         case memoryAssistEnabled, autoMemory, autoProjectSections
         case pipelineMode
         case invariantValidation
+        case swarmEnabled, maxParallelAgents
+        case mcpEnabled, enabledMCPServerIDs
+        case ragEnabled, ragIndexID, ragTopK
+        case ragCandidateK, ragMinScore, ragRerankEnabled, ragQueryRewrite, ragStrictMode
     }
 }
 
@@ -211,6 +257,18 @@ extension GenerationSettings {
         autoProjectSections = try c.decodeIfPresent(Bool.self, forKey: .autoProjectSections) ?? d.autoProjectSections
         pipelineMode = try c.decodeIfPresent(PipelineMode.self, forKey: .pipelineMode) ?? d.pipelineMode
         invariantValidation = try c.decodeIfPresent(InvariantValidationMode.self, forKey: .invariantValidation) ?? d.invariantValidation
+        swarmEnabled = try c.decodeIfPresent(Bool.self, forKey: .swarmEnabled) ?? d.swarmEnabled
+        maxParallelAgents = try c.decodeIfPresent(Int.self, forKey: .maxParallelAgents) ?? d.maxParallelAgents
+        mcpEnabled = try c.decodeIfPresent(Bool.self, forKey: .mcpEnabled) ?? d.mcpEnabled
+        enabledMCPServerIDs = try c.decodeIfPresent(Set<UUID>.self, forKey: .enabledMCPServerIDs) ?? d.enabledMCPServerIDs
+        ragEnabled = try c.decodeIfPresent(Bool.self, forKey: .ragEnabled) ?? d.ragEnabled
+        ragIndexID = try c.decodeIfPresent(UUID.self, forKey: .ragIndexID) ?? d.ragIndexID
+        ragTopK = try c.decodeIfPresent(Int.self, forKey: .ragTopK) ?? d.ragTopK
+        ragCandidateK = try c.decodeIfPresent(Int.self, forKey: .ragCandidateK) ?? d.ragCandidateK
+        ragMinScore = try c.decodeIfPresent(Double.self, forKey: .ragMinScore) ?? d.ragMinScore
+        ragRerankEnabled = try c.decodeIfPresent(Bool.self, forKey: .ragRerankEnabled) ?? d.ragRerankEnabled
+        ragQueryRewrite = try c.decodeIfPresent(Bool.self, forKey: .ragQueryRewrite) ?? d.ragQueryRewrite
+        ragStrictMode = try c.decodeIfPresent(Bool.self, forKey: .ragStrictMode) ?? d.ragStrictMode
     }
 }
 
@@ -316,10 +374,10 @@ enum TaskState: String, Codable, CaseIterable, Identifiable {
 /// «детерминизм на уровне кода» (аналог `val transitions = mapOf(...)`).
 enum TaskFSM {
     static let transitions: [TaskState: [TaskState]] = [
-        .planning:   [.execution],                 // только вперёд
-        .execution:  [.validation, .planning],     // вперёд ИЛИ шаг назад (перепланировать)
-        .validation: [.answer, .execution],        // вперёд ИЛИ шаг назад (переделать)
-        .answer:     []                             // терминал
+        .planning:   [.execution],                       // только вперёд
+        .execution:  [.validation, .planning],           // вперёд ИЛИ шаг назад (перепланировать)
+        .validation: [.answer, .execution, .planning],   // вперёд / переделать выполнение / перепланировать
+        .answer:     []                                  // терминал
     ]
 
     /// Разрешён ли переход from → to по таблице.
@@ -332,6 +390,7 @@ enum TaskFSM {
 enum TaskRunStatus: String, Codable {
     case running       // этап в полёте (есть активный Task)
     case awaitingPlan  // план готов, ждём «Принять план» (только режим .plan)
+    case awaitingInput // агент задал уточняющий вопрос — ждём ответ пользователя
     case paused        // пользователь поставил паузу / отмена / перезапуск в середине
     case failed        // этап упал с ошибкой (не отмена)
     case finished      // дошли до Готово (терминал)
@@ -340,6 +399,27 @@ enum TaskRunStatus: String, Codable {
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
         self = TaskRunStatus(rawValue: raw) ?? .paused
+    }
+}
+
+/// Уточняющий вопрос агента с вариантами ответа (как AskUserQuestion в Claude Code).
+/// Агент выводит его, когда для корректной работы не хватает данных; пользователь
+/// выбирает вариант (или пишет свой), после чего прогон продолжается с той же стадии.
+struct PendingQuestion: Codable, Equatable {
+    var question: String = ""
+    var options: [String] = []
+
+    enum CodingKeys: String, CodingKey { case question, options }
+
+    init(question: String, options: [String]) {
+        self.question = question
+        self.options = options
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        question = try c.decodeIfPresent(String.self, forKey: .question) ?? ""
+        options = try c.decodeIfPresent([String].self, forKey: .options) ?? []
     }
 }
 
@@ -367,6 +447,14 @@ struct TaskContext: Codable, Identifiable {
     var planFeedback: String = ""         // правки к плану (кнопка/маркер REPLAN)
     var invariantRetries: Int = 0         // перегенерации текущего ответа из-за нарушения инвариантов
     var invariantViolations: [String] = [] // нарушения для прокидывания в retry-промпт
+    // --- интерактивность (пауза/уточнения, см. ChatViewModel.interject/answerClarification) ---
+    var guidance: [String] = []           // уточнения пользователя, прокидываются в промпт текущей стадии
+    var pendingQuestion: PendingQuestion? = nil  // заданный агентом вопрос (status == .awaitingInput)
+    // --- рой агентов (параллельное выполнение независимых шагов) ---
+    var waves: [[Int]] = []               // волны выполнения: группы индексов шагов, выполнимых параллельно
+    var waveIndex: Int = 0                // текущая волна (для возобновления)
+    var stepResults: [String] = []        // результаты по индексу шага (для зависимостей подагентов)
+    var stepDeps: [[Int]] = []            // зависимости по индексу шага (какие шаги нужны как вход)
     var errorText: String? = nil
     var startedAt: Date = Date()
 
@@ -380,6 +468,8 @@ struct TaskContext: Codable, Identifiable {
         case mode, status, validationResult, validationPassed, answer
         case executionRetries, planRetries, planFeedback, errorText, startedAt
         case invariantRetries, invariantViolations
+        case guidance, pendingQuestion
+        case waves, waveIndex, stepResults, stepDeps
     }
 }
 
@@ -412,6 +502,12 @@ extension TaskContext {
         planFeedback = try c.decodeIfPresent(String.self, forKey: .planFeedback) ?? ""
         invariantRetries = try c.decodeIfPresent(Int.self, forKey: .invariantRetries) ?? 0
         invariantViolations = try c.decodeIfPresent([String].self, forKey: .invariantViolations) ?? []
+        guidance = try c.decodeIfPresent([String].self, forKey: .guidance) ?? []
+        pendingQuestion = try c.decodeIfPresent(PendingQuestion.self, forKey: .pendingQuestion)
+        waves = try c.decodeIfPresent([[Int]].self, forKey: .waves) ?? []
+        waveIndex = try c.decodeIfPresent(Int.self, forKey: .waveIndex) ?? 0
+        stepResults = try c.decodeIfPresent([String].self, forKey: .stepResults) ?? []
+        stepDeps = try c.decodeIfPresent([[Int]].self, forKey: .stepDeps) ?? []
         errorText = try c.decodeIfPresent(String.self, forKey: .errorText)
         startedAt = try c.decodeIfPresent(Date.self, forKey: .startedAt) ?? Date()
     }
@@ -426,6 +522,36 @@ extension TaskContext {
         c.state = target
         return c
     }
+
+    /// Можно ли ВРУЧНУЮ перейти в `target`: легально по таблице И предыдущий этап реально
+    /// произвёл результат. Нельзя «перепрыгнуть» через невыполненный этап (нет плана →
+    /// нет выполнения; нет выполнения → нет проверки; нет проверки → нет ответа). Шаги
+    /// НАЗАД (переделать/перепланировать) — всегда можно. Источник истины «этап выполнен»
+    /// — артефакты контекста (plan/done/validationResult).
+    func canTransition(to target: TaskState) -> Bool {
+        TaskFSM.allows(state, to: target) && transitionBlockReason(to: target) == nil
+    }
+
+    /// Причина, по которой ВПЕРЁД-переход недоступен (nil — доступен либо это шаг назад).
+    func transitionBlockReason(to target: TaskState) -> String? {
+        switch (state, target) {
+        case (.planning, .execution):
+            return plan.isEmpty
+                ? "сначала нужно построить план — этап «Планирование» ещё не дал результата"
+                : nil
+        case (.execution, .validation):
+            if plan.isEmpty { return "нет плана для выполнения" }
+            return done.count >= plan.count
+                ? nil
+                : "сначала нужно выполнить все шаги — «Выполнение» ещё не завершено (\(done.count)/\(plan.count))"
+        case (.validation, .answer):
+            return validationResult.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "сначала нужно пройти «Проверку» — она ещё не дала результат"
+                : nil
+        default:
+            return nil   // шаги назад (execution→planning, validation→execution/planning) — всегда
+        }
+    }
 }
 
 /// Сборка промптов из контекста — «уровень кода»: ЧТО делает модель на каждом
@@ -434,16 +560,55 @@ extension TaskContext {
 enum PipelinePrompts {
     static let nextStepMarker = "NEXT_STEP"   // модель сообщает: текущий шаг выполнен
     static let replanMarker   = "REPLAN"      // модель сообщает: план непригоден, нужен возврат
+    static let askUserMarker  = "ASK_USER"    // модель просит уточнение у пользователя
 
-    /// Системный промпт = РОЛЬ этапа.
-    static func systemPrompt(for state: TaskState) -> String {
+    /// Клауза про уточняющий вопрос (как AskUserQuestion в Claude Code): добавляется в
+    /// роль планировщика/исполнителя — спрашивай вместо догадок, если данных не хватает.
+    static let askUserClause = """
+    Если для корректной работы НЕ ХВАТАЕТ данных и любое продолжение было бы догадкой — \
+    НЕ угадывай. Вместо ответа выведи блок РОВНО в таком виде и остановись:
+    \(askUserMarker)
+    QUESTION: <один короткий вопрос>
+    OPTION: <вариант 1>
+    OPTION: <вариант 2>
+    (2–4 варианта). Выводи этот блок ТОЛЬКО при реальной нехватке данных, не злоупотребляй.
+    """
+
+    /// Системный промпт стадии = ОГРАНИЧЕНИЯ (если есть) + РОЛЬ этапа. Инварианты идут
+    /// ПЕРВЫМИ и в системном промпте (а не только в user-сообщении) — модель сильнее их
+    /// соблюдает. `swarm` — просить у планировщика зависимости шагов.
+    /// ВАЖНО: этапу «Проверка» блок инвариантов НЕ кладём — его дело сверять план/DONE,
+    /// а не флагать ограничения (иначе он выводит маркер-конфликт и его отчёт уходит «в ответ»).
+    static func systemPrompt(for state: TaskState, swarm: Bool = false, invariants: [Invariant] = []) -> String {
+        let role = rolePrompt(for: state, swarm: swarm)
+        guard state != .validation else { return role }
+        let inv = InvariantValidator.promptBlock(invariants)
+        return inv.isEmpty ? role : inv + "\n\n" + role
+    }
+
+    /// Роль этапа (без инвариантов).
+    private static func rolePrompt(for state: TaskState, swarm: Bool) -> String {
         switch state {
         case .planning:
-            return """
+            var s = """
             Ты — планировщик. По задаче из [QUERY] составь чёткий пошаговый план: \
             пронумерованные шаги (1., 2., 3., …), каждый шаг — одно конкретное \
-            действие, без воды. Не выполняй задачу — только спланируй. Верни ТОЛЬКО план.
+            действие по сути задачи, без воды. Не выполняй задачу — только спланируй. \
+            НЕ добавляй служебных/протокольных шагов (например «заверши ответ строкой …», \
+            «выведи маркер») — только содержательные действия. Верни ТОЛЬКО план.
             """
+            if swarm {
+                s += "\n\n" + """
+                После плана ОБЯЗАТЕЛЬНО добавь раздел зависимостей в формате:
+                ЗАВИСИМОСТИ:
+                <номер шага>: <номера шагов, от которых он зависит через запятую>
+                Указывай ТОЛЬКО реальные зависимости по данным/порядку. Независимые шаги \
+                не перечисляй (или пиши «<номер>: -») — они будут выполнены параллельно. \
+                Стремись к максимальной параллельности: не вводи лишних зависимостей.
+                """
+            }
+            s += "\n\n" + askUserClause
+            return s
         case .execution:
             return """
             Ты — исполнитель. Выполни ТОЛЬКО текущий шаг [CURRENT] (НЕ весь план сразу). \
@@ -451,6 +616,8 @@ enum PipelinePrompts {
             шага. Когда шаг выполнен — заверши ответ ОТДЕЛЬНОЙ ПОСЛЕДНЕЙ строкой \
             «\(nextStepMarker)». Если по ходу стало ясно, что план непригоден и нужно \
             перепланировать — вместо этого заверши ответ строкой «\(replanMarker)».
+
+            \(askUserClause)
             """
         case .validation:
             return """
@@ -473,7 +640,7 @@ enum PipelinePrompts {
     }
 
     /// User-сообщение = структурный блок контекста (аналог тела `buildPrompt(query, ctx, profile, invariants)`).
-    static func buildPrompt(query: String, ctx: TaskContext, profile: String, invariants: [Invariant] = []) -> String {
+    static func buildPrompt(query: String, ctx: TaskContext, profile: String, invariants: [Invariant] = [], rag: String = "") -> String {
         func numbered(_ items: [String]) -> String {
             items.isEmpty ? "—"
                 : items.enumerated().map { "\($0.offset + 1). \($0.element)" }
@@ -493,14 +660,32 @@ enum PipelinePrompts {
         - Работай только в рамках текущего шага [CURRENT]; не перепрыгивай этапы и шаги.
         - Если текущий шаг выполнен — заверши ответ строкой «\(nextStepMarker)».
         - Если план непригоден — заверши ответ строкой «\(replanMarker)».
+        - \(transitionRulesLine(from: ctx.state))
         """
-        // Инварианты (ограничения) — агент ОБЯЗАН их учитывать и отказывать в нарушениях.
-        let invBlock = InvariantValidator.promptBlock(invariants)
-        if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        // Уточнения пользователя (на паузе/в ходе прогона) — учесть в ТЕКУЩЕЙ стадии,
+        // НЕ начиная заново. Это самые приоритетные указания.
+        if !ctx.guidance.isEmpty {
+            s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их в текущей стадии, приоритетно]\n"
+                + ctx.guidance.map { "- \($0)" }.joined(separator: "\n")
+        }
+        // База знаний RAG (релевантные фрагменты по задаче) — как справочный контекст
+        // на всех генерирующих этапах. Блок уже сформирован RagRetriever под бюджет.
+        let ragBlock = rag.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ragBlock.isEmpty { s += "\n\n\(ragBlock)" }
+        // Инварианты (ограничения) — агент ОБЯЗАН их учитывать. Этапу «Проверка» НЕ кладём
+        // (он обсуждает нарушения по роли; см. systemPrompt). Соблюдение обеспечивают
+        // генерирующие этапы (планирование/выполнение/ответ).
+        if ctx.state != .validation {
+            let invBlock = InvariantValidator.promptBlock(invariants)
+            if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        }
         // Уже выявленные нарушения инвариантов — исправить в перегенерации.
         if !ctx.invariantViolations.isEmpty {
-            s += "\n\n[НАРУШЕНЫ ИНВАРИАНТЫ — ИСПРАВЬ, перегенерируй без нарушений]\n"
+            s += "\n\n[ТЫ НАРУШИЛ ОГРАНИЧЕНИЯ — ПЕРЕГЕНЕРИРУЙ ПОЛНОСТЬЮ БЕЗ НИХ]\n"
                 + ctx.invariantViolations.map { "- \($0)" }.joined(separator: "\n")
+                + "\nЗамени запрещённое разрешёнными альтернативами и НЕ упоминай запрещённые "
+                + "термины ВООБЩЕ — ни одного вхождения (даже в сравнениях/скобках/пояснениях). "
+                + "Дай полноценный ответ по сути запроса на допустимых альтернативах."
         }
         // Замечания проверки прокидываем в повтор выполнения.
         let v = ctx.validationResult.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -515,16 +700,28 @@ enum PipelinePrompts {
         return s
     }
 
-    /// Текст плана → список шагов: снимает нумерацию/маркеры; пустой план → весь текст одним шагом.
+    static let depsHeader = "ЗАВИСИМОСТИ"
+
+    /// Текст плана → список шагов: снимает нумерацию/маркеры; пустой план → весь текст
+    /// одним шагом. Останавливается на разделах ЗАВИСИМОСТИ:/ASK_USER (не считает их шагами).
     static func parsePlanSteps(_ text: String) -> [String] {
         var steps: [String] = []
         for raw in text.split(whereSeparator: \.isNewline) {
             var line = raw.trimmingCharacters(in: .whitespaces)
             guard !line.isEmpty else { continue }
+            let upper = line.uppercased()
+            // Разделы зависимостей / уточнения — не часть плана; дальше шагов нет.
+            if upper.hasPrefix(depsHeader) || upper.hasPrefix(askUserMarker)
+                || upper.hasPrefix("QUESTION:") || upper.hasPrefix("OPTION:") { break }
             if let r = line.range(of: #"^\s*(\d+[.)]|[-–•*])\s+"#, options: .regularExpression) {
                 line.removeSubrange(r)
                 line = line.trimmingCharacters(in: .whitespaces)
             }
+            // Шаг-артефакт: планировщик включил протокольный маркер как «шаг» (например
+            // «заверши ответ строкой NEXT_STEP») — после очистки он невыполним и зациклит
+            // проверку. Отбрасываем такие строки.
+            let u2 = line.uppercased()
+            if u2.contains(nextStepMarker) || u2.contains(replanMarker) || u2.contains(askUserMarker) { continue }
             if !line.isEmpty { steps.append(line) }
         }
         return steps.isEmpty ? [text.trimmingCharacters(in: .whitespacesAndNewlines)] : steps
@@ -533,10 +730,23 @@ enum PipelinePrompts {
     static func wantsNextStep(_ text: String) -> Bool { text.uppercased().contains(nextStepMarker) }
     static func wantsReplan(_ text: String)   -> Bool { text.uppercased().contains(replanMarker) }
 
-    /// Убирает служебные маркеры из текста перед показом/сохранением.
+    /// Убирает служебные маркеры/разделы из текста перед показом/сохранением.
     static func stripMarkers(_ text: String) -> String {
-        var t = text
-        for m in [nextStepMarker, replanMarker] { t = t.replacingOccurrences(of: m, with: "") }
+        var kept: [String] = []
+        var inDeps = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(raw)
+            let upper = line.trimmingCharacters(in: .whitespaces).uppercased()
+            if upper.hasPrefix(depsHeader) { inDeps = true; continue }      // раздел зависимостей — убрать
+            if inDeps {                                                      // строки вида «3: 1,2» внутри раздела
+                if line.range(of: #"^\s*\d+\s*:"#, options: .regularExpression) != nil { continue }
+                inDeps = false
+            }
+            if upper == askUserMarker || upper.hasPrefix("QUESTION:") || upper.hasPrefix("OPTION:") { continue }
+            kept.append(line)
+        }
+        var t = kept.joined(separator: "\n")
+        for m in [nextStepMarker, replanMarker, askUserMarker] { t = t.replacingOccurrences(of: m, with: "") }
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -550,6 +760,294 @@ enum PipelinePrompts {
             if tail.contains("ВЫПОЛНЕНО") { return true }
         }
         return true
+    }
+
+    // MARK: - Уточняющий вопрос (ASK_USER)
+
+    /// Парсит блок ASK_USER → PendingQuestion. Возвращает nil, если нет всех частей
+    /// (маркер ASK_USER + строка QUESTION: + хотя бы один OPTION:).
+    static func parseQuestion(_ text: String) -> PendingQuestion? {
+        guard text.uppercased().contains(askUserMarker) else { return nil }
+        var question = ""
+        var options: [String] = []
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            let upper = line.uppercased()
+            if upper.hasPrefix("QUESTION:") {
+                question = String(line.dropFirst("QUESTION:".count)).trimmingCharacters(in: .whitespaces)
+            } else if upper.hasPrefix("OPTION:") {
+                let opt = String(line.dropFirst("OPTION:".count)).trimmingCharacters(in: .whitespaces)
+                if !opt.isEmpty { options.append(opt) }
+            }
+        }
+        // Дедуп вариантов, ограничение до 4.
+        var seen = Set<String>()
+        options = options.filter { seen.insert($0.lowercased()).inserted }
+        if options.count > 4 { options = Array(options.prefix(4)) }
+        guard !question.isEmpty, !options.isEmpty else { return nil }
+        return PendingQuestion(question: question, options: options)
+    }
+
+    // MARK: - Рой агентов: зависимости шагов → волны (топосортировка)
+
+    /// Парсит раздел «ЗАВИСИМОСТИ:» (строки «3: 1,2», номера 1-based) → для каждого шага
+    /// (0-based) множество индексов-предшественников. Вне диапазона/self/дубли отбрасываются.
+    static func parseDeps(_ text: String, stepCount n: Int) -> [Set<Int>] {
+        var deps = Array(repeating: Set<Int>(), count: max(0, n))
+        guard n > 0 else { return [] }
+        var inSection = false
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.uppercased().hasPrefix(depsHeader) { inSection = true; continue }
+            guard inSection, !line.isEmpty else { continue }
+            // «<номер>: <номера через запятую/пробел>»
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, let stepNum = Int(parts[0].trimmingCharacters(in: .whitespaces)) else { continue }
+            let target = stepNum - 1
+            guard target >= 0, target < n else { continue }
+            let refs = parts[1].split(whereSeparator: { $0 == "," || $0 == " " || $0 == ";" })
+            for r in refs {
+                guard let num = Int(r.trimmingCharacters(in: .whitespaces)) else { continue }
+                let dep = num - 1
+                if dep >= 0, dep < n, dep != target { deps[target].insert(dep) }
+            }
+        }
+        return deps
+    }
+
+    /// Волны выполнения (алгоритм Кана): группы индексов шагов, выполнимых параллельно.
+    /// Цикл/тупик или пустой ввод → последовательный фолбэк (каждый шаг — своя волна).
+    static func computeWaves(n: Int, deps: [Set<Int>]) -> [[Int]] {
+        guard n > 0 else { return [] }
+        // Защита от рассинхрона размеров.
+        let d: [Set<Int>] = (0..<n).map { i in i < deps.count ? deps[i].filter { $0 >= 0 && $0 < n && $0 != i } : [] }
+        var placed = Array(repeating: false, count: n)
+        var waves: [[Int]] = []
+        var remaining = n
+        while remaining > 0 {
+            var wave: [Int] = []
+            for i in 0..<n where !placed[i] {
+                if d[i].allSatisfy({ placed[$0] }) { wave.append(i) }
+            }
+            if wave.isEmpty { return (0..<n).map { [$0] } }   // цикл/тупик → последовательно
+            for i in wave { placed[i] = true }
+            remaining -= wave.count
+            waves.append(wave.sorted())
+        }
+        return waves
+    }
+
+    /// Системный промпт подагента роя (исполнитель ОДНОГО шага с узким контекстом).
+    /// Инварианты — ПЕРВЫМИ (модель сильнее их соблюдает).
+    static func subAgentSystemPrompt(invariants: [Invariant] = []) -> String {
+        let role = """
+        Ты — подагент-исполнитель в рое. Выполни ТОЛЬКО порученный шаг [STEP] полностью и \
+        самодостаточно. Используй [DEPS] (результаты шагов, от которых зависит твой) как \
+        вход; [PLAN] — общий контекст. НЕ выполняй другие шаги и НЕ задавай вопросов — \
+        дай готовый результат своего шага. Если шаг невозможен без переплана — заверши \
+        ответ строкой «\(replanMarker)».
+        """
+        let inv = InvariantValidator.promptBlock(invariants)
+        return inv.isEmpty ? role : inv + "\n\n" + role
+    }
+
+    /// User-сообщение подагенту: узкий контекст (обзор плана + ТОЛЬКО выводы зависимостей
+    /// + текущий шаг). Полный [DONE] НЕ передаём — экономия токенов/контекста.
+    static func subAgentPrompt(task: String, stepIndex: Int, plan: [String],
+                               deps: Set<Int>, stepResults: [String],
+                               profile: String, invariants: [Invariant] = [],
+                               guidance: [String] = [], rag: String = "") -> String {
+        func numberedPlan() -> String {
+            plan.isEmpty ? "—" : plan.enumerated()
+                .map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n           ")
+        }
+        let depList = deps.sorted()
+        let depsText: String
+        if depList.isEmpty {
+            depsText = "—"
+        } else {
+            depsText = depList.map { idx -> String in
+                let res = (idx < stepResults.count ? stepResults[idx] : "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let title = idx < plan.count ? plan[idx] : "шаг \(idx + 1)"
+                return "• Шаг \(idx + 1) (\(title)):\n\(res.isEmpty ? "—" : res)"
+            }.joined(separator: "\n")
+        }
+        let step = stepIndex < plan.count ? plan[stepIndex] : ""
+        let prof = profile.trimmingCharacters(in: .whitespacesAndNewlines)
+        var s = """
+        [QUERY]    \(task)
+        [PLAN]     \(numberedPlan())
+        [STEP]     \(stepIndex + 1). \(step)
+        [DEPS]
+        \(depsText)
+        [PROFILE]  \(prof.isEmpty ? "—" : prof)
+
+        Дай полный результат шага [STEP].
+        """
+        if !guidance.isEmpty {
+            s += "\n\n[УКАЗАНИЯ ПОЛЬЗОВАТЕЛЯ — учти их, приоритетно]\n"
+                + guidance.map { "- \($0)" }.joined(separator: "\n")
+        }
+        // База знаний RAG (узкий контекст задачи) — тот же блок, что и у основных этапов.
+        let ragBlock = rag.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !ragBlock.isEmpty { s += "\n\n\(ragBlock)" }
+        let invBlock = InvariantValidator.promptBlock(invariants)
+        if !invBlock.isEmpty { s += "\n\n\(invBlock)" }
+        return s
+    }
+
+    // MARK: - Запрос смены стадии текстом
+
+    /// Распознаёт в тексте пользователя ПРОСЬБУ СМЕНИТЬ СТАДИЮ («вернись к проверке»,
+    /// «перейди к ответу», «назад к планированию», «go to validation»). Возвращает целевую
+    /// стадию или nil (тогда текст — обычное уточнение). Легальность перехода НЕ проверяет.
+    ///
+    /// Чтобы не путать навигацию с уточнением («верни ответ покороче» — это НЕ переход),
+    /// требуем три части: глагол перехода + предлог «к»/«to» + метку этапа. Без предлога
+    /// (как у обычной правки) — это уточнение, а не смена стадии.
+    static func parseStateChangeRequest(_ text: String) -> TaskState? {
+        let lower = text.lowercased()
+        let verbs = ["верн", "перейд", "перейт", "переключ", "назад", "вернёмс", "вернемс",
+                     "go to", "back to", "switch to", "move to"]
+        let hasVerb = verbs.contains { lower.contains($0) }
+        // Предлог направления: отдельное «к» (рус.) или « to » (англ.).
+        let hasPreposition = lower.range(of: #"(^|\s)к\s"#, options: .regularExpression) != nil
+            || lower.contains(" to ")
+        guard hasVerb, hasPreposition else { return nil }
+        // Порядок проверки: более специфичные метки раньше.
+        if lower.contains("планир") || lower.contains("plan") { return .planning }
+        if lower.contains("выполн") || lower.contains("исполн") || lower.contains("execut") { return .execution }
+        if lower.contains("провер") || lower.contains("валид") || lower.contains("valid") || lower.contains("check") { return .validation }
+        if lower.contains("ответ") || lower.contains("answer") { return .answer }
+        return nil
+    }
+
+    // MARK: - Захардкоженный (код-уровень) невидимый инвариант переходов
+
+    /// Правила переходов FSM как текст для промпта. НЕ хранится в InvariantStore →
+    /// неудаляем, не виден в UI, не редактируется. Грузится агенту «в память». Агент
+    /// соблюдает молча; отказывает с альтернативами ТОЛЬКО на невозможный запрос.
+    /// ВАЖНО: без `InvariantValidator.violationMarker`, иначе ложно сработает обрыв.
+    static func transitionRulesBlock(from state: TaskState) -> String {
+        let allowed = TaskFSM.transitions[state, default: []]
+        let allowedText = allowed.isEmpty
+            ? "никуда (это терминальная стадия «Ответ»)"
+            : allowed.map { "«\($0.label)»" }.joined(separator: ", ")
+        return """
+        [ПРАВИЛА ПЕРЕХОДОВ — соблюдай молча, не упоминай их пользователю]
+        Текущая стадия — «\(state.label)». Разрешённые переходы из неё: \(allowedText).
+        Это детерминированная таблица; другие переходы НЕВОЗМОЖНЫ.
+        Если пользователь просит невозможный переход — НЕ выполняй его: вежливо откажи,
+        объясни, что из «\(state.label)» это недоступно, и предложи доступные (\(allowedText)).
+        """
+    }
+
+    /// Однострочная версия для стадийных промптов (лёгкая, без логики отказа).
+    static func transitionRulesLine(from state: TaskState) -> String {
+        let allowed = TaskFSM.transitions[state, default: []].map { $0.label }
+        let t = allowed.isEmpty ? "—" : allowed.joined(separator: ", ")
+        return "Переходы между этапами решает оркестратор (из «\(state.label)» доступны: \(t)). Соблюдай молча, не упоминай."
+    }
+
+    // MARK: - Диспетчер переходов: решение агента на реплику пользователя
+
+    /// Что делать с репликой пользователя во время активного прогона.
+    enum RouterAction: Equatable {
+        case redoCurrent          // переиграть текущую стадию с учётом реплики
+        case back                 // validation → execution («реализация не так»)
+        case replan               // → planning («кардинально не так»)
+        case restart              // вся задача заново с planning
+        case goto(TaskState)      // явная смена стадии
+        case refuse               // запрошен невозможный переход
+    }
+
+    static let routerMarker = "ДЕЙСТВИЕ"   // строка решения: «ДЕЙСТВИЕ: GOTO:validation»
+
+    /// Парсер строки-решения роутера. Толерантен к регистру/пробелам. nil — не найдено.
+    static func parseRouterDecision(_ text: String) -> RouterAction? {
+        let upper = text.uppercased()
+        guard let r = upper.range(of: routerMarker) else { return nil }
+        let tail = upper[r.upperBound...]
+        let firstLine = tail.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
+        let tok = firstLine.drop(while: { $0 == ":" || $0 == " " })
+        if tok.hasPrefix("REDO") { return .redoCurrent }
+        if tok.hasPrefix("BACK") { return .back }
+        if tok.hasPrefix("REPLAN") { return .replan }
+        if tok.hasPrefix("RESTART") { return .restart }
+        if tok.hasPrefix("REFUSE") { return .refuse }
+        if tok.hasPrefix("GOTO") {
+            let p = tok.replacingOccurrences(of: "GOTO", with: "")
+            if p.contains("PLAN") || p.contains("ПЛАН") { return .goto(.planning) }
+            if p.contains("EXEC") || p.contains("ВЫПОЛН") || p.contains("ИСПОЛН") { return .goto(.execution) }
+            if p.contains("VALID") || p.contains("CHECK") || p.contains("ПРОВЕР") || p.contains("ВАЛИД") { return .goto(.validation) }
+            if p.contains("ANSW") || p.contains("ОТВЕТ") { return .goto(.answer) }
+        }
+        return nil
+    }
+
+    /// Целевая стадия действия (для проверки по таблице). redo/refuse → nil (не переход).
+    static func routerTarget(_ action: RouterAction, from state: TaskState) -> TaskState? {
+        switch action {
+        case .redoCurrent, .refuse: return nil
+        case .back:                 return .execution
+        case .replan, .restart:     return .planning
+        case .goto(let s):          return s
+        }
+    }
+
+    /// Текст-объяснение агента до строки ДЕЙСТВИЕ (показываем пользователю при отказе).
+    static func stripRouterMarker(_ text: String) -> String {
+        if let r = text.range(of: routerMarker) {
+            return String(text[..<r.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Системный промпт диспетчера: правила переходов + грамматика ответа.
+    static func routerSystemPrompt(state: TaskState) -> String {
+        """
+        Ты — диспетчер конечного автомата задачи. Пользователь прислал реплику во время
+        активного прогона. Реши ОДНО действие и выведи его ПОСЛЕДНЕЙ строкой строго так:
+        \(routerMarker): <одно из: REDO_CURRENT | BACK | REPLAN | RESTART | GOTO:<стадия> | REFUSE>
+
+        Значения:
+        - REDO_CURRENT — обычная правка/замечание/уточнение: переиграть ТЕКУЩУЮ стадию с учётом реплики.
+        - BACK — «реализация не так»: вернуться к выполнению (имеет смысл со стадии «Проверка»).
+        - REPLAN — «кардинально не так» / переделать задачу: вернуться к планированию.
+        - RESTART — начать всю задачу заново с планирования.
+        - GOTO:<стадия> — пользователь хочет КОНКРЕТНУЮ стадию (planning|execution|validation|answer).
+        - REFUSE — реплика не про переход и не про правку (используй редко).
+
+        ЖЁСТКОЕ ПРАВИЛО: если пользователь называет конкретную целевую стадию (например
+        «давай к ответу», «сразу к ответу», «перейди к проверке», «вернись к планированию»),
+        выведи РОВНО эту стадию в GOTO:<стадия> — ДАЖЕ ЕСЛИ переход в неё сейчас НЕВОЗМОЖЕН.
+        НИКОГДА не подменяй запрошенную стадию другой («ближайшей доступной»). Код сам сверит
+        с таблицей и, если перейти нельзя, КОРРЕКТНО откажет пользователю и предложит доступные.
+        Пример: со стадии «Выполнение» реплика «давай сразу к ответу» → ДЕЙСТВИЕ: GOTO:answer
+        (код объяснит, что напрямую в «Ответ» из «Выполнения» нельзя, и предложит «Проверка»/«Планирование»).
+
+        \(transitionRulesBlock(from: state))
+        Перед строкой ДЕЙСТВИЕ дай 1–2 предложения дружелюбного объяснения для пользователя
+        (если переход невозможен — честно скажи это и назови доступные стадии).
+        """
+    }
+
+    /// User-сообщение диспетчеру.
+    static func routerUserPrompt(task: String, state: TaskState, userText: String) -> String {
+        """
+        [ЗАДАЧА] \(task)
+        [ТЕКУЩАЯ СТАДИЯ] \(state.label)
+        [РЕПЛИКА ПОЛЬЗОВАТЕЛЯ] \(userText)
+        Выбери ровно одно действие.
+        """
+    }
+}
+
+extension Array {
+    /// Разбивает массив на чанки заданного размера (для ограничения параллельности роя).
+    func chunked(into size: Int) -> [[Element]] {
+        guard size > 0 else { return isEmpty ? [] : [self] }
+        return stride(from: 0, to: count, by: size).map { Array(self[$0..<Swift.min($0 + size, count)]) }
     }
 }
 
@@ -565,6 +1063,23 @@ struct MsgNode: Identifiable, Codable {
     var state: TaskState? = nil
     var step: Int? = nil
     var total: Int? = nil
+    /// Группа волны роя: сообщения одной параллельной волны имеют общий waveGroupID и
+    /// рендерятся плитками. nil/waveSize<=1 — обычное (последовательное) сообщение.
+    /// ТОЛЬКО Optional — у MsgNode синтезированный Codable (старый JSON без ключей → nil).
+    var waveGroupID: UUID? = nil
+    var waveSize: Int? = nil
+}
+
+/// Живая плитка подагента роя (runtime, НЕ сохраняется). Обновляется по мере работы
+/// подагентов текущей волны; рендерится рядом плиток (UI как в Claude Code).
+struct LiveSubAgent: Identifiable, Equatable {
+    let id: Int            // индекс шага (стабилен внутри волны)
+    var title: String      // текст шага плана
+    var status: Status = .running
+    var output: String = ""
+    var tokens: Int = 0
+
+    enum Status: Equatable { case running, done, failed }
 }
 
 /// Именованная ветка = указатель на «кончик» (leaf) ветки в дереве узлов.
@@ -594,7 +1109,7 @@ struct Chat: Identifiable, Codable {
             var result: [ChatMessage] = []
             var cur = currentTipID
             while let id = cur, let n = byID[id] {
-                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics, state: n.state, step: n.step, total: n.total))
+                result.append(ChatMessage(id: n.id, role: n.role, content: n.content, metrics: n.metrics, state: n.state, step: n.step, total: n.total, waveGroupID: n.waveGroupID, waveSize: n.waveSize))
                 cur = n.parentID
             }
             return result.reversed()
@@ -604,7 +1119,7 @@ struct Chat: Identifiable, Codable {
             nodes = []
             var parent: UUID? = nil
             for m in newValue {
-                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics, state: m.state, step: m.step, total: m.total)
+                let node = MsgNode(id: m.id, parentID: parent, role: m.role, content: m.content, metrics: m.metrics, state: m.state, step: m.step, total: m.total, waveGroupID: m.waveGroupID, waveSize: m.waveSize)
                 nodes.append(node)
                 parent = node.id
             }
@@ -650,6 +1165,18 @@ struct Chat: Identifiable, Codable {
     /// Runtime: текст баннера о конфликте инвариантов (модель отказала из-за запроса
     /// пользователя). Не сохраняется (см. CodingKeys).
     var invariantConflict: String? = nil
+
+    /// Runtime: текст баннера об отказе в смене стадии (запрошенный переход запрещён
+    /// таблицей TaskFSM). Не сохраняется (см. CodingKeys).
+    var stateChangeError: String? = nil
+
+    /// Runtime: живые плитки подагентов текущей волны роя (статус/вывод по мере готовности).
+    /// НЕ сохраняется (транзиентно; на коммите/паузе чистится, при resume пересобирается).
+    var liveSubAgents: [LiveSubAgent] = []
+
+    /// Runtime: идёт решение диспетчера переходов по реплике пользователя («Агент решает…»).
+    /// НЕ сохраняется (см. CodingKeys).
+    var isDeciding: Bool = false
 
     /// Активный/последний контекст задачи (конечный автомат FSM). nil — нет.
     /// Сохраняется (нужен для возобновления после перезапуска).
@@ -714,10 +1241,53 @@ struct ChatRequest: Encodable {
     let max_tokens: Int
     /// nil — ключ не отправляется (синтезированный Encodable использует encodeIfPresent).
     let stop: [String]?
+    /// Инструменты (MCP) в формате OpenAI. nil → ключ не отправляется (обычные запросы не меняются).
+    var tools: [Tool]? = nil
+    /// "auto" | "none". nil → не отправляется.
+    var tool_choice: String? = nil
 
     struct RequestMessage: Encodable {
         let role: String
-        let content: String
+        /// Опционально: assistant-сообщение с tool_calls может не иметь content.
+        let content: String?
+        /// Вызовы инструментов (в assistant-сообщении).
+        var tool_calls: [ToolCallDTO]? = nil
+        /// id вызова, на который отвечает сообщение role=tool.
+        var tool_call_id: String? = nil
+        var name: String? = nil
+    }
+
+    /// Описание инструмента для модели (OpenAI function-calling).
+    struct Tool: Encodable, Sendable {
+        let type: String
+        let function: Function
+        struct Function: Encodable, Sendable {
+            let name: String
+            let description: String?
+            let parameters: JSONValue   // JSON Schema
+        }
+        init(spec: ToolSpec) {
+            type = "function"
+            // Параметры обязаны быть объектом-схемой; иначе подставляем пустой объект.
+            let schema: JSONValue = (spec.schema.objectValue != nil)
+                ? spec.schema
+                : .object(["type": .string("object"), "properties": .object([:])])
+            function = Function(name: spec.qualifiedName,
+                                description: spec.description.isEmpty ? nil : spec.description,
+                                parameters: schema)
+        }
+    }
+}
+
+/// Вызов инструмента (общий для запроса и ответа, OpenAI-формат).
+struct ToolCallDTO: Codable, Sendable {
+    let id: String
+    let type: String
+    let function: Function
+    struct Function: Codable, Sendable {
+        let name: String
+        /// JSON-строка аргументов (как отдаёт модель).
+        let arguments: String
     }
 }
 
@@ -733,7 +1303,9 @@ struct ChatResponse: Decodable {
 
     struct ResponseMessage: Decodable {
         let role: String
-        let content: String
+        /// Может отсутствовать, когда ответ — только вызовы инструментов.
+        let content: String?
+        let tool_calls: [ToolCallDTO]?
     }
 
     struct Usage: Decodable {
@@ -741,6 +1313,25 @@ struct ChatResponse: Decodable {
         let completion_tokens: Int
         let total_tokens: Int
     }
+}
+
+/// Результат tool-loop: финальный текст + накопленные токены + краткий транскрипт вызовов.
+struct ToolLoopResult {
+    let text: String
+    let promptTokens: Int
+    let completionTokens: Int
+    let totalTokens: Int
+    let transcript: [ToolCallRecord]
+    var sendResult: SendResult {
+        SendResult(text: text, promptTokens: promptTokens,
+                   completionTokens: completionTokens, totalTokens: totalTokens)
+    }
+}
+
+/// Одна запись транскрипта вызова инструмента (для показа в ленте).
+struct ToolCallRecord: Sendable, Equatable {
+    let name: String
+    let ok: Bool
 }
 
 /// Результат отправки: текст ответа + потраченные на запрос токены.
