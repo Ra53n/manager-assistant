@@ -335,6 +335,46 @@ final class RagTests: XCTestCase {
         XCTAssertEqual(RagRerank.rewriteUserPrompt(question: "q", history: []), "Вопрос: q")
     }
 
+    // MARK: - Grounded-режим: метки источников и директивы
+
+    func testBuildBlockLabelsContainSourceAndChunkID() {
+        var chunk = RagChunk(text: "текст фрагмента")
+        chunk.ordinal = 12
+        chunk.metadata = RagChunkMetadata(title: "Список машин", section: "Lada Niva Sport")
+        let block = RagRetriever.buildBlock(hits: [RagRetrievalHit(chunk: chunk, score: 0.8)], budgetTokens: 500)
+        XCTAssertNotNil(block)
+        XCTAssertTrue(block!.contains("[#12 · Список машин · Lada Niva Sport]"))
+
+        // Без раздела и заголовка — метка только с номером чанка, без висячих «·».
+        let bare = RagChunk(text: "голый текст")
+        let block2 = RagRetriever.buildBlock(hits: [RagRetrievalHit(chunk: bare, score: 0.5)], budgetTokens: 500)
+        XCTAssertTrue(block2!.contains("[#0]\nголый текст"))
+        XCTAssertFalse(block2!.contains("· ]"))
+    }
+
+    func testCitationDirectiveMentionsSourcesFormat() {
+        XCTAssertTrue(RagRerank.citationDirective.contains("Источники"))
+        XCTAssertTrue(RagRerank.citationDirective.contains("цитата"))
+        XCTAssertTrue(RagRerank.citationDirective.contains("ТОЛЬКО на основе фрагментов"))
+    }
+
+    func testNotFoundDirectiveDemandsIDontKnow() {
+        XCTAssertTrue(RagRerank.notFoundDirective.contains("не знаю"))
+        XCTAssertTrue(RagRerank.notFoundDirective.contains("уточняющий вопрос"))
+        XCTAssertTrue(RagRerank.notFoundDirective.contains("НЕ отвечать из общих знаний"))
+    }
+
+    func testGenerationSettingsStrictModeMigration() throws {
+        // Round-trip нового поля + старый JSON без него → строгий режим ВКЛ по умолчанию.
+        var s = GenerationSettings()
+        s.ragStrictMode = false
+        let back = try dec.decode(GenerationSettings.self, from: enc.encode(s))
+        XCTAssertFalse(back.ragStrictMode)
+        let old = try dec.decode(GenerationSettings.self,
+                                 from: Data(#"{"provider":"deepseek"}"#.utf8))
+        XCTAssertTrue(old.ragStrictMode)
+    }
+
     func testBuildBlockAfterThreshold() {
         let filtered = RagRerank.thresholdFilter([hit("выживший факт", 0.8), hit("шум", 0.1)], minScore: 0.5)
         let block = RagRetriever.buildBlock(hits: filtered, budgetTokens: 500)

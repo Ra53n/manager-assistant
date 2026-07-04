@@ -201,6 +201,9 @@ struct GenerationSettings: Equatable, Codable {
     var ragRerankEnabled: Bool = false
     /// Переформулировать вопрос в самодостаточный поисковый запрос перед ретривом (LLM).
     var ragQueryRewrite: Bool = true
+    /// Строгий grounded-режим: ответ только по базе, в конце — раздел «Источники»
+    /// (файл · раздел · #чанк + цитата); ниже порога — обязательное «не знаю» + уточнение.
+    var ragStrictMode: Bool = true
 
     static let `default` = GenerationSettings()
 
@@ -226,7 +229,7 @@ struct GenerationSettings: Equatable, Codable {
         case swarmEnabled, maxParallelAgents
         case mcpEnabled, enabledMCPServerIDs
         case ragEnabled, ragIndexID, ragTopK
-        case ragCandidateK, ragMinScore, ragRerankEnabled, ragQueryRewrite
+        case ragCandidateK, ragMinScore, ragRerankEnabled, ragQueryRewrite, ragStrictMode
     }
 }
 
@@ -265,6 +268,7 @@ extension GenerationSettings {
         ragMinScore = try c.decodeIfPresent(Double.self, forKey: .ragMinScore) ?? d.ragMinScore
         ragRerankEnabled = try c.decodeIfPresent(Bool.self, forKey: .ragRerankEnabled) ?? d.ragRerankEnabled
         ragQueryRewrite = try c.decodeIfPresent(Bool.self, forKey: .ragQueryRewrite) ?? d.ragQueryRewrite
+        ragStrictMode = try c.decodeIfPresent(Bool.self, forKey: .ragStrictMode) ?? d.ragStrictMode
     }
 }
 

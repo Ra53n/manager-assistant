@@ -69,13 +69,20 @@ enum RagRetriever {
     /// Каждый шаг при ошибке ДЕГРАДИРУЕТ к предыдущему результату (rewrite не удался →
     /// ищем по исходному вопросу; реранк вернул мусор → порядок по score) — ретрив
     /// НИКОГДА не бросает и не роняет отправку. Порог/реранк могут осознанно отсеять
-    /// всех кандидатов → nil (нерелевантное не подставляем — это фича).
+    /// всех кандидатов → нерелевантное не подставляем (это фича).
+    /// Grounded-режим (settings.ragStrictMode): к найденным фрагментам дописывается
+    /// директива цитирования («Источники» с метками+цитатами); пустой результат
+    /// (ничего выше порога / реранкер сказал «0» / поиск не дал ничего, в т.ч. из-за
+    /// инфраструктурной ошибки — честнее «не знаю», чем ответ из общих знаний) →
+    /// директива «обязан сказать "не знаю" и задать уточняющий вопрос».
     static func retrieveBlock(client: DeepSeekClient,
                               settings: GenerationSettings,
                               query: String,
                               history: [ChatMessage],
                               budgetTokens: Int) async -> String? {
         guard settings.ragEnabled, let indexID = settings.ragIndexID else { return nil }
+        // Пустой итог: в строгом режиме модель обязана честно признаться, не молчим.
+        let empty: String? = settings.ragStrictMode ? RagRerank.notFoundDirective : nil
 
         // 1. Query rewrite: вопрос → самодостаточный поисковый запрос (местоимения
         //    раскрываются по последним репликам). Ошибка/мусор → исходный вопрос.
@@ -89,11 +96,11 @@ enum RagRetriever {
         // 2. Кандидаты: широкий top-candidateK (до фильтрации), не уже финального top-K.
         let candidateK = max(settings.ragCandidateK, settings.ragTopK)
         var hits = await search(indexID: indexID, query: searchQuery, topK: candidateK)
-        guard !hits.isEmpty else { return nil }
+        guard !hits.isEmpty else { return empty }
 
         // 3. Порог релевантности (бесплатная эвристика). Отсёк всех → блока нет.
         hits = RagRerank.thresholdFilter(hits, minScore: settings.ragMinScore)
-        guard !hits.isEmpty else { return nil }
+        guard !hits.isEmpty else { return empty }
 
         // 4. LLM-реранк (аналог cross-encoder). Зовём только когда есть что резать.
         if settings.ragRerankEnabled, hits.count > settings.ragTopK {
@@ -106,7 +113,9 @@ enum RagRetriever {
             hits = Array(hits.prefix(settings.ragTopK))
         }
 
-        return buildBlock(hits: hits, budgetTokens: budgetTokens)
+        // Реранкер мог явно ответить «ничего не релевантно» → тоже честное «не знаю».
+        guard let block = buildBlock(hits: hits, budgetTokens: budgetTokens) else { return empty }
+        return settings.ragStrictMode ? block + "\n\n" + RagRerank.citationDirective : block
     }
 
     /// Сборка текстового блока из попаданий под токенный бюджет (~3 симв./токен).
@@ -119,9 +128,11 @@ enum RagRetriever {
         for hit in hits {
             let text = hit.chunk.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
-            // Метка фрагмента: раздел (если есть) или заголовок документа.
-            let label = hit.chunk.metadata.section.isEmpty ? hit.chunk.metadata.title : hit.chunk.metadata.section
-            let entry = label.isEmpty ? text : "[\(label)]\n\(text)"
+            // Метка фрагмента: #chunk_id · источник (заголовок документа) · раздел —
+            // по ней модель ссылается в разделе «Источники» (grounded-режим).
+            let parts = ["#\(hit.chunk.ordinal)", hit.chunk.metadata.title, hit.chunk.metadata.section]
+                .filter { !$0.isEmpty }
+            let entry = "[\(parts.joined(separator: " · "))]\n\(text)"
             let cost = max(1, entry.count / 3)
             // Хотя бы первый (лучший) чанк включаем всегда; далее — пока хватает бюджета.
             if used + cost > max(0, budgetTokens), !lines.isEmpty { break }
@@ -129,7 +140,7 @@ enum RagRetriever {
             used += cost
         }
         guard !lines.isEmpty else { return nil }
-        return "База знаний RAG (используй как контекст для ответа, не упоминай источник):\n"
+        return "База знаний RAG — найденные фрагменты (метка: [#чанк · источник · раздел]):\n"
             + lines.joined(separator: "\n\n")
     }
 }

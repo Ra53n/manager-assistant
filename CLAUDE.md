@@ -257,6 +257,13 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     роняет send(). FSM зовёт с `history: []`. Старый простой `retrieveBlock(indexID:...)`
     оставлен (панель/тесты). При `ragMinScore=0`+реранк выкл путь байт-в-байт как раньше.
     Сравнение режимов «с фильтром / без» — те же per-lane настройки дорожек.
+    **Grounded-режим** (`ragStrictMode`, ВКЛ по умолчанию): метка каждого фрагмента в блоке —
+    `[#ordinal · title · section]` (`buildBlock`); к найденному дописывается
+    `RagRerank.citationDirective` (ответ ТОЛЬКО по базе + обязательный раздел «Источники»
+    с метками и цитатами); пустой итог (порог отсёк всех / реранкер «0» / ошибка поиска) →
+    `RagRerank.notFoundDirective` (обязан сказать «не знаю» + уточняющий вопрос) ВМЕСТО nil.
+    Всё внутри строки блока → обвязка чата/FSM/сравнения не менялась. Выкл → фрагменты как
+    раньше просто контекст (и nil при пустом итоге).
 - **Миграция chats.json/projects.json** — у Chat, GenerationSettings, Project,
   ProjectEntry, MemoryItem РУЧНЫЕ init(from:) в extension с decodeIfPresent+дефолтами.
   Новые поля добавлять ТОЛЬКО так (поле + CodingKeys + init(from:)), иначе старый
