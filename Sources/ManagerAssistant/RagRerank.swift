@@ -137,4 +137,118 @@ enum RagRerank {
     НЕ отвечать из общих знаний и НЕ строить предположений. Затем задай один уточняющий \
     вопрос, который помог бы переформулировать запрос и найти нужное в базе.
     """
+
+    // MARK: Кодовая гарантия раздела «Источники» (grounded-режим)
+    // citationDirective — только просьба; модель может «забыть». Здесь — проверка на
+    // уровне КОДА: детектор раздела, парсер меток фрагментов и автофутер-фолбэк.
+    // Вызывающие (send()/runStateMachine/сравнение) на их основе делают ретрай и/или
+    // дописывают источники сами — ответ без источников становится невозможен.
+
+    /// Есть ли в ответе раздел «Источники»/«Sources». Построчно: снимается markdown-обвязка
+    /// (`##`, `>`, маркеры списка, `**`/`_`), затем строка должна БЫТЬ заголовком раздела —
+    /// «источники» целиком или начинаться с «источники:»/«источники (» (в т.ч. автофутер).
+    /// «эти источники мы не нашли» в середине фразы — НЕ срабатывает.
+    static func hasSourcesSection(_ answer: String) -> Bool {
+        for rawLine in answer.split(separator: "\n", omittingEmptySubsequences: true) {
+            var line = rawLine.trimmingCharacters(in: .whitespaces).lowercased()
+            // Markdown-обвязка заголовка: #, >, маркеры списка, жирный/курсив.
+            line = line.trimmingCharacters(in: CharacterSet(charactersIn: "#>*-—–_ \t"))
+            for header in ["источники", "sources"] {
+                if line == header { return true }
+                if line.hasPrefix(header + ":") || line.hasPrefix(header + " (") { return true }
+            }
+        }
+        return false
+    }
+
+    /// Метки фрагментов из строки ragBlock: строки вида «[#3 · doc.md · Раздел]» →
+    /// «#3 · doc.md · Раздел». Формат пишет RagRetriever.buildBlock — однострочная метка,
+    /// начинается с «[#», закрывается «]». Дедуп с сохранением порядка; для
+    /// notFoundDirective/произвольного текста → пусто.
+    static func parseChunkLabels(_ ragBlock: String) -> [String] {
+        var seen = Set<String>()
+        var labels: [String] = []
+        for rawLine in ragBlock.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard line.hasPrefix("[#"), line.hasSuffix("]") else { continue }
+            let inner = String(line.dropFirst().dropLast())
+            guard !inner.isEmpty, !inner.contains("]") else { continue }   // только однострочная метка
+            if seen.insert(inner).inserted { labels.append(inner) }
+        }
+        return labels
+    }
+
+    /// Есть ли с чего требовать источники: nil / пустой блок / notFoundDirective → false.
+    static func hasCitationLabels(_ ragBlock: String?) -> Bool {
+        guard let block = ragBlock else { return false }
+        return !parseChunkLabels(block).isEmpty
+    }
+
+    /// Ответ — честное «не знаю» (citationDirective РАЗРЕШАЕТ его без источников).
+    /// Эвристика; ошибается в сторону «не наказывать честный отказ» — это правильная сторона.
+    static func answerAdmitsNotFound(_ answer: String) -> Bool {
+        let lower = answer.lowercased()
+        let markers = ["не знаю", "ответа нет", "нет ответа", "не нашёл", "не нашел",
+                       "не найдено", "недостаточно фрагментов", "недостаточно информации",
+                       "нет в базе знаний", "в базе знаний нет"]
+        return markers.contains { lower.contains($0) }
+    }
+
+    /// Автофутер из меток найденных фрагментов. «Автоматически» — честность: цитат
+    /// модель не давала, это список найденного, а не использованного. labels пуст → nil.
+    static func citationFooter(labels: [String]) -> String? {
+        guard !labels.isEmpty else { return nil }
+        return "Источники (автоматически, по найденным фрагментам):\n"
+            + labels.map { "— \($0)" }.joined(separator: "\n")
+    }
+
+    /// Терминальный фолбэк: раздел уже есть / ответ = «не знаю» / меток нет → ответ как
+    /// есть; иначе дописывает автофутер. Идемпотентна (футер сам детектится как раздел).
+    static func ensureSourcesSection(answer: String, ragBlock: String) -> String {
+        guard !hasSourcesSection(answer), !answerAdmitsNotFound(answer),
+              let footer = citationFooter(labels: parseChunkLabels(ragBlock)) else { return answer }
+        return answer + "\n\n" + footer
+    }
+
+    /// Повторный запрос в ЧАТЕ (предыдущий ответ виден модели парой assistant/user).
+    static let citationRetryReminder = """
+    Твой предыдущий ответ нарушил обязательное требование: нет раздела «Источники:». \
+    Выведи ТОТ ЖЕ ответ ЦЕЛИКОМ ещё раз, добавив в конец раздел «Источники:» — для каждого \
+    использованного фрагмента базы знаний строку «— <источник> · <раздел> · #<номер>: \
+    «короткая цитата»» (данные бери из меток фрагментов в квадратных скобках). Если \
+    фрагментов недостаточно — честно скажи, что не знаешь. Больше ничего не меняй.
+    """
+
+    /// Повтор этапа «Ответ» в FSM (предыдущей попытки модель НЕ видит — этап генерится заново).
+    static let citationStageReminder = """
+    ВНИМАНИЕ: предыдущая попытка ответа не содержала обязательный раздел «Источники:». \
+    Сформируй ответ заново и ОБЯЗАТЕЛЬНО заверши его разделом «Источники:» — для каждого \
+    использованного фрагмента базы знаний строка «— <источник> · <раздел> · #<номер>: \
+    «короткая цитата»» (данные — из меток фрагментов в квадратных скобках). Если \
+    фрагментов недостаточно — честно скажи, что не знаешь.
+    """
+}
+
+/// Гейт «нужен ли (пере)ретрив» для прогона FSM. Живёт локальной переменной
+/// runStateMachine (НЕ персистентный: resume/interject перезапускают прогон, где гейт
+/// свежий и первый же проход ретривит заново). Эмбеддер гоняется ТОЛЬКО когда снапшот
+/// guidance.count изменился — на обычных проходах цикла это сравнение двух Int.
+struct RagRetrievalGate {
+    private(set) var lastGuidanceCount: Int? = nil
+
+    /// Поисковый запрос прогона: задача + ПОСЛЕДНИЕ уточнения пользователя (усечённые).
+    static func query(task: String, guidance: [String],
+                      maxItems: Int = 3, maxItemChars: Int = 300) -> String {
+        let recent = guidance.suffix(maxItems)
+            .map { "- \(String($0.prefix(maxItemChars)))" }
+        guard !recent.isEmpty else { return task }
+        return task + "\n\nУточнения пользователя:\n" + recent.joined(separator: "\n")
+    }
+
+    /// nil — ретрив не нужен (guidance не менялся); иначе запрос + фиксация снапшота.
+    mutating func queryIfNeeded(task: String, guidance: [String]) -> String? {
+        guard guidance.count != lastGuidanceCount else { return nil }
+        lastGuidanceCount = guidance.count
+        return Self.query(task: task, guidance: guidance)
+    }
 }

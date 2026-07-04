@@ -545,28 +545,62 @@ final class ChatViewModel: ObservableObject {
                     result = loop.sendResult
                     toolTranscript = loop.transcript
                 }
+
+                // --- Кодовая гарантия «Источников» (grounded-режим): промптовая директива
+                // могла не сработать. Ответ без раздела и не-«не знаю» → ОДИН повторный
+                // запрос с жёстким напоминанием (история чата НЕ раздувается — ответ и
+                // напоминание идут одноразовыми сообщениями поверх того же payload);
+                // снова нет → автофутер из меток найденных фрагментов (терминальный фолбэк).
+                // try? — осознанно: гарантия не должна ронять уже полученный ответ.
+                var answerText = result.text
+                var promptTok = result.promptTokens
+                var completionTok = result.completionTokens
+                var totalTok = result.totalTokens
+                if settings.ragStrictMode, RagRerank.hasCitationLabels(ragBlock),
+                   !RagRerank.hasSourcesSection(answerText),
+                   !RagRerank.answerAdmitsNotFound(answerText) {
+                    let retryMessages = payload.tail
+                        + [ChatMessage(role: .assistant, content: answerText),
+                           ChatMessage(role: .user, content: RagRerank.citationRetryReminder)]
+                    if let retry = try? await client.send(messages: retryMessages,
+                                                          settings: settings,
+                                                          facts: payload.facts,
+                                                          memory: memoryForSend,
+                                                          inProject: inProject,
+                                                          profile: profileText) {
+                        promptTok += retry.promptTokens
+                        completionTok += retry.completionTokens
+                        totalTok += retry.totalTokens
+                        answerText = RagRerank.ensureSourcesSection(answer: retry.text,
+                                                                    ragBlock: ragBlock ?? "")
+                    } else {
+                        answerText = RagRerank.ensureSourcesSection(answer: answerText,
+                                                                    ragBlock: ragBlock ?? "")
+                    }
+                }
+
                 let duration = Date().timeIntervalSince(start)
                 let metrics = MessageMetrics(
-                    promptTokens: result.promptTokens,
-                    completionTokens: result.completionTokens,
-                    totalTokens: result.totalTokens,
+                    promptTokens: promptTok,
+                    completionTokens: completionTok,
+                    totalTokens: totalTok,
                     duration: duration,
-                    promptCost: price.map { Double(result.promptTokens) * $0.promptPerToken },
-                    completionCost: price.map { Double(result.completionTokens) * $0.completionPerToken }
+                    promptCost: price.map { Double(promptTok) * $0.promptPerToken },
+                    completionCost: price.map { Double(completionTok) * $0.completionPerToken }
                 )
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
                     // В ленте — с блоком «что вызвал агент»; в память/секции — чистый текст.
                     let toolBlock = Self.toolTranscriptBlock(toolTranscript)
-                    let display = toolBlock.isEmpty ? result.text : toolBlock + "\n\n" + result.text
+                    let display = toolBlock.isEmpty ? answerText : toolBlock + "\n\n" + answerText
                     addMessage(i, role: .assistant, content: display, metrics: metrics)
-                    chats[i].promptTokens += result.promptTokens
-                    chats[i].completionTokens += result.completionTokens
-                    chats[i].totalTokens += result.totalTokens
+                    chats[i].promptTokens += promptTok
+                    chats[i].completionTokens += completionTok
+                    chats[i].totalTokens += totalTok
                     chats[i].totalCost += metrics.totalCost ?? 0
                     chats[i].isLoading = false
                     maybeUpdateFacts(chatID: chatID)
                     maybeMaintainMemory(chatID: chatID)
-                    maybeAppendProjectSection(chatID: chatID, answer: result.text)
+                    maybeAppendProjectSection(chatID: chatID, answer: answerText)
                 }
             } catch {
                 if let i = chats.firstIndex(where: { $0.id == chatID }) {
@@ -598,19 +632,28 @@ final class ChatViewModel: ObservableObject {
     /// Главный цикл автомата. Один проход = один запрос модели (этап ИЛИ один шаг
     /// выполнения). ВСЕ переходы — только через `ctx.transitioned(to:)` (сверка с таблицей).
     private func runStateMachine(chatID: UUID, gen: Int) async {
-        // RAG-контекст задачи (один раз на весь прогон): релевантные фрагменты по тексту
-        // задачи. Одинаков для всех этапов/шагов/подагентов → эмбеддер не гоняется повторно.
-        // Пусто, если RAG выключен/не выбран индекс (см. ragRetrieval). Инжектится в
-        // buildPrompt/subAgentPrompt ортогонально контекст-стратегиям и памяти.
+        // RAG-контекст прогона: релевантные фрагменты по тексту задачи + уточнениям.
+        // Ретрив — на ПЕРВОМ проходе цикла и при ИЗМЕНИВШЕМСЯ guidance (уточнения меняют,
+        // ЧТО искать) — за это отвечает гейт (сравнение двух Int, эмбеддер на обычных
+        // проходах не гоняется). Инжектится в buildPrompt/subAgentPrompt ортогонально
+        // контекст-стратегиям и памяти. Пусто, если RAG выключен/не выбран индекс.
         var ragBlock = ""
-        if let chat = chats.first(where: { $0.id == chatID }), let ctx0 = chat.taskContext {
-            ragBlock = await ragRetrieval(settings: chat.settings, query: ctx0.task) ?? ""
-        }
+        var ragGate = RagRetrievalGate()
+        // Кодовая гарантия «Источников» на этапе «Ответ»: бюджет — ОДИН повтор за прогон.
+        var citationRetried = false
+        var citationReminderPending = false
         while true {
             // Инструменты MCP подключаем ДО основного guard — вне мутаций ctx, чтобы
             // await не пересёкся с правкой состояния. Выключено → путь без MCP не меняется.
             guard let settingsSnap = chats.first(where: { $0.id == chatID })?.settings,
                   chats.first(where: { $0.id == chatID })?.taskContext?.status == .running else { break }
+            if settingsSnap.ragEnabled,
+               let snap = chats.first(where: { $0.id == chatID })?.taskContext,
+               let q = ragGate.queryIfNeeded(task: snap.task, guidance: snap.guidance) {
+                ragBlock = await ragRetrieval(settings: settingsSnap, query: q) ?? ""
+                guard pipelineGen[chatID] == gen else { return }
+                if Task.isCancelled { pauseAt(chatID, gen: gen); return }
+            }
             let toolDTOs = settingsSnap.mcpEnabled ? await mcpToolDTOs(for: settingsSnap) : []
             guard pipelineGen[chatID] == gen else { return }
 
@@ -662,7 +705,11 @@ final class ChatViewModel: ObservableObject {
             }
 
             let sys = PipelinePrompts.systemPrompt(for: state, swarm: settings.swarmEnabled, invariants: invs)
-            let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs, rag: ragBlock)
+            // Повтор этапа «Ответ» из-за отсутствия «Источников»: жёсткое напоминание
+            // доезжает через rag-параметр — сигнатуры buildPrompt не меняются.
+            let ragForPrompt = (citationReminderPending && state == .answer && !ragBlock.isEmpty)
+                ? ragBlock + "\n\n" + RagRerank.citationStageReminder : ragBlock
+            let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs, rag: ragForPrompt)
             chats[i].isLoading = true
 
             let start = Date()
@@ -852,8 +899,26 @@ final class ChatViewModel: ObservableObject {
                     }
 
                 case .answer:
-                    c.answer = result.text
-                    addMessage(j, role: .assistant, content: cleaned, metrics: metrics, state: .answer)
+                    var answerText = pure
+                    // Кодовая гарантия «Источников»: без раздела и не-«не знаю» → повтор
+                    // ТОГО ЖЕ этапа (паттерн invariant-retry: continue до мутаций ctx и
+                    // persistNow, токены отброшенной попытки не копим); после повтора —
+                    // автофутер из меток найденных фрагментов (терминальный фолбэк).
+                    if settings.ragStrictMode, RagRerank.hasCitationLabels(ragBlock),
+                       !RagRerank.hasSourcesSection(answerText),
+                       !RagRerank.answerAdmitsNotFound(answerText) {
+                        if !citationRetried {
+                            citationRetried = true
+                            citationReminderPending = true
+                            continue
+                        }
+                        answerText = RagRerank.ensureSourcesSection(answer: answerText, ragBlock: ragBlock)
+                    }
+                    citationReminderPending = false
+                    c.answer = answerText
+                    addMessage(j, role: .assistant,
+                               content: toolBlock.isEmpty ? answerText : toolBlock + "\n\n" + answerText,
+                               metrics: metrics, state: .answer)
                     accumulateTokens(j, result, metrics)
                     c.status = .finished                             // терминал
                     chats[j].taskContext = c

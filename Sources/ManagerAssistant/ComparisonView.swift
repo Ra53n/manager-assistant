@@ -111,6 +111,13 @@ final class ComparisonViewModel: ObservableObject {
                         memory: ChatViewModel.mergeMemory(memoryText, ragBlock)
                     )
                     let duration = Date().timeIntervalSince(start)
+                    // Гарантия «Источников» в сравнении — ТОЛЬКО автофутер, БЕЗ ретрая:
+                    // скрытый второй LLM-вызов исказил бы честный замер токенов/стоимости
+                    // дорожки. ensureSourcesSection — no-op, если раздел уже есть /
+                    // ответ «не знаю» / меток нет (RAG выключен, notFoundDirective).
+                    let answerText = settings.ragStrictMode
+                        ? RagRerank.ensureSourcesSection(answer: result.text, ragBlock: ragBlock ?? "")
+                        : result.text
                     let metrics = MessageMetrics(
                         promptTokens: result.promptTokens,
                         completionTokens: result.completionTokens,
@@ -120,7 +127,7 @@ final class ComparisonViewModel: ObservableObject {
                         completionCost: price.map { Double(result.completionTokens) * $0.completionPerToken }
                     )
                     if let j = tracks.firstIndex(where: { $0.id == trackID }) {
-                        tracks[j].messages.append(ChatMessage(role: .assistant, content: result.text, metrics: metrics))
+                        tracks[j].messages.append(ChatMessage(role: .assistant, content: answerText, metrics: metrics))
                         tracks[j].totalTokens += result.totalTokens
                         tracks[j].totalCost += metrics.totalCost ?? 0
                         tracks[j].isLoading = false

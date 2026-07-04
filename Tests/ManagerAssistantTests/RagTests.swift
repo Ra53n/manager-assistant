@@ -464,4 +464,132 @@ final class RagTests: XCTestCase {
         // Лучший чанк — из «кошачьего» файла.
         XCTAssertTrue(chunks[top.index].metadata.filePath.hasSuffix("cats.md"))
     }
+
+    // MARK: - Кодовая гарантия «Источников»: детектор раздела / парсер меток / автофутер
+
+    func testHasSourcesSectionPlainAndColon() {
+        XCTAssertTrue(RagRerank.hasSourcesSection("ответ по делу\n\nИсточники:\n— заметка.md · #3: «цитата»"))
+        XCTAssertTrue(RagRerank.hasSourcesSection("ответ\nИсточники\n— заметка"))
+        XCTAssertTrue(RagRerank.hasSourcesSection("answer\nSources:\n— note.md"))
+    }
+
+    func testHasSourcesSectionMarkdownVariants() {
+        XCTAssertTrue(RagRerank.hasSourcesSection("ответ\n## Источники\n— з.md"))
+        XCTAssertTrue(RagRerank.hasSourcesSection("ответ\n**Источники:**\n— з.md"))
+        XCTAssertTrue(RagRerank.hasSourcesSection("ответ\n> Источники:\n— з.md"))
+        XCTAssertTrue(RagRerank.hasSourcesSection("ответ\nИСТОЧНИКИ:\n— з.md"))
+        // Автофутер сам детектится как раздел (иначе ensureSourcesSection не идемпотентна).
+        let footer = RagRerank.citationFooter(labels: ["#1 · з.md"])!
+        XCTAssertTrue(RagRerank.hasSourcesSection(footer))
+    }
+
+    func testHasSourcesSectionNoFalsePositive() {
+        XCTAssertFalse(RagRerank.hasSourcesSection("эти источники мы не нашли, зато есть другие"))
+        XCTAssertFalse(RagRerank.hasSourcesSection("Источники информации бывают разные."))
+        XCTAssertFalse(RagRerank.hasSourcesSection(""))
+        XCTAssertFalse(RagRerank.hasSourcesSection("ответ без раздела вовсе"))
+    }
+
+    func testParseChunkLabelsFromBuiltBlock() {
+        // Замок на синхронность формата: buildBlock пишет метки → парсер их читает.
+        var a = RagChunk(text: "текст А")
+        a.ordinal = 3
+        a.metadata = RagChunkMetadata(title: "Заметка.md", section: "Раздел про X")
+        var b = RagChunk(text: "текст Б")
+        b.ordinal = 7
+        b.metadata = RagChunkMetadata(title: "Другая.md", section: "")
+        let block = RagRetriever.buildBlock(hits: [RagRetrievalHit(chunk: a, score: 0.9),
+                                                   RagRetrievalHit(chunk: b, score: 0.5)],
+                                            budgetTokens: 500)!
+        let labels = RagRerank.parseChunkLabels(block)
+        XCTAssertEqual(labels, ["#3 · Заметка.md · Раздел про X", "#7 · Другая.md"])
+        XCTAssertTrue(RagRerank.hasCitationLabels(block))
+    }
+
+    func testParseChunkLabelsGarbageAndNotFound() {
+        XCTAssertEqual(RagRerank.parseChunkLabels("просто текст\nбез меток"), [])
+        XCTAssertEqual(RagRerank.parseChunkLabels(RagRerank.notFoundDirective), [])
+        XCTAssertFalse(RagRerank.hasCitationLabels(nil))
+        XCTAssertFalse(RagRerank.hasCitationLabels(""))
+        XCTAssertFalse(RagRerank.hasCitationLabels(RagRerank.notFoundDirective))
+        // Дедуп с сохранением порядка.
+        XCTAssertEqual(RagRerank.parseChunkLabels("[#1 · a]\nтекст\n[#2 · b]\nтекст\n[#1 · a]"),
+                       ["#1 · a", "#2 · b"])
+    }
+
+    func testCitationFooterFormat() {
+        let footer = RagRerank.citationFooter(labels: ["#3 · Заметка.md · Раздел", "#7 · Другая.md"])!
+        XCTAssertTrue(footer.contains("Источники (автоматически"))
+        XCTAssertTrue(footer.contains("— #3 · Заметка.md · Раздел"))
+        XCTAssertTrue(footer.contains("— #7 · Другая.md"))
+        XCTAssertNil(RagRerank.citationFooter(labels: []))
+    }
+
+    func testEnsureSourcesSectionAppendsAndIsIdempotent() {
+        let block = "[#1 · Заметка.md · Р]\nфакт из базы"
+        let out = RagRerank.ensureSourcesSection(answer: "ответ без раздела", ragBlock: block)
+        XCTAssertTrue(out.hasPrefix("ответ без раздела"))
+        XCTAssertTrue(out.contains("Источники (автоматически"))
+        XCTAssertTrue(out.contains("— #1 · Заметка.md · Р"))
+        // Повторный вызов — байт-в-байт (футер уже детектится как раздел).
+        XCTAssertEqual(RagRerank.ensureSourcesSection(answer: out, ragBlock: block), out)
+        // Ответ с собственным разделом — не трогаем.
+        let withOwn = "ответ\n\nИсточники:\n— Заметка.md · Р · #1: «цитата»"
+        XCTAssertEqual(RagRerank.ensureSourcesSection(answer: withOwn, ragBlock: block), withOwn)
+        // Меток нет (notFoundDirective/пусто) — не трогаем.
+        XCTAssertEqual(RagRerank.ensureSourcesSection(answer: "ответ", ragBlock: ""), "ответ")
+    }
+
+    func testEnsureSourcesSectionSkipsNotFoundAnswer() {
+        let block = "[#1 · Заметка.md]\nфакт"
+        let honest = "В базе знаний ответа нет, не знаю. Уточни, о каком проекте речь?"
+        XCTAssertEqual(RagRerank.ensureSourcesSection(answer: honest, ragBlock: block), honest)
+        XCTAssertTrue(RagRerank.answerAdmitsNotFound(honest))
+        XCTAssertFalse(RagRerank.answerAdmitsNotFound("вот развёрнутый ответ по фактам базы"))
+    }
+
+    func testCitationRemindersMentionSources() {
+        for reminder in [RagRerank.citationRetryReminder, RagRerank.citationStageReminder] {
+            XCTAssertTrue(reminder.contains("Источники"))
+            XCTAssertTrue(reminder.contains("цитата"))
+            XCTAssertTrue(reminder.contains("не знаешь"))
+        }
+    }
+
+    // MARK: - RagRetrievalGate: пере-ретрив в FSM при уточнениях
+
+    func testRagGateFirstCallRetrieves() {
+        var gate = RagRetrievalGate()
+        let q = gate.queryIfNeeded(task: "задача", guidance: [])
+        XCTAssertEqual(q, "задача")
+        XCTAssertEqual(gate.lastGuidanceCount, 0)
+    }
+
+    func testRagGateNoChangeReturnsNil() {
+        var gate = RagRetrievalGate()
+        _ = gate.queryIfNeeded(task: "задача", guidance: ["уточнение"])
+        XCTAssertNil(gate.queryIfNeeded(task: "задача", guidance: ["уточнение"]))
+        XCTAssertNil(gate.queryIfNeeded(task: "задача", guidance: ["уточнение"]))
+    }
+
+    func testRagGateGuidanceAppendedRetrieves() {
+        var gate = RagRetrievalGate()
+        _ = gate.queryIfNeeded(task: "задача", guidance: [])
+        let q = gate.queryIfNeeded(task: "задача", guidance: ["учти ипотеку"])
+        XCTAssertNotNil(q)
+        XCTAssertTrue(q!.contains("задача"))
+        XCTAssertTrue(q!.contains("учти ипотеку"))
+        XCTAssertNil(gate.queryIfNeeded(task: "задача", guidance: ["учти ипотеку"]))
+    }
+
+    func testRagGateQueryTakesLastItemsTruncated() {
+        let guidance = ["первое", "второе", "третье", "четвёртое", String(repeating: "х", count: 500)]
+        let q = RagRetrievalGate.query(task: "задача", guidance: guidance)
+        XCTAssertFalse(q.contains("первое"))          // только последние 3
+        XCTAssertFalse(q.contains("второе"))
+        XCTAssertTrue(q.contains("третье"))
+        XCTAssertTrue(q.contains("четвёртое"))
+        XCTAssertTrue(q.contains(String(repeating: "х", count: 300)))   // усечено до 300
+        XCTAssertFalse(q.contains(String(repeating: "х", count: 301)))
+    }
 }

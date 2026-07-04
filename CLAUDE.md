@@ -235,9 +235,15 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     `ProgressView`, health-бейдж Ollama, «тестовый поиск» без LLM). Включение ретрива — per-chat
     в `ChatSettingsView` (секция «RAG»: `ragEnabled`/`ragIndexID`/`ragTopK` в `GenerationSettings`).
     Владелец списка — `@StateObject ragVM` в `ContentView` (общий на приложение). Ретрив в `send()`
-    ортогонален контекст-стратегиям (идёт в память, не в историю). В FSM ретрив ЕСТЬ: один
-    RAG-блок на прогон (по тексту задачи) инжектится в `buildPrompt`/`subAgentPrompt` (параметр
-    `rag:`). В сравнении RAG ЕСТЬ per-lane: те же поля `settings.ragEnabled/ragIndexID/ragTopK`
+    ортогонален контекст-стратегиям (идёт в память, не в историю). В FSM ретрив ЕСТЬ: RAG-блок
+    на прогон инжектится в `buildPrompt`/`subAgentPrompt` (параметр `rag:`), причём НЕ статично:
+    гейт `RagRetrievalGate` (чистая структура в RagRerank.swift, локальная переменная
+    `runStateMachine`) ретривит на первом проходе цикла (запрос = текст задачи) и ПЕРЕ-ретривит,
+    когда изменился `guidance` (уточнения пользователя меняют, что искать; запрос = task +
+    последние 3 уточнения, усечённые). На обычных проходах гейт бесплатен (сравнение Int),
+    эмбеддер не гоняется; после await-ретрива — обязательные `pipelineGen`-guard + `isCancelled
+    → pauseAt`. Снапшот гейта НЕ персистентный: interject/resume перезапускают прогон → свежий
+    гейт ретривит заново. В сравнении RAG ЕСТЬ per-lane: те же поля `settings.ragEnabled/ragIndexID/ragTopK`
     у дорожки, секция «RAG» в настройках дорожки (`ChatSettingsView(ragVM:)`), ретрив мержится в
     `memory` поверх долговременной памяти (`ComparisonViewModel.send`); индикатор-лупа в шапке
     колонки. Одна модель в двух колонках (RAG вкл/выкл) = честное сравнение «с RAG / без RAG».
@@ -264,6 +270,22 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     `RagRerank.notFoundDirective` (обязан сказать «не знаю» + уточняющий вопрос) ВМЕСТО nil.
     Всё внутри строки блока → обвязка чата/FSM/сравнения не менялась. Выкл → фрагменты как
     раньше просто контекст (и nil при пустом итоге).
+    **Кодовая гарантия «Источников»** (директива — только просьба, модель может «забыть»):
+    чистая логика в `RagRerank` — `hasSourcesSection` (детектор раздела, терпит markdown-обвязку,
+    без ложных срабатываний на «источники» в середине фразы), `parseChunkLabels` (метки `[#N · …]`
+    из строки ragBlock; формат пишет `buildBlock` — тест-замок на синхронность),
+    `answerAdmitsNotFound` (честное «не знаю» без источников РАЗРЕШЕНО), `citationFooter`/
+    `ensureSourcesSection` (автофутер «Источники (автоматически…)» из меток; идемпотентна).
+    Срабатывание везде: `ragStrictMode && hasCitationLabels(ragBlock)` (отсекает выкл. RAG,
+    notFoundDirective, нестрогий режим). Чат (`send()`): нет раздела → ОДИН повторный запрос
+    с `citationRetryReminder` (ответ+напоминание одноразовой парой поверх payload.tail, история
+    НЕ раздувается; токены обоих вызовов суммируются в metrics/счётчики) → снова нет → автофутер;
+    ошибка ретрая (`try?`) → сразу автофутер (гарантия не роняет ответ). FSM: ТОЛЬКО этап
+    `.answer` (единственный итог для пользователя; промежуточные этапы — артефакты) — повтор
+    этапа по паттерну invariant-retry (`continue` до мутаций ctx/persistNow, бюджет 1 на прогон —
+    локальный `citationRetried`; напоминание `citationStageReminder` доезжает через rag-параметр
+    `buildPrompt`) → автофутер. Сравнение: ТОЛЬКО автофутер, БЕЗ ретрая (скрытый второй вызов
+    исказил бы честный замер токенов дорожки). Никаких новых персистентных полей.
 - **Миграция chats.json/projects.json** — у Chat, GenerationSettings, Project,
   ProjectEntry, MemoryItem РУЧНЫЕ init(from:) в extension с decodeIfPresent+дефолтами.
   Новые поля добавлять ТОЛЬКО так (поле + CodingKeys + init(from:)), иначе старый
