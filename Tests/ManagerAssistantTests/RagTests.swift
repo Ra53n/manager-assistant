@@ -223,19 +223,125 @@ final class RagTests: XCTestCase {
         let id = UUID()
         s.ragIndexID = id
         s.ragTopK = 8
+        s.ragCandidateK = 30
+        s.ragMinScore = 0.45
+        s.ragRerankEnabled = true
+        s.ragQueryRewrite = false
         let back = try dec.decode(GenerationSettings.self, from: enc.encode(s))
         XCTAssertTrue(back.ragEnabled)
         XCTAssertEqual(back.ragIndexID, id)
         XCTAssertEqual(back.ragTopK, 8)
+        XCTAssertEqual(back.ragCandidateK, 30)
+        XCTAssertEqual(back.ragMinScore, 0.45, accuracy: 1e-9)
+        XCTAssertTrue(back.ragRerankEnabled)
+        XCTAssertFalse(back.ragQueryRewrite)
     }
 
     func testGenerationSettingsOldJSONRagDefaults() throws {
-        // Старые настройки без RAG-полей → дефолты (выкл, индекс не выбран, top-K = 4).
+        // Старые настройки без RAG-полей → дефолты (выкл, индекс не выбран, top-K = 4;
+        // 2-й этап: 20 кандидатов, порог выкл, реранк выкл, rewrite ВКЛ).
         let json = #"{"provider":"deepseek","model":"deepseek-chat"}"#
         let s = try dec.decode(GenerationSettings.self, from: Data(json.utf8))
         XCTAssertFalse(s.ragEnabled)
         XCTAssertNil(s.ragIndexID)
         XCTAssertEqual(s.ragTopK, 4)
+        XCTAssertEqual(s.ragCandidateK, 20)
+        XCTAssertEqual(s.ragMinScore, 0)
+        XCTAssertFalse(s.ragRerankEnabled)
+        XCTAssertTrue(s.ragQueryRewrite)
+    }
+
+    // MARK: - Второй этап: порог релевантности / LLM-реранк / query rewrite (RagRerank)
+
+    private func hit(_ text: String, _ score: Float) -> RagRetrievalHit {
+        RagRetrievalHit(chunk: RagChunk(text: text), score: score)
+    }
+
+    func testThresholdFilterDropsBelowAndKeepsOrder() {
+        let hits = [hit("a", 0.9), hit("b", 0.5), hit("c", 0.39), hit("d", 0.7)]
+        let out = RagRerank.thresholdFilter(hits, minScore: 0.4)
+        XCTAssertEqual(out.map(\.chunk.text), ["a", "b", "d"])
+    }
+
+    func testThresholdFilterZeroIsOff() {
+        let hits = [hit("a", -0.2), hit("b", 0.1)]
+        XCTAssertEqual(RagRerank.thresholdFilter(hits, minScore: 0), hits)
+    }
+
+    func testThresholdFilterCanDropAll() {
+        let hits = [hit("a", 0.1), hit("b", 0.2)]
+        XCTAssertTrue(RagRerank.thresholdFilter(hits, minScore: 0.5).isEmpty)
+    }
+
+    func testRerankParserValidCSV() {
+        XCTAssertEqual(RagRerank.parseRerankIndices("3,1,5", candidateCount: 5), [2, 0, 4])
+    }
+
+    func testRerankParserToleratesGarbage() {
+        // Мусор вокруг чисел, дубликаты, out-of-range → дедуп + отброс лишнего.
+        let out = RagRerank.parseRerankIndices("Подходят фрагменты: 2, 2 и 99, ещё 1.", candidateCount: 3)
+        XCTAssertEqual(out, [1, 0])
+    }
+
+    func testRerankParserExplicitZeroMeansNone() {
+        XCTAssertEqual(RagRerank.parseRerankIndices("0", candidateCount: 4), [])
+    }
+
+    func testRerankParserUnparsableIsNil() {
+        XCTAssertNil(RagRerank.parseRerankIndices("не могу определить", candidateCount: 4))
+        XCTAssertNil(RagRerank.parseRerankIndices("", candidateCount: 4))
+    }
+
+    func testApplyRerank() {
+        let hits = [hit("a", 0.9), hit("b", 0.8), hit("c", 0.7)]
+        // Явный порядок реранка + обрезка до topK.
+        XCTAssertEqual(RagRerank.applyRerank(hits: hits, indices: [2, 0, 1], topK: 2).map(\.chunk.text), ["c", "a"])
+        // nil (мусор от модели) → фолбэк: порядок по score.
+        XCTAssertEqual(RagRerank.applyRerank(hits: hits, indices: nil, topK: 2).map(\.chunk.text), ["a", "b"])
+        // [] («ничего не релевантно») → пусто.
+        XCTAssertTrue(RagRerank.applyRerank(hits: hits, indices: [], topK: 2).isEmpty)
+    }
+
+    func testRerankPromptNumbersAndTruncates() {
+        let long = String(repeating: "х", count: 700)
+        let prompt = RagRerank.rerankUserPrompt(query: "вопрос", candidates: ["первый", long], maxChunkChars: 600)
+        XCTAssertTrue(prompt.contains("ЗАПРОС: вопрос"))
+        XCTAssertTrue(prompt.contains("1) первый"))
+        XCTAssertTrue(prompt.contains("2) "))
+        XCTAssertFalse(prompt.contains(long))               // усечён
+        XCTAssertTrue(prompt.contains(String(long.prefix(600))))
+    }
+
+    func testRewriteParserStripsQuotesFirstLine() {
+        XCTAssertEqual(RagRerank.parseRewrittenQuery("«бюджет проекта Х»\nпояснение", fallback: "f"),
+                       "бюджет проекта Х")
+        XCTAssertEqual(RagRerank.parseRewrittenQuery("Запрос: \"лимиты API\"", fallback: "f"), "лимиты API")
+    }
+
+    func testRewriteParserEmptyOrOverlongFallsBack() {
+        XCTAssertEqual(RagRerank.parseRewrittenQuery("   \n  ", fallback: "исходный"), "исходный")
+        let overlong = String(repeating: "a", count: 600)
+        XCTAssertEqual(RagRerank.parseRewrittenQuery(overlong, fallback: "исходный"), "исходный")
+    }
+
+    func testRewritePromptResolvesHistoryFormat() {
+        let history = [ChatMessage(role: .user, content: "расскажи про проект Атлас"),
+                       ChatMessage(role: .assistant, content: "Атлас — это…")]
+        let prompt = RagRerank.rewriteUserPrompt(question: "а какой у него бюджет?", history: history)
+        XCTAssertTrue(prompt.contains("Пользователь: расскажи про проект Атлас"))
+        XCTAssertTrue(prompt.contains("Ассистент: Атлас"))
+        XCTAssertTrue(prompt.hasSuffix("Вопрос: а какой у него бюджет?"))
+        // Без истории — только вопрос.
+        XCTAssertEqual(RagRerank.rewriteUserPrompt(question: "q", history: []), "Вопрос: q")
+    }
+
+    func testBuildBlockAfterThreshold() {
+        let filtered = RagRerank.thresholdFilter([hit("выживший факт", 0.8), hit("шум", 0.1)], minScore: 0.5)
+        let block = RagRetriever.buildBlock(hits: filtered, budgetTokens: 500)
+        XCTAssertNotNil(block)
+        XCTAssertTrue(block!.contains("выживший факт"))
+        XCTAssertFalse(block!.contains("шум"))
+        XCTAssertNil(RagRetriever.buildBlock(hits: [], budgetTokens: 500))
     }
 
     // MARK: - Инъекция RAG в промпты FSM

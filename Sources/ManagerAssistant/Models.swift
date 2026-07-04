@@ -191,8 +191,16 @@ struct GenerationSettings: Equatable, Codable {
     var ragEnabled: Bool = false
     /// Выбранный индекс (nil — ничего не подставляем).
     var ragIndexID: UUID? = nil
-    /// Сколько top-K фрагментов доставать и подставлять в контекст.
+    /// Сколько top-K фрагментов подставлять в контекст (ПОСЛЕ фильтрации/реранка).
     var ragTopK: Int = 4
+    /// Сколько кандидатов доставать из векторного индекса ДО фильтрации/переранжирования.
+    var ragCandidateK: Int = 20
+    /// Порог косинусной близости: кандидаты со score ниже отбрасываются. 0 = фильтр выключен.
+    var ragMinScore: Double = 0.0
+    /// Второй этап: LLM-переранжирование кандидатов моделью чата (доп. запрос, точнее, но дороже).
+    var ragRerankEnabled: Bool = false
+    /// Переформулировать вопрос в самодостаточный поисковый запрос перед ретривом (LLM).
+    var ragQueryRewrite: Bool = true
 
     static let `default` = GenerationSettings()
 
@@ -205,6 +213,8 @@ struct GenerationSettings: Equatable, Codable {
     static let memoryTokenBudgetRange = 200...4000
     static let maxParallelAgentsRange = 2...6
     static let ragTopKRange = 1...12
+    static let ragCandidateKRange = 4...50
+    static let ragMinScoreRange = 0.0...0.9
 
     enum CodingKeys: String, CodingKey {
         case provider, model, temperature, topP, maxTokens, stop, responseFormat
@@ -216,6 +226,7 @@ struct GenerationSettings: Equatable, Codable {
         case swarmEnabled, maxParallelAgents
         case mcpEnabled, enabledMCPServerIDs
         case ragEnabled, ragIndexID, ragTopK
+        case ragCandidateK, ragMinScore, ragRerankEnabled, ragQueryRewrite
     }
 }
 
@@ -250,6 +261,10 @@ extension GenerationSettings {
         ragEnabled = try c.decodeIfPresent(Bool.self, forKey: .ragEnabled) ?? d.ragEnabled
         ragIndexID = try c.decodeIfPresent(UUID.self, forKey: .ragIndexID) ?? d.ragIndexID
         ragTopK = try c.decodeIfPresent(Int.self, forKey: .ragTopK) ?? d.ragTopK
+        ragCandidateK = try c.decodeIfPresent(Int.self, forKey: .ragCandidateK) ?? d.ragCandidateK
+        ragMinScore = try c.decodeIfPresent(Double.self, forKey: .ragMinScore) ?? d.ragMinScore
+        ragRerankEnabled = try c.decodeIfPresent(Bool.self, forKey: .ragRerankEnabled) ?? d.ragRerankEnabled
+        ragQueryRewrite = try c.decodeIfPresent(Bool.self, forKey: .ragQueryRewrite) ?? d.ragQueryRewrite
     }
 }
 

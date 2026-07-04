@@ -91,21 +91,19 @@ final class ComparisonViewModel: ObservableObject {
             let payload = ContextManager.payload(messages: tracks[index].messages, settings: settings, facts: tracks[index].facts)
             let memoryText = MemoryContext.assembleLongTermOnly(longTerm: globalMemoryLookup(), settings: settings)
             let price = priceLookup(model)
+            // История дорожки ДО только что добавленного вопроса — контекст для query rewrite.
+            let ragHistory = Array(tracks[index].messages.dropLast().suffix(6))
 
             Task {
                 let start = Date()
                 do {
-                    // RAG per-lane: если у дорожки включён ретрив и выбран индекс — достаём
-                    // релевантные фрагменты и мержим с памятью (как в обычном чате). Ошибка
-                    // ретрива невозможна (retrieveBlock возвращает nil) — send не ломается.
-                    let ragBlock: String?
-                    if settings.ragEnabled, let ragID = settings.ragIndexID {
-                        ragBlock = await RagRetriever.retrieveBlock(
-                            indexID: ragID, query: text, topK: settings.ragTopK,
-                            budgetTokens: max(200, settings.memoryTokenBudget / 2))
-                    } else {
-                        ragBlock = nil
-                    }
+                    // RAG per-lane: полный пайплайн (rewrite → поиск → порог → реранк —
+                    // настройки у каждой дорожки свои, что и даёт сравнение режимов
+                    // «с фильтром / без» бок о бок). Ошибка ретрива невозможна
+                    // (retrieveBlock возвращает nil) — send не ломается.
+                    let ragBlock = await RagRetriever.retrieveBlock(
+                        client: client, settings: settings, query: text, history: ragHistory,
+                        budgetTokens: max(200, settings.memoryTokenBudget / 2))
                     let result = try await client.send(
                         messages: payload.tail,
                         settings: settings,

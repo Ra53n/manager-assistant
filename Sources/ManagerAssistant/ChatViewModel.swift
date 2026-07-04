@@ -506,13 +506,16 @@ final class ChatViewModel: ObservableObject {
         // Директивы активного «Профиля ответа» (стиль/формат/ограничения).
         let profileText = profile(for: chats[idx])?.systemDirective
         let price = pricing["\(settings.provider.rawValue)|\(settings.model)"]
+        // Последние реплики ДО только что добавленного вопроса — контекст для query rewrite
+        // (снапшот на MainActor: messages — computed путь по дереву, в Task не лезем).
+        let ragHistory = Array(chats[idx].messages.dropLast().suffix(6))
 
         Task {
             let start = Date()
             do {
                 // RAG: релевантные фрагменты из выбранного индекса (async, не блокирует UI).
                 // Дописываются к блоку памяти — модель видит их как контекст (см. PromptBuilder).
-                let ragBlock = await ragRetrieval(settings: settings, query: text)
+                let ragBlock = await ragRetrieval(settings: settings, query: text, history: ragHistory)
                 let memoryForSend = Self.mergeMemory(memoryText, ragBlock)
                 // MCP в обычном чате: если включено и есть инструменты — агентный tool-loop
                 // (модель сама дёргает инструменты перед ответом). Иначе — обычный send().
@@ -1527,15 +1530,15 @@ final class ChatViewModel: ObservableObject {
         )
     }
 
-    /// RAG-ретрив для чата: релевантные фрагменты выбранного индекса по запросу.
-    /// nil — RAG выключен / индекс не выбран / ничего не нашлось / ошибка (ретрив НИКОГДА
-    /// не роняет отправку). Читает индекс лениво с диска (RagRetriever), поэтому не зависит
-    /// от RagViewModel; тяжёлая часть — в await, MainActor не блокируется. Бюджет — половина
-    /// бюджета памяти, чтобы фрагменты не вытесняли остальную память.
-    func ragRetrieval(settings: GenerationSettings, query: String) async -> String? {
-        guard settings.ragEnabled, let id = settings.ragIndexID else { return nil }
-        return await RagRetriever.retrieveBlock(indexID: id, query: query,
-                                                topK: settings.ragTopK,
+    /// RAG-ретрив для чата: полный пайплайн (rewrite → поиск → порог → реранк → блок,
+    /// см. RagRetriever.retrieveBlock(client:...)). nil — RAG выключен / индекс не выбран /
+    /// всё отфильтровано / ошибка (ретрив НИКОГДА не роняет отправку). history — последние
+    /// реплики для query rewrite (FSM зовёт без истории: текст задачи самодостаточен).
+    /// Бюджет — половина бюджета памяти, чтобы фрагменты не вытесняли остальную память.
+    func ragRetrieval(settings: GenerationSettings, query: String, history: [ChatMessage] = []) async -> String? {
+        guard settings.ragEnabled, settings.ragIndexID != nil else { return nil }
+        return await RagRetriever.retrieveBlock(client: client, settings: settings,
+                                                query: query, history: history,
                                                 budgetTokens: max(200, settings.memoryTokenBudget / 2))
     }
 

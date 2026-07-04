@@ -1513,15 +1513,40 @@ struct ChatSettingsView: View {
                             Text("Не выбран").tag(UUID?.none)
                             ForEach(ready) { ix in Text(ix.name).tag(Optional(ix.id)) }
                         }
+                        Stepper(value: $settings.ragCandidateK, in: GenerationSettings.ragCandidateKRange) {
+                            HStack {
+                                Text("Кандидатов из индекса")
+                                Spacer()
+                                Text("\(settings.ragCandidateK)")
+                                    .foregroundColor(.secondary)
+                                    .monospacedDigit()
+                            }
+                        }
                         Stepper(value: $settings.ragTopK, in: GenerationSettings.ragTopKRange) {
                             HStack {
-                                Text("Фрагментов (top-K)")
+                                Text("Фрагментов в контекст (top-K)")
                                 Spacer()
                                 Text("\(settings.ragTopK)")
                                     .foregroundColor(.secondary)
                                     .monospacedDigit()
                             }
                         }
+                        HStack {
+                            Text("Порог релевантности")
+                            Slider(value: $settings.ragMinScore, in: GenerationSettings.ragMinScoreRange, step: 0.05)
+                            Text(settings.ragMinScore <= 0 ? "выкл" : String(format: "%.2f", settings.ragMinScore))
+                                .foregroundColor(.secondary)
+                                .monospacedDigit()
+                                .frame(width: 38, alignment: .trailing)
+                        }
+                        Text("Кандидаты с косинусной близостью ниже порога отбрасываются (0 — фильтр выключен; разумные значения 0.3–0.5). Если порог отсёк всех — фрагменты не подставляются.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Toggle("LLM-переранжирование кандидатов", isOn: $settings.ragRerankEnabled)
+                        Text("Вкл: модель чата одним доп. запросом сортирует кандидатов по релевантности и оставляет top-K лучших (точнее порога, но дороже). Ошибка запроса → порядок по score.")
+                            .font(.caption).foregroundColor(.secondary)
+                        Toggle("Переформулировать вопрос для поиска", isOn: $settings.ragQueryRewrite)
+                        Text("Модель переписывает вопрос в самодостаточный поисковый запрос (раскрывает «он»/«это» по последним репликам). Ошибка → ищем по исходному вопросу.")
+                            .font(.caption).foregroundColor(.secondary)
                         if ready.isEmpty {
                             Text("Пока нет готовых индексов. Создай индекс кнопкой «лупа» в шапке чата.")
                                 .font(.caption).foregroundColor(.orange)

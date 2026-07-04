@@ -277,6 +277,29 @@ struct DeepSeekClient {
                               temperature: 0.2, maxTokens: 32, stop: [])
     }
 
+    /// RAG: переписывает вопрос в самодостаточный поисковый запрос (query rewrite).
+    /// Best-effort: промпт/парсер — в RagRerank, ошибка вызова гасится вызывающим
+    /// (фолбэк на исходный вопрос — ретрив никогда не роняет отправку).
+    func rewriteRagQuery(question: String, history: [ChatMessage], settings: GenerationSettings) async throws -> SendResult {
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: RagRerank.rewriteSystemPrompt),
+            .init(role: ChatRole.user.rawValue, content: RagRerank.rewriteUserPrompt(question: question, history: history)),
+        ]
+        return try await post(payloadMessages: payloadMessages, settings: settings,
+                              temperature: 0.1, maxTokens: 128, stop: [])
+    }
+
+    /// RAG: переранжирование кандидатов одним запросом (LLM как аналог cross-encoder).
+    /// Возвращает сырой текст («3,1,5» / «0»); разбор — RagRerank.parseRerankIndices.
+    func rerankChunks(query: String, candidates: [String], settings: GenerationSettings) async throws -> SendResult {
+        let payloadMessages: [ChatRequest.RequestMessage] = [
+            .init(role: ChatRole.system.rawValue, content: RagRerank.rerankSystemPrompt),
+            .init(role: ChatRole.user.rawValue, content: RagRerank.rerankUserPrompt(query: query, candidates: candidates)),
+        ]
+        return try await post(payloadMessages: payloadMessages, settings: settings,
+                              temperature: 0.0, maxTokens: 64, stop: [])
+    }
+
     /// «Собрать»: сшивает ПОЛНЫЕ тела секций проекта в единый итоговый документ.
     func assembleProject(title: String, brief: String, entries: [ProjectEntry], settings: GenerationSettings) async throws -> SendResult {
         let system = """

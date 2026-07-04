@@ -55,9 +55,63 @@ enum RagRetriever {
         }
     }
 
-    /// Готовый блок для инъекции в контекст. nil — нечего подставить.
+    /// Готовый блок для инъекции в контекст (простой путь БЕЗ фильтрации/реранка —
+    /// используется тестами и как базис; чат/FSM/сравнение идут через пайплайн ниже).
+    /// nil — нечего подставить.
     static func retrieveBlock(indexID: UUID, query: String, topK: Int, budgetTokens: Int) async -> String? {
         let hits = await search(indexID: indexID, query: query, topK: topK)
+        return buildBlock(hits: hits, budgetTokens: budgetTokens)
+    }
+
+    /// ПОЛНЫЙ пайплайн ретрива со вторым этапом (по ТЗ «День 23»):
+    ///   (query rewrite LLM) → поиск top-candidateK → порог similarity → (LLM-реранк) →
+    ///   top-K лучших → блок.
+    /// Каждый шаг при ошибке ДЕГРАДИРУЕТ к предыдущему результату (rewrite не удался →
+    /// ищем по исходному вопросу; реранк вернул мусор → порядок по score) — ретрив
+    /// НИКОГДА не бросает и не роняет отправку. Порог/реранк могут осознанно отсеять
+    /// всех кандидатов → nil (нерелевантное не подставляем — это фича).
+    static func retrieveBlock(client: DeepSeekClient,
+                              settings: GenerationSettings,
+                              query: String,
+                              history: [ChatMessage],
+                              budgetTokens: Int) async -> String? {
+        guard settings.ragEnabled, let indexID = settings.ragIndexID else { return nil }
+
+        // 1. Query rewrite: вопрос → самодостаточный поисковый запрос (местоимения
+        //    раскрываются по последним репликам). Ошибка/мусор → исходный вопрос.
+        var searchQuery = query
+        if settings.ragQueryRewrite {
+            if let raw = try? await client.rewriteRagQuery(question: query, history: history, settings: settings) {
+                searchQuery = RagRerank.parseRewrittenQuery(raw.text, fallback: query)
+            }
+        }
+
+        // 2. Кандидаты: широкий top-candidateK (до фильтрации), не уже финального top-K.
+        let candidateK = max(settings.ragCandidateK, settings.ragTopK)
+        var hits = await search(indexID: indexID, query: searchQuery, topK: candidateK)
+        guard !hits.isEmpty else { return nil }
+
+        // 3. Порог релевантности (бесплатная эвристика). Отсёк всех → блока нет.
+        hits = RagRerank.thresholdFilter(hits, minScore: settings.ragMinScore)
+        guard !hits.isEmpty else { return nil }
+
+        // 4. LLM-реранк (аналог cross-encoder). Зовём только когда есть что резать.
+        if settings.ragRerankEnabled, hits.count > settings.ragTopK {
+            let raw = try? await client.rerankChunks(query: searchQuery,
+                                                     candidates: hits.map { $0.chunk.text },
+                                                     settings: settings)
+            let indices = raw.flatMap { RagRerank.parseRerankIndices($0.text, candidateCount: hits.count) }
+            hits = RagRerank.applyRerank(hits: hits, indices: indices, topK: settings.ragTopK)
+        } else {
+            hits = Array(hits.prefix(settings.ragTopK))
+        }
+
+        return buildBlock(hits: hits, budgetTokens: budgetTokens)
+    }
+
+    /// Сборка текстового блока из попаданий под токенный бюджет (~3 симв./токен).
+    /// Хотя бы первый (лучший) чанк включается всегда. nil — попаданий нет / всё пустое.
+    static func buildBlock(hits: [RagRetrievalHit], budgetTokens: Int) -> String? {
         guard !hits.isEmpty else { return nil }
 
         var lines: [String] = []

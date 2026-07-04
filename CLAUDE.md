@@ -241,6 +241,22 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     у дорожки, секция «RAG» в настройках дорожки (`ChatSettingsView(ragVM:)`), ретрив мержится в
     `memory` поверх долговременной памяти (`ComparisonViewModel.send`); индикатор-лупа в шапке
     колонки. Одна модель в двух колонках (RAG вкл/выкл) = честное сравнение «с RAG / без RAG».
+  • **Второй этап ретрива (реранкинг/фильтрация + query rewrite)** — полный пайплайн в
+    `RagRetriever.retrieveBlock(client:settings:query:history:budgetTokens:)`:
+    (rewrite LLM) → поиск top-`ragCandidateK`(деф. 20, ДО фильтрации) → порог косинуса
+    `ragMinScore` (0 = выкл; отсёк всех → блока НЕТ — осознанно ломает «лучший чанк всегда») →
+    (LLM-реранк `ragRerankEnabled`, деф. выкл) → top-`ragTopK` → блок. Чистая логика — в
+    `RagRerank.swift` (порог, промпты, парсеры; офлайн-тесты), LLM-вызовы —
+    `DeepSeekClient.rewriteRagQuery`/`rerankChunks` (паттерн `sectionTitle`; парсинг НЕ в
+    клиенте). Реранкер = ТЕКУЩАЯ модель чата одним вызовом (нумерованные кандидаты → «3,1,5»,
+    «0» = ничего не релевантно → блока нет; мусор → nil → фолбэк на порядок по score) —
+    настоящий cross-encoder через Ollama невозможен (нет rerank-API). Query rewrite
+    (`ragQueryRewrite`, ВКЛ по умолчанию): вопрос → самодостаточный запрос по последним 6
+    репликам (`history` снапшотится на MainActor ДО Task, `messages.dropLast().suffix(6)`);
+    ошибка ЛЮБОГО шага → деградация к предыдущему результату, ретрив по-прежнему никогда не
+    роняет send(). FSM зовёт с `history: []`. Старый простой `retrieveBlock(indexID:...)`
+    оставлен (панель/тесты). При `ragMinScore=0`+реранк выкл путь байт-в-байт как раньше.
+    Сравнение режимов «с фильтром / без» — те же per-lane настройки дорожек.
 - **Миграция chats.json/projects.json** — у Chat, GenerationSettings, Project,
   ProjectEntry, MemoryItem РУЧНЫЕ init(from:) в extension с decodeIfPresent+дефолтами.
   Новые поля добавлять ТОЛЬКО так (поле + CodingKeys + init(from:)), иначе старый
