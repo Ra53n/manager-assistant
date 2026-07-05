@@ -128,4 +128,23 @@ final class FSMTests: XCTestCase {
         let ctx2 = TaskContext(task: "T", state: .execution)
         XCTAssertEqual(ctx2.transitioned(to: .planning).state, .planning)
     }
+
+    // MARK: Перенос уточнений между прогонами одного чата
+
+    func testCarryGuidanceFromPreviousRun() {
+        var prev = TaskContext(task: "старая задача", state: .answer, status: .finished)
+        prev.guidance = ["не продавать акции", "расходы 250к"]
+        XCTAssertEqual(TaskContext.carryGuidance(from: prev),
+                       ["не продавать акции", "расходы 250к"])
+        XCTAssertEqual(TaskContext.carryGuidance(from: nil), [])
+    }
+
+    func testCarryGuidanceCapsAtLast() {
+        var prev = TaskContext(task: "T", state: .answer)
+        prev.guidance = (1...10).map { "уточнение \($0)" }
+        let carried = TaskContext.carryGuidance(from: prev, cap: 6)
+        XCTAssertEqual(carried.count, 6)
+        XCTAssertEqual(carried.first, "уточнение 5")     // последние 6
+        XCTAssertEqual(carried.last, "уточнение 10")
+    }
 }

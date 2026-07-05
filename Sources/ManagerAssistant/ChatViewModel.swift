@@ -485,10 +485,13 @@ final class ChatViewModel: ObservableObject {
         if chats[idx].settings.pipelineMode != .off {
             chats[idx].invariantConflict = nil
             chats[idx].stateChangeError = nil
-            chats[idx].taskContext = TaskContext(task: text,
-                                                 state: .planning,
-                                                 mode: chats[idx].settings.pipelineMode,
-                                                 status: .running)
+            var ctx = TaskContext(task: text,
+                                  state: .planning,
+                                  mode: chats[idx].settings.pipelineMode,
+                                  status: .running)
+            // Уточнения/ограничения из предыдущего прогона этого чата не забываем.
+            ctx.guidance = TaskContext.carryGuidance(from: chats[idx].taskContext)
+            chats[idx].taskContext = ctx
             input = ""
             startPipeline(chatID: chatID)
             return
@@ -642,6 +645,17 @@ final class ChatViewModel: ObservableObject {
         // Кодовая гарантия «Источников» на этапе «Ответ»: бюджет — ОДИН повтор за прогон.
         var citationRetried = false
         var citationReminderPending = false
+        // Контекст предыдущего диалога (снапшот на старте прогона): реплики пользователя +
+        // итоговые ответы. Без него прогоны в одном чате не знают друг о друге, и «какая
+        // была цель диалога?» отвечалась по случайным RAG-фрагментам. Текст текущей задачи
+        // не дублируем (он уже в [QUERY]).
+        let dialog: String = {
+            guard let chat = chats.first(where: { $0.id == chatID }) else { return "" }
+            var msgs = chat.messages
+            if let ctx0 = chat.taskContext, let last = msgs.last,
+               last.role == .user, last.content == ctx0.task { msgs.removeLast() }
+            return PipelinePrompts.dialogContext(messages: msgs)
+        }()
         while true {
             // Инструменты MCP подключаем ДО основного guard — вне мутаций ctx, чтобы
             // await не пересёкся с правкой состояния. Выключено → путь без MCP не меняется.
@@ -709,7 +723,7 @@ final class ChatViewModel: ObservableObject {
             // доезжает через rag-параметр — сигнатуры buildPrompt не меняются.
             let ragForPrompt = (citationReminderPending && state == .answer && !ragBlock.isEmpty)
                 ? ragBlock + "\n\n" + RagRerank.citationStageReminder : ragBlock
-            let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs, rag: ragForPrompt)
+            let user = PipelinePrompts.buildPrompt(query: ctx.task, ctx: ctx, profile: profileText, invariants: invs, rag: ragForPrompt, dialog: dialog)
             chats[i].isLoading = true
 
             let start = Date()

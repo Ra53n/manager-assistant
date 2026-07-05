@@ -236,4 +236,45 @@ final class PromptParsingTests: XCTestCase {
         XCTAssertFalse(p.contains("вывод B"))       // НЕ-зависимость не включена (экономия контекста)
         XCTAssertTrue(p.contains("C"))              // текущий шаг
     }
+
+    // MARK: dialogContext — контекст предыдущего диалога для прогона FSM
+
+    func testDialogContextKeepsUserAndFinalAnswersOnly() {
+        var planning = ChatMessage(role: .assistant, content: "план этапа")
+        planning.state = .planning
+        var execution = ChatMessage(role: .assistant, content: "шаг 1 сделан")
+        execution.state = .execution
+        var answer = ChatMessage(role: .assistant, content: "итоговый ответ")
+        answer.state = .answer
+        let msgs = [ChatMessage(role: .user, content: "составь стратегию"),
+                    planning, execution, answer,
+                    ChatMessage(role: .assistant, content: "обычный ответ вне FSM")]
+        let dlg = PipelinePrompts.dialogContext(messages: msgs)
+        XCTAssertTrue(dlg.contains("Пользователь: составь стратегию"))
+        XCTAssertTrue(dlg.contains("Ассистент: итоговый ответ"))
+        XCTAssertTrue(dlg.contains("Ассистент: обычный ответ вне FSM"))
+        XCTAssertFalse(dlg.contains("план этапа"))          // промежуточные этапы — шум
+        XCTAssertFalse(dlg.contains("шаг 1 сделан"))
+    }
+
+    func testDialogContextLimitsAndTruncates() {
+        let msgs = (1...10).map { ChatMessage(role: .user, content: "вопрос \($0) " + String(repeating: "х", count: 600)) }
+        let dlg = PipelinePrompts.dialogContext(messages: msgs, maxTurns: 3, maxTurnChars: 50)
+        XCTAssertFalse(dlg.contains("вопрос 7"))            // только последние 3
+        XCTAssertTrue(dlg.contains("вопрос 8"))
+        XCTAssertTrue(dlg.contains("вопрос 10"))
+        XCTAssertFalse(dlg.contains(String(repeating: "х", count: 51)))   // усечено
+        XCTAssertEqual(PipelinePrompts.dialogContext(messages: []), "")
+    }
+
+    func testBuildPromptInjectsDialogBlock() {
+        let ctx = TaskContext(task: "T", state: .planning)
+        let with = PipelinePrompts.buildPrompt(query: "T", ctx: ctx, profile: "",
+                                               dialog: "Пользователь: зафиксируй ограничение")
+        XCTAssertTrue(with.contains("[КОНТЕКСТ ДИАЛОГА"))
+        XCTAssertTrue(with.contains("зафиксируй ограничение"))
+        XCTAssertTrue(with.contains("НЕ фрагментами базы знаний"))
+        let without = PipelinePrompts.buildPrompt(query: "T", ctx: ctx, profile: "")
+        XCTAssertFalse(without.contains("[КОНТЕКСТ ДИАЛОГА"))
+    }
 }
