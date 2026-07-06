@@ -50,6 +50,10 @@ struct ContentView: View {
     // Локальный RAG (база знаний): один экземпляр на приложение, список индексов общий.
     @StateObject private var ragVM = RagViewModel()
 
+    // Локальные модели (Ollama/LM Studio/llama.cpp): один экземпляр на приложение —
+    // скачивание модели переживает закрытие панели и смену чата.
+    @StateObject private var localModelsVM = LocalModelsViewModel()
+
     // Вкладка «Рутины» (агент на VPS)
     @StateObject private var routinesVM = RoutinesViewModel()
     @State private var selectedRoutineID: String?
@@ -78,6 +82,10 @@ struct ContentView: View {
         .sheet(isPresented: $showingAgentConnection) { ConnectionSettingsView(vm: routinesVM) }
         .sheet(isPresented: $showingAgentSettings) { AgentSettingsView(vm: routinesVM) }
         .onChange(of: mode) { m in if m == .routines { Task { await enterRoutines() } } }
+        .onAppear {
+            // После установки/удаления локальной модели — перечитать пикер моделей.
+            localModelsVM.onModelsChanged = { [weak vm] in vm?.loadModels(force: true) }
+        }
         .sheet(isPresented: $showingCreateProject) {
             ProjectCreateView { title, instructions in
                 let pid = vm.newProject(title: title, brief: instructions)
@@ -332,7 +340,7 @@ struct ContentView: View {
         if mode == .routines {
             routinesDetail
         } else if vm.selectedChat != nil {
-            ChatDetailView(vm: vm, ragVM: ragVM)
+            ChatDetailView(vm: vm, ragVM: ragVM, localModelsVM: localModelsVM)
         } else {
             VStack(spacing: 12) {
                 Image(systemName: mode == .chats ? "bubble.left.and.bubble.right" : "folder")
@@ -356,6 +364,8 @@ private struct IDBox: Identifiable { let id: UUID }
 struct ChatDetailView: View {
     @ObservedObject var vm: ChatViewModel
     @ObservedObject var ragVM: RagViewModel
+    @ObservedObject var localModelsVM: LocalModelsViewModel
+    @State private var showingLocalModels = false
     @State private var showingSettings = false
     @State private var showingFacts = false
     @State private var showingMemory = false
@@ -466,6 +476,15 @@ struct ChatDetailView: View {
                 .help("RAG: локальная база знаний (индексация файлов/папок + ретрив в чате)")
 
                 Button {
+                    showingLocalModels = true
+                } label: {
+                    Image(systemName: "desktopcomputer")
+                        .foregroundStyle((vm.selectedChat?.settings.provider.isLocal ?? false)
+                                         ? Color.accentColor : Color.secondary)
+                }
+                .help("Локальные модели: Ollama / LM Studio / llama.cpp — установка, статус, что уже стоит на ПК")
+
+                Button {
                     showingMemory = true
                 } label: {
                     Image(systemName: "brain")
@@ -487,6 +506,12 @@ struct ChatDetailView: View {
         }
         .sheet(isPresented: $showingRag) {
             RagPanelView(ragVM: ragVM)
+        }
+        .sheet(isPresented: $showingLocalModels, onDismiss: {
+            // Раннер могли запустить/остановить, модели — скачать/удалить.
+            vm.loadModels(force: true)
+        }) {
+            LocalModelsPanelView(vm: localModelsVM)
         }
         .sheet(isPresented: $showingFacts) {
             FactsEditorView(text: vm.selectedChat?.facts ?? "") { edited in
@@ -2720,7 +2745,8 @@ struct ProviderKeysView: View {
             Divider()
 
             Form {
-                ForEach(Provider.allCases, id: \.self) { provider in
+                // Локальным раннерам ключ не нужен — поля не показываем.
+                ForEach(Provider.allCases.filter(\.requiresKey), id: \.self) { provider in
                     Section(provider.displayName) {
                         TextField(
                             "",
@@ -2754,7 +2780,7 @@ struct ProviderKeysView: View {
                 Spacer()
                 Button("Отмена") { dismiss() }
                 Button("Сохранить") {
-                    for provider in Provider.allCases {
+                    for provider in Provider.allCases.filter(\.requiresKey) {
                         KeyStore.setKey(keys[provider] ?? "", for: provider)
                     }
                     vm.loadModels(force: true)
@@ -2766,7 +2792,7 @@ struct ProviderKeysView: View {
         }
         .frame(width: 480, height: 420)
         .onAppear {
-            for provider in Provider.allCases {
+            for provider in Provider.allCases.filter(\.requiresKey) {
                 keys[provider] = KeyStore.key(for: provider)
             }
         }

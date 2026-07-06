@@ -1,9 +1,15 @@
 // Providers.swift — мультипровайдерность и хранение ключей.
 //
-// Provider — перечисление OpenAI-совместимых провайдеров (DeepSeek, OpenRouter):
-// у каждого свой chat-endpoint, endpoint списка моделей, файл ключа и env-var.
+// Provider — перечисление OpenAI-совместимых провайдеров: облачные (DeepSeek,
+// OpenRouter — нужен ключ) и локальные раннеры (Ollama, LM Studio, llama.cpp —
+// ключ не нужен, isLocal=true, endpoint'ы читаются из LocalEndpoints).
 // Добавление нового провайдера = новый case + заполнение этих полей; UI
 // (пикер моделей, лист ключей) подхватит его автоматически через allCases.
+// Лист ключей фильтрует по requiresKey — локальным поля ключа не показываются.
+//
+// LocalEndpoints — базовые адреса локальных серверов с override в UserDefaults
+// (конфиг машины, не чата — поэтому НЕ в GenerationSettings: нулевая миграция
+// chats.json и синхронный доступ из computed props enum'а).
 //
 // KeyStore — ключи лежат ВНЕ репозитория в ~/.config/manager-assistant/<p>.key
 // (или в env-переменных, env приоритетнее). Никогда не хардкодить ключи в код
@@ -15,15 +21,33 @@
 
 import Foundation
 
-/// Поставщик OpenAI-совместимого API.
+/// Поставщик OpenAI-совместимого API (облачный или локальный раннер).
 enum Provider: String, CaseIterable, Codable, Hashable {
     case deepseek
     case openrouter
+    // Локальные раннеры (облачные выше — остаются первыми в пикерах).
+    case ollama
+    case lmstudio
+    case llamacpp
+
+    /// Локальный раннер на этой машине (без ключа, endpoint из LocalEndpoints).
+    var isLocal: Bool {
+        switch self {
+        case .deepseek, .openrouter: return false
+        case .ollama, .lmstudio, .llamacpp: return true
+        }
+    }
+
+    /// Нужен ли ключ API для работы (локальным — нет).
+    var requiresKey: Bool { !isLocal }
 
     var displayName: String {
         switch self {
         case .deepseek: return "DeepSeek"
         case .openrouter: return "OpenRouter"
+        case .ollama: return "Ollama (локально)"
+        case .lmstudio: return "LM Studio (локально)"
+        case .llamacpp: return "llama.cpp (локально)"
         }
     }
 
@@ -32,6 +56,8 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "https://api.deepseek.com/chat/completions"
         case .openrouter: return "https://openrouter.ai/api/v1/chat/completions"
+        case .ollama, .lmstudio, .llamacpp:
+            return LocalEndpoints.baseURL(for: self) + "/v1/chat/completions"
         }
     }
 
@@ -40,14 +66,20 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "https://api.deepseek.com/models"
         case .openrouter: return "https://openrouter.ai/api/v1/models"
+        case .ollama, .lmstudio, .llamacpp:
+            return LocalEndpoints.baseURL(for: self) + "/v1/models"
         }
     }
 
-    /// Имя файла с ключом в каталоге KeyStore.
+    /// Имя файла с ключом в каталоге KeyStore. У локальных ключ НЕ обязателен,
+    /// но файл/переменная позволяют задать его для «llama-server --api-key».
     var keyFileName: String {
         switch self {
         case .deepseek: return "deepseek.key"
         case .openrouter: return "openrouter.key"
+        case .ollama: return "ollama.key"
+        case .lmstudio: return "lmstudio.key"
+        case .llamacpp: return "llamacpp.key"
         }
     }
 
@@ -56,6 +88,9 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "DEEPSEEK_API_KEY"
         case .openrouter: return "OPENROUTER_API_KEY"
+        case .ollama: return "OLLAMA_API_KEY"
+        case .lmstudio: return "LMSTUDIO_API_KEY"
+        case .llamacpp: return "LLAMACPP_API_KEY"
         }
     }
 
@@ -64,6 +99,58 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "Ключ с platform.deepseek.com (sk-...)"
         case .openrouter: return "Ключ с openrouter.ai/keys (sk-or-...)"
+        case .ollama, .lmstudio, .llamacpp: return "Ключ не нужен (локальный сервер)"
+        }
+    }
+
+    /// Снисходительное декодирование (паттерн ContextStrategy): неизвестный
+    /// провайдер из будущего/переименованного файла → .deepseek, а не крах
+    /// всего chats.json в .corrupt.json.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = Provider(rawValue: raw) ?? .deepseek
+    }
+}
+
+/// Базовые адреса локальных раннеров. Дефолты — стандартные порты; override
+/// хранится в UserDefaults («localBaseURL.<provider>»), т.к. это конфиг машины,
+/// а не чата (per-chat поля потребовали бы миграции chats.json и рассинхрон).
+enum LocalEndpoints {
+    private static func defaultsKey(for provider: Provider) -> String {
+        "localBaseURL.\(provider.rawValue)"
+    }
+
+    /// Стандартный адрес раннера (для облачных — пусто).
+    static func defaultBaseURL(for provider: Provider) -> String {
+        switch provider {
+        case .ollama: return "http://127.0.0.1:11434"
+        case .lmstudio: return "http://127.0.0.1:1234"
+        case .llamacpp: return "http://127.0.0.1:8080"
+        case .deepseek, .openrouter: return ""
+        }
+    }
+
+    /// Нормализация ввода пользователя: трим + без хвостового «/».
+    static func normalize(_ value: String) -> String {
+        var s = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasSuffix("/") { s = String(s.dropLast()) }
+        return s
+    }
+
+    /// Актуальный базовый адрес: override из UserDefaults или дефолт.
+    static func baseURL(for provider: Provider) -> String {
+        let stored = UserDefaults.standard.string(forKey: defaultsKey(for: provider))
+        let normalized = normalize(stored ?? "")
+        return normalized.isEmpty ? defaultBaseURL(for: provider) : normalized
+    }
+
+    /// Сохраняет адрес; пустая строка сбрасывает к дефолту.
+    static func setBaseURL(_ value: String, for provider: Provider) {
+        let normalized = normalize(value)
+        if normalized.isEmpty || normalized == defaultBaseURL(for: provider) {
+            UserDefaults.standard.removeObject(forKey: defaultsKey(for: provider))
+        } else {
+            UserDefaults.standard.set(normalized, forKey: defaultsKey(for: provider))
         }
     }
 }

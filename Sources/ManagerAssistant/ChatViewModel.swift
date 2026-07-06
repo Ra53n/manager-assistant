@@ -401,7 +401,21 @@ final class ChatViewModel: ObservableObject {
             var prices: [String: ModelPricing] = [:]
             var limits: [String: Int] = Self.seedContextLimits()
             var failed: [String] = []
-            for provider in Provider.allCases where KeyStore.hasKey(for: provider) {
+            for provider in Provider.allCases {
+                if provider.isLocal {
+                    // Локальные раннеры: без ключа, по доступности. Выключенный
+                    // раннер — НОРМА, не ошибка: не пишем в failed/modelsError и
+                    // НЕ вызываем ensureRunning (старт приложения не должен
+                    // спавнить ollama serve — только probe).
+                    guard await LocalModelsClient.isReachable(provider) else { continue }
+                    guard let infos = try? await client.fetchModels(provider: provider) else { continue }
+                    for info in infos {
+                        combined.append(ModelOption(provider: provider, model: info.id))
+                        // Цен у локальных нет → price(for:) вернёт nil → UI скроет стоимость.
+                    }
+                    continue
+                }
+                guard KeyStore.hasKey(for: provider) else { continue }
                 do {
                     let infos = try await client.fetchModels(provider: provider)
                     for info in infos {

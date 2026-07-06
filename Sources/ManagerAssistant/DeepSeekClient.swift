@@ -22,6 +22,7 @@ enum DeepSeekError: LocalizedError {
     case invalidURL
     case badStatus(code: Int, message: String)
     case emptyResponse
+    case localUnavailable(Provider)
 
     var errorDescription: String? {
         switch self {
@@ -33,6 +34,8 @@ enum DeepSeekError: LocalizedError {
             return "Ошибка API (\(code)): \(message)"
         case .emptyResponse:
             return "Пустой ответ от модели."
+        case .localUnavailable(let provider):
+            return "Локальный сервер \(provider.displayName) не запущен. Открой панель «Локальные модели» (иконка компьютера) и проверь статус."
         }
     }
 }
@@ -442,7 +445,14 @@ struct DeepSeekClient {
     ) async throws -> ChatResponse {
         let provider = settings.provider
         let key = KeyStore.key(for: provider)
-        guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        if provider.requiresKey {
+            guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        }
+        if provider == .ollama {
+            // Ленивый запуск ollama serve (тот же лончер, что у RAG); быстрый no-op, если жив.
+            let ok = await OllamaLauncher.shared.ensureRunning(baseURL: LocalEndpoints.baseURL(for: .ollama))
+            guard ok else { throw DeepSeekError.localUnavailable(.ollama) }
+        }
         guard let url = URL(string: provider.chatURL) else { throw DeepSeekError.invalidURL }
 
         let model = settings.model.isEmpty ? Config.model : settings.model
@@ -461,14 +471,26 @@ struct DeepSeekClient {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        // Локальным серверам заголовок не нужен, но непустой ключ шлём и им
+        // (поддержка «llama-server --api-key» бесплатно).
+        if !key.isEmpty {
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         if provider == .openrouter {
             // Необязательные заголовки OpenRouter для атрибуции.
             request.setValue("Manager assistant", forHTTPHeaderField: "X-Title")
         }
         request.httpBody = try JSONEncoder().encode(body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let error as URLError where provider.isLocal && error.code != .cancelled {
+            // connection refused и т.п. у локального раннера → человеческое сообщение.
+            // .cancelled НЕ трогаем: пауза FSM различает отмену по типу ошибки.
+            throw DeepSeekError.localUnavailable(provider)
+        }
 
         guard let http = response as? HTTPURLResponse else {
             throw DeepSeekError.badStatus(code: -1, message: "нет HTTP-ответа")
@@ -487,12 +509,16 @@ struct DeepSeekClient {
     /// Загружает модели провайдера (id + цены, если они есть в /models).
     func fetchModels(provider: Provider) async throws -> [ModelInfo] {
         let key = KeyStore.key(for: provider)
-        guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        if provider.requiresKey {
+            guard !key.isEmpty else { throw DeepSeekError.missingAPIKey(provider) }
+        }
         guard let url = URL(string: provider.modelsURL) else { throw DeepSeekError.invalidURL }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if !key.isEmpty {
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {

@@ -383,8 +383,36 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
     `agent/README.md`. Конкретные адрес/домен/токен инстанса в git НЕТ: см. `agent/deploy/instance.local.md`
     (gitignored) или локальную память. **Как расширять** (новый sink/endpoint/поле рутины) — в README; новые
     поля/статусы декодировать снисходительно С ОБЕИХ сторон.
+- **Локальные модели — три раннера (Ollama / LM Studio / llama.cpp)** — case'ы
+  `.ollama/.lmstudio/.llamacpp` в `Provider` с `isLocal=true`/`requiresKey=false`:
+  безключевой путь (key-guard в `postRaw`/`fetchModels` только при `requiresKey`;
+  Authorization шлётся лишь при непустом ключе — поддержка `llama-server --api-key`).
+  Все три дают OpenAI-совместимые `/v1/chat/completions`+`/v1/models` → чат/FSM/рой/
+  сравнение работают через тот же `DeepSeekClient`; для `.ollama` перед запросом —
+  `OllamaLauncher.ensureRunning` (тот же ленивый лончер, что у RAG), `URLError` у
+  локального провайдера (кроме .cancelled — это пауза FSM!) → `DeepSeekError.
+  localUnavailable` (человеческое сообщение). Адреса серверов — `LocalEndpoints`
+  (UserDefaults `localBaseURL.<raw>`, дефолты 11434/1234/8080; НЕ per-chat: конфиг
+  машины, нулевая миграция chats.json; `RagIndexConfig.ollamaBaseURL` отдельный —
+  пер-индексный). `Provider.init(from:)` снисходительный (unknown → .deepseek).
+  `loadModels`: локальные — по `LocalModelsClient.isReachable` (probe 2с, БЕЗ
+  ensureRunning — старт приложения не спавнит ollama serve, и БЕЗ записи в
+  modelsError — выключенный раннер норма); цен нет → стоимость в UI сама скрыта.
+  Файлы: `LocalModels.swift` (чистые типы/парсеры: /api/tags, /v1/models, строки
+  стрима /api/pull, скан каталога LM Studio по списку путей; каталог популярных
+  моделей `LocalCatalog`; `RunnerStatus`+install-подсказки), `LocalModelsClient.swift`
+  (HTTP: tags / pull-стриминг `bytes.lines` с отменой через Task.cancel / delete +
+  скан `~/.lmstudio/models` и легаси `~/.cache/lm-studio/models` — модели видны и
+  при выключенном LM Studio, но `chattable=false`: имя каталога ≠ id `/v1/models`),
+  `LocalModelsViewModel.swift` (паттерн RagViewModel; pull переживает закрытие
+  панели; `onModelsChanged` → `loadModels(force:)`), `LocalModelsPanelView.swift`
+  (иконка `desktopcomputer` в шапке чата: статусы раннеров, установка/удаление
+  моделей Ollama с прогрессом, каталог + ручной ввод имени из реестра). Установка
+  САМИХ раннеров — не наша: статус «не установлен» + ссылка на скачивание. Тесты —
+  `LocalModelsTests.swift` (парсеры/скан/каталог/снисходительный декод/normalize).
 - **Мультипровайдер** — добавить провайдера = новый case в `Provider` +
-  endpoints/keyFileName/envVar; UI подхватит сам через `allCases`.
+  endpoints/keyFileName/envVar; UI подхватит сам через `allCases` (лист ключей —
+  `allCases.filter(\.requiresKey)`, локальным раннерам поля ключа не показываются).
 - **Ключи API — никогда в коде/git.** Лежат в `~/.config/manager-assistant/<p>.key`
   или env (`DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`). Перед коммитом сканируй
   staged-файлы: `git grep -I --cached -e 'sk-'` (плейсхолдеры «sk-...» в доках — ок).
