@@ -209,6 +209,9 @@ struct LocalModelsPanelView: View {
         let fullName = entry.fullName(tag: tag)
         let isInstalled = installedOllamaNames.contains(fullName)
             || installedOllamaNames.contains("\(fullName):latest")
+        // Фиксированные ширины колонок (вес / вариант / действие) — строки
+        // ровные независимо от того, установлена модель или нет и есть ли
+        // у семейства выбор варианта.
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
                 Text(entry.family).font(.system(.body, design: .monospaced))
@@ -217,30 +220,40 @@ struct LocalModelsPanelView: View {
             Spacer()
             // Вес выбранного варианта: большие (≥15 ГБ) — оранжевым, чтобы
             // случайно не залить полдиска.
-            if let info = tagInfo {
-                Text(info.sizeText)
-                    .font(.caption)
-                    .foregroundColor(info.isHeavy ? .orange : .secondary)
-                    .help(info.isHeavy
-                          ? "Большая модель: долго качается и требует много места/памяти"
-                          : "Примерный вес скачивания")
+            Text(tagInfo?.sizeText ?? "")
+                .font(.caption)
+                .foregroundColor((tagInfo?.isHeavy ?? false) ? .orange : .secondary)
+                .frame(width: 68, alignment: .trailing)
+                .help((tagInfo?.isHeavy ?? false)
+                      ? "Большая модель: долго качается и требует много места/памяти"
+                      : "Примерный вес скачивания")
+            // Вариант размера: селектор только когда вариантов НЕСКОЛЬКО;
+            // единственный вариант — просто текст.
+            Group {
+                if entry.tags.count > 1 {
+                    Picker("", selection: Binding(
+                        get: { tag },
+                        set: { selectedTags[entry.family] = $0 }
+                    )) {
+                        ForEach(entry.tags, id: \.tag) { Text($0.tag).tag($0.tag) }
+                    }
+                    .labelsHidden()
+                } else {
+                    Text(tag).foregroundColor(.secondary)
+                }
             }
-            Picker("", selection: Binding(
-                get: { tag },
-                set: { selectedTags[entry.family] = $0 }
-            )) {
-                ForEach(entry.tags, id: \.tag) { Text($0.tag).tag($0.tag) }
-            }
-            .labelsHidden()
             .frame(width: 84)
-            if isInstalled {
-                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-                    .help("Уже установлена")
-            } else {
-                Button("Скачать") { vm.pull(fullName) }
-                    .buttonStyle(.borderless)
-                    .disabled(vm.pullingModel != nil)
+            Group {
+                if isInstalled {
+                    Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                        .help("Уже установлена")
+                } else {
+                    Button("Скачать") { vm.pull(fullName) }
+                        .buttonStyle(.borderless)
+                        .disabled(vm.pullingModel != nil)
+                }
             }
+            .frame(width: 72, alignment: .trailing)
         }
     }
 
