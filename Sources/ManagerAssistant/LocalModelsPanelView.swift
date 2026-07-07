@@ -153,13 +153,10 @@ struct LocalModelsPanelView: View {
                         .foregroundColor(model.chattable ? .accentColor : .secondary)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(model.name).font(.system(.body, design: .monospaced))
-                        HStack(spacing: 6) {
-                            if let size = model.sizeBytes {
-                                Text(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
-                            }
-                            if let quant = model.quantization { Text(quant) }
+                        // Вес · квант · параметры — сколько занимает и насколько мощная.
+                        if let detail = model.detailLine {
+                            Text(detail).font(.caption).foregroundColor(.secondary)
                         }
-                        .font(.caption).foregroundColor(.secondary)
                         if !model.chattable {
                             Text("найдена на диске; для чата запустите сервер в LM Studio")
                                 .font(.caption2).foregroundColor(.orange)
@@ -200,13 +197,15 @@ struct LocalModelsPanelView: View {
                     .buttonStyle(.borderless)
                     .disabled(manualName.trimmingCharacters(in: .whitespaces).isEmpty || vm.pullingModel != nil)
             }
-            Text("Полный список — на ollama.com/library.").font(.caption2).foregroundColor(.secondary)
+            Text("Размер варианта (1b, 8b, 70b…) — миллиарды параметров: больше — умнее, но тяжелее и медленнее. Вес указан примерно, для стандартного кванта реестра. Полный список — на ollama.com/library.")
+                .font(.caption2).foregroundColor(.secondary)
         }
     }
 
     @ViewBuilder
     private func catalogRow(_ entry: LocalCatalogEntry) -> some View {
-        let tag = selectedTags[entry.family] ?? entry.tags.first ?? ""
+        let tag = selectedTags[entry.family] ?? entry.tags.first?.tag ?? ""
+        let tagInfo = entry.tagInfo(tag)
         let fullName = entry.fullName(tag: tag)
         let isInstalled = installedOllamaNames.contains(fullName)
             || installedOllamaNames.contains("\(fullName):latest")
@@ -216,11 +215,21 @@ struct LocalModelsPanelView: View {
                 Text(entry.summary).font(.caption).foregroundColor(.secondary)
             }
             Spacer()
+            // Вес выбранного варианта: большие (≥15 ГБ) — оранжевым, чтобы
+            // случайно не залить полдиска.
+            if let info = tagInfo {
+                Text(info.sizeText)
+                    .font(.caption)
+                    .foregroundColor(info.isHeavy ? .orange : .secondary)
+                    .help(info.isHeavy
+                          ? "Большая модель: долго качается и требует много места/памяти"
+                          : "Примерный вес скачивания")
+            }
             Picker("", selection: Binding(
                 get: { tag },
                 set: { selectedTags[entry.family] = $0 }
             )) {
-                ForEach(entry.tags, id: \.self) { Text($0).tag($0) }
+                ForEach(entry.tags, id: \.tag) { Text($0.tag).tag($0.tag) }
             }
             .labelsHidden()
             .frame(width: 84)

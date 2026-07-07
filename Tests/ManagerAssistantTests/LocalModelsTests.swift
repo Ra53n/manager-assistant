@@ -14,7 +14,7 @@ final class LocalModelsTests: XCTestCase {
     func testParseOllamaTags() throws {
         let json = """
         {"models":[
-          {"name":"llama3.1:8b","size":4661224676,"details":{"quantization_level":"Q4_K_M"}},
+          {"name":"llama3.1:8b","size":4661224676,"details":{"quantization_level":"Q4_K_M","parameter_size":"8.0B"}},
           {"name":"nomic-embed-text:latest","size":274302450,"details":{}}
         ]}
         """.data(using: .utf8)!
@@ -23,9 +23,14 @@ final class LocalModelsTests: XCTestCase {
         XCTAssertEqual(models[0].name, "llama3.1:8b")
         XCTAssertEqual(models[0].sizeBytes, 4_661_224_676)
         XCTAssertEqual(models[0].quantization, "Q4_K_M")
+        XCTAssertEqual(models[0].parameterSize, "8.0B")
         XCTAssertEqual(models[0].provider, .ollama)
         XCTAssertTrue(models[0].chattable)
         XCTAssertNil(models[1].quantization)
+        // Подпись пикера: вес · квант · параметры; у голого id подписи нет.
+        XCTAssertEqual(models[0].detailLine?.contains("Q4_K_M"), true)
+        XCTAssertEqual(models[0].detailLine?.contains("8.0B"), true)
+        XCTAssertNil(InstalledLocalModel(name: "x", provider: .llamacpp).detailLine)
     }
 
     func testParseOllamaTagsTolerant() throws {
@@ -112,11 +117,18 @@ final class LocalModelsTests: XCTestCase {
         for entry in LocalCatalog.entries {
             XCTAssertFalse(entry.tags.isEmpty, "\(entry.family): нет тегов")
             for tag in entry.tags {
-                let full = entry.fullName(tag: tag)
+                let full = entry.fullName(tag: tag.tag)
                 XCTAssertFalse(full.contains(" "), "\(full): пробелы в имени")
                 XCTAssertEqual(full, full.lowercased(), "\(full): имя реестра должно быть в нижнем регистре")
+                XCTAssertGreaterThan(tag.approxGB, 0, "\(full): у каждого варианта должен быть примерный вес")
+                XCTAssertEqual(entry.tagInfo(tag.tag), tag)
             }
         }
+        // Метка «тяжёлая» и текст размера.
+        let heavy = LocalCatalogTag(tag: "70b", approxGB: 40)
+        XCTAssertTrue(heavy.isHeavy)
+        XCTAssertFalse(LocalCatalogTag(tag: "8b", approxGB: 4.9).isHeavy)
+        XCTAssertEqual(heavy.sizeText, "≈40,0 ГБ")
     }
 
     // MARK: Provider — снисходительный декод

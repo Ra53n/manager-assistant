@@ -1277,7 +1277,10 @@ struct ChatSettingsView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(settings.model)
-                                Text(settings.provider.displayName)
+                                // У локальной модели — вес/квант/параметры рядом с провайдером.
+                                Text([settings.provider.displayName,
+                                      vm.modelDetails["\(settings.provider.rawValue)|\(settings.model)"]]
+                                    .compactMap { $0 }.joined(separator: " · "))
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -1625,7 +1628,8 @@ struct ChatSettingsView: View {
             ModelPickerView(
                 models: vm.availableModels,
                 current: ModelOption(provider: settings.provider, model: settings.model),
-                onSelect: { settings.provider = $0.provider; settings.model = $0.model }
+                onSelect: { settings.provider = $0.provider; settings.model = $0.model },
+                details: vm.modelDetails
             )
         }
         .sheet(item: $editingProfile) { p in
@@ -1754,6 +1758,8 @@ struct ModelPickerView: View {
     let models: [ModelOption]
     let current: ModelOption?
     let onSelect: (ModelOption) -> Void
+    /// Метаданные по id опции («4,7 ГБ · Q4_K_M · 8B» у локальных) — подпись строки.
+    var details: [String: String] = [:]
     @Environment(\.dismiss) private var dismiss
 
     @State private var search = ""
@@ -1815,8 +1821,17 @@ struct ModelPickerView: View {
                                         dismiss()
                                     } label: {
                                         HStack {
-                                            Text(opt.model)
-                                                .lineLimit(1)
+                                            VStack(alignment: .leading, spacing: 1) {
+                                                Text(opt.model)
+                                                    .lineLimit(1)
+                                                // Вес/квант/параметры локальной модели —
+                                                // видно, какая большая, ДО выбора.
+                                                if let detail = details[opt.id] {
+                                                    Text(detail)
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                }
+                                            }
                                             Spacer()
                                             if opt == current {
                                                 Image(systemName: "checkmark")

@@ -57,6 +57,11 @@ final class ChatViewModel: ObservableObject {
     @Published var modelsError: String?
     private var hasLoadedModels = false
 
+    /// Метаданные ЛОКАЛЬНЫХ моделей для пикера, ключ — "<provider>|<model>":
+    /// «4,7 ГБ · Q4_K_M · 8B» (вес обязателен, если известен — юзер должен видеть,
+    /// какая модель большая). У облачных моделей веса нет — там цены.
+    @Published var modelDetails: [String: String] = [:]
+
     /// Цены по моделям, ключ — "<provider>|<model>". Сидим прайсом DeepSeek сразу.
     private var pricing: [String: ModelPricing] = ChatViewModel.seedPricing()
 
@@ -401,6 +406,7 @@ final class ChatViewModel: ObservableObject {
             var prices: [String: ModelPricing] = [:]
             var limits: [String: Int] = Self.seedContextLimits()
             var failed: [String] = []
+            var details: [String: String] = [:]
             for provider in Provider.allCases {
                 if provider.isLocal {
                     // Локальные раннеры: без ключа, по доступности. Выключенный
@@ -408,10 +414,12 @@ final class ChatViewModel: ObservableObject {
                     // НЕ вызываем ensureRunning (старт приложения не должен
                     // спавнить ollama serve — только probe).
                     guard await LocalModelsClient.isReachable(provider) else { continue }
-                    guard let infos = try? await client.fetchModels(provider: provider) else { continue }
-                    for info in infos {
-                        combined.append(ModelOption(provider: provider, model: info.id))
-                        // Цен у локальных нет → price(for:) вернёт nil → UI скроет стоимость.
+                    for model in await Self.fetchLocalModels(provider) {
+                        let option = ModelOption(provider: provider, model: model.name)
+                        combined.append(option)
+                        // Вес/квант/параметры — в подпись пикера (цен у локальных
+                        // нет → price(for:) вернёт nil → UI скроет стоимость).
+                        if let line = model.detailLine { details[option.id] = line }
                     }
                     continue
                 }
@@ -439,9 +447,39 @@ final class ChatViewModel: ObservableObject {
             if !combined.isEmpty { availableModels = combined }
             pricing = prices
             contextLimits = limits
+            modelDetails = details
             modelsError = failed.isEmpty ? nil : "Не удалось загрузить: \(failed.joined(separator: ", "))"
             hasLoadedModels = true
             isLoadingModels = false
+        }
+    }
+
+    /// Модели локального раннера С МЕТАДАННЫМИ (вес/квант/параметры), где раннер
+    /// их отдаёт: Ollama — /api/tags; LM Studio — /v1/models + веса со скана диска
+    /// (фаззи-матч имён, как в LocalModelsViewModel); llama.cpp — голые id.
+    private nonisolated static func fetchLocalModels(_ provider: Provider) async -> [InstalledLocalModel] {
+        let localClient = LocalModelsClient()
+        switch provider {
+        case .ollama:
+            return (try? await localClient.ollamaInstalled(baseURL: LocalEndpoints.baseURL(for: .ollama))) ?? []
+        case .lmstudio:
+            let server = (try? await localClient.openAIModels(provider: .lmstudio)) ?? []
+            let disk = localClient.lmStudioDiskModels()
+            return server.map { model in
+                var enriched = model
+                let serverKey = model.name.lowercased()
+                if let match = disk.first(where: { d in
+                    let diskKey = d.name.lowercased().replacingOccurrences(of: "/", with: "-")
+                    return serverKey.contains(diskKey) || diskKey.contains(serverKey)
+                }) {
+                    enriched.sizeBytes = match.sizeBytes
+                }
+                return enriched
+            }
+        case .llamacpp:
+            return (try? await localClient.openAIModels(provider: .llamacpp)) ?? []
+        default:
+            return []
         }
     }
 

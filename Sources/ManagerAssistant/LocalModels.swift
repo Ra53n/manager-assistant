@@ -14,12 +14,25 @@ struct InstalledLocalModel: Identifiable, Hashable {
     var name: String            // id для чата: "llama3.1:8b" / "qwen2.5-7b-instruct"
     var sizeBytes: Int64?       // nil — размер неизвестен (/v1/models его не отдаёт)
     var quantization: String?   // "Q4_K_M" из details Ollama
+    var parameterSize: String?  // "8.0B" / "494.03M" из details Ollama — «мощность»
     var provider: Provider
     /// false — найдена только сканом диска LM Studio: имя каталога (publisher/repo)
     /// НЕ совпадает с id, который отдаст /v1/models, поэтому в чат её не подставить.
     var chattable: Bool = true
 
     var id: String { "\(provider.rawValue)|\(name)" }
+
+    /// Компактная строка метаданных для пикера/панели: «4,7 ГБ · Q4_K_M · 8B».
+    /// nil — если о модели вообще ничего не известно (голый id из /v1/models).
+    var detailLine: String? {
+        var parts: [String] = []
+        if let size = sizeBytes {
+            parts.append(ByteCountFormatter.string(fromByteCount: size, countStyle: .file))
+        }
+        if let quant = quantization, !quant.isEmpty { parts.append(quant) }
+        if let params = parameterSize, !params.isEmpty { parts.append(params) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 
 // MARK: - Прогресс скачивания (/api/pull)
@@ -43,10 +56,14 @@ struct PullProgress: Equatable {
 // MARK: - Парсеры
 
 enum LocalModelsParsing {
-    // Ollama GET /api/tags → {"models":[{"name":…,"size":…,"details":{"quantization_level":…}}]}
+    // Ollama GET /api/tags → {"models":[{"name":…,"size":…,
+    //   "details":{"quantization_level":…,"parameter_size":…}}]}
     private struct OllamaTags: Decodable {
         struct Model: Decodable {
-            struct Details: Decodable { let quantization_level: String? }
+            struct Details: Decodable {
+                let quantization_level: String?
+                let parameter_size: String?
+            }
             let name: String
             let size: Int64?
             let details: Details?
@@ -62,6 +79,7 @@ enum LocalModelsParsing {
                 name: m.name,
                 sizeBytes: m.size,
                 quantization: m.details?.quantization_level,
+                parameterSize: m.details?.parameter_size,
                 provider: .ollama
             )
         }
@@ -133,27 +151,57 @@ enum LocalModelsParsing {
 
 // MARK: - Каталог популярных моделей (реестр Ollama)
 
+/// Вариант размера модели в каталоге: тег реестра + примерный вес скачивания.
+/// Тег («8b» = 8 млрд параметров) — это и есть «мощность»: больше параметров →
+/// умнее, но тяжелее и медленнее. Веса — дефолтные кванты (Q4_K_M) реестра
+/// Ollama, приблизительно.
+struct LocalCatalogTag: Hashable {
+    let tag: String         // "8b"
+    let approxGB: Double    // ≈ вес скачивания в ГБ
+
+    /// «≈4,7 ГБ» — для строки каталога.
+    var sizeText: String { String(format: "≈%.1f ГБ", approxGB).replacingOccurrences(of: ".", with: ",") }
+    /// Большая модель: перед скачиванием стоит подумать о месте на диске.
+    var isHeavy: Bool { approxGB >= 15 }
+}
+
 /// Семейство моделей в курируемом каталоге; полное имя для pull = "family:tag".
 struct LocalCatalogEntry: Identifiable, Hashable {
-    let family: String      // "llama3.1"
-    let summary: String     // короткое описание по-русски
-    let tags: [String]      // ["8b","70b"]
+    let family: String          // "llama3.1"
+    let summary: String         // короткое описание по-русски
+    let tags: [LocalCatalogTag] // варианты размеров
     var id: String { family }
 
     func fullName(tag: String) -> String { "\(family):\(tag)" }
+    func tagInfo(_ tag: String) -> LocalCatalogTag? { tags.first { $0.tag == tag } }
 }
 
 enum LocalCatalog {
+    private static func t(_ tag: String, _ gb: Double) -> LocalCatalogTag {
+        LocalCatalogTag(tag: tag, approxGB: gb)
+    }
+
     static let entries: [LocalCatalogEntry] = [
-        LocalCatalogEntry(family: "llama3.1", summary: "Meta, универсальная", tags: ["8b", "70b"]),
-        LocalCatalogEntry(family: "llama3.2", summary: "Meta, компактная", tags: ["1b", "3b"]),
-        LocalCatalogEntry(family: "qwen2.5", summary: "Alibaba, сильна в русском", tags: ["0.5b", "1.5b", "3b", "7b", "14b", "32b", "72b"]),
-        LocalCatalogEntry(family: "qwen2.5-coder", summary: "Alibaba, для кода", tags: ["1.5b", "7b", "32b"]),
-        LocalCatalogEntry(family: "gemma2", summary: "Google, сбалансированная", tags: ["2b", "9b", "27b"]),
-        LocalCatalogEntry(family: "mistral", summary: "Mistral AI, классика 7B", tags: ["7b"]),
-        LocalCatalogEntry(family: "deepseek-r1", summary: "DeepSeek, рассуждающая", tags: ["1.5b", "7b", "8b", "14b", "32b", "70b"]),
-        LocalCatalogEntry(family: "phi4", summary: "Microsoft, компактная и умная", tags: ["14b"]),
-        LocalCatalogEntry(family: "llava", summary: "мультимодальная (картинки)", tags: ["7b", "13b"]),
+        LocalCatalogEntry(family: "llama3.1", summary: "Meta, универсальная",
+                          tags: [t("8b", 4.9), t("70b", 40)]),
+        LocalCatalogEntry(family: "llama3.2", summary: "Meta, компактная",
+                          tags: [t("1b", 1.3), t("3b", 2.0)]),
+        LocalCatalogEntry(family: "qwen2.5", summary: "Alibaba, сильна в русском",
+                          tags: [t("0.5b", 0.4), t("1.5b", 1.0), t("3b", 1.9), t("7b", 4.7),
+                                 t("14b", 9.0), t("32b", 20), t("72b", 47)]),
+        LocalCatalogEntry(family: "qwen2.5-coder", summary: "Alibaba, для кода",
+                          tags: [t("1.5b", 1.0), t("7b", 4.7), t("32b", 20)]),
+        LocalCatalogEntry(family: "gemma2", summary: "Google, сбалансированная",
+                          tags: [t("2b", 1.6), t("9b", 5.4), t("27b", 16)]),
+        LocalCatalogEntry(family: "mistral", summary: "Mistral AI, классика 7B",
+                          tags: [t("7b", 4.1)]),
+        LocalCatalogEntry(family: "deepseek-r1", summary: "DeepSeek, рассуждающая",
+                          tags: [t("1.5b", 1.1), t("7b", 4.7), t("8b", 4.9), t("14b", 9.0),
+                                 t("32b", 20), t("70b", 43)]),
+        LocalCatalogEntry(family: "phi4", summary: "Microsoft, компактная и умная",
+                          tags: [t("14b", 9.1)]),
+        LocalCatalogEntry(family: "llava", summary: "мультимодальная (картинки)",
+                          tags: [t("7b", 4.7), t("13b", 8.0)]),
     ]
 }
 

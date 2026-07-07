@@ -408,7 +408,14 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   панели; `onModelsChanged` → `loadModels(force:)`), `LocalModelsPanelView.swift`
   (иконка `desktopcomputer` в шапке чата: статусы раннеров, установка/удаление
   моделей Ollama с прогрессом, каталог + ручной ввод имени из реестра). Установка
-  САМИХ раннеров — не наша: статус «не установлен» + ссылка на скачивание. Тесты —
+  САМИХ раннеров — не наша: статус «не установлен» + ссылка на скачивание.
+  **Метаданные моделей**: у локальных везде виден ВЕС — `InstalledLocalModel.
+  detailLine` («4,7 ГБ · Q4_K_M · 8B»; parameter_size из /api/tags = «мощность»),
+  `ChatViewModel.modelDetails` ("provider|model" → строка; заполняется в
+  loadModels: ollama через /api/tags, lmstudio + веса со скана диска) → подпись
+  в ModelPickerView (параметр `details:`, оба call site) и в кнопке модели
+  ChatSettingsView; каталог — `LocalCatalogTag {tag, approxGB}` (примерный вес
+  скачивания у каждого варианта, ≥15 ГБ = `isHeavy` → оранжевым). Тесты —
   `LocalModelsTests.swift` (парсеры/скан/каталог/снисходительный декод/normalize).
 - **Мультипровайдер** — добавить провайдера = новый case в `Provider` +
   endpoints/keyFileName/envVar; UI подхватит сам через `allCases` (лист ключей —

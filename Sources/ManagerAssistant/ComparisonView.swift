@@ -270,7 +270,8 @@ struct ComparisonView: View {
                 current: comp.tracks[safe: box.value]?.model ?? nil,
                 onSelect: { model in
                     if box.value < comp.tracks.count { comp.tracks[box.value].model = model }
-                }
+                },
+                details: vm.modelDetails
             )
         }
         .sheet(item: $settingsTrack) { box in
