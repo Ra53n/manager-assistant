@@ -174,6 +174,27 @@ final class LocalModelsTests: XCTestCase {
         XCTAssertTrue(Provider.lmstudio.modelsURL.hasSuffix("/v1/models"))
     }
 
+    // MARK: маппинг сетевых ошибок локальных раннеров
+
+    func testLocalFailureMapping() {
+        // Отмена — не переопределяется (пауза FSM различает её по типу).
+        XCTAssertNil(DeepSeekClient.localFailure(.cancelled, provider: .ollama))
+        // Облачный провайдер — не переопределяется.
+        XCTAssertNil(DeepSeekClient.localFailure(.timedOut, provider: .deepseek))
+        // Таймаут локальной — ЧЕСТНОЕ сообщение про медленную модель, не «не запущен».
+        if case .badStatus(_, let message)? = DeepSeekClient.localFailure(.timedOut, provider: .ollama) {
+            XCTAssertTrue(message.contains("таймаут"))
+        } else {
+            XCTFail("timedOut должен маппиться в badStatus с текстом про таймаут")
+        }
+        // Обрыв соединения — «сервер не запущен».
+        if case .localUnavailable(let p)? = DeepSeekClient.localFailure(.cannotConnectToHost, provider: .lmstudio) {
+            XCTAssertEqual(p, .lmstudio)
+        } else {
+            XCTFail("cannotConnectToHost должен маппиться в localUnavailable")
+        }
+    }
+
     // MARK: LocalEndpoints
 
     func testLocalEndpointsNormalizeAndDefaults() {

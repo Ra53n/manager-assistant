@@ -434,6 +434,18 @@ struct DeepSeekClient {
 
     /// HTTP-ядро: строит ChatRequest (с инструментами или без), POST, декодирует
     /// ChatResponse. Единая точка для текстовых и tool-calling запросов.
+    /// Понятная ошибка сетевого сбоя ЛОКАЛЬНОГО раннера; nil — не переопределяем
+    /// (облачные провайдеры и отмена: пауза FSM различает отмену по типу ошибки).
+    /// ВАЖНО: таймаут ≠ «сервер не запущен» — модель жива, но думает дольше лимита
+    /// (раньше любой URLError превращался в «не запущен» и сбивал с толку).
+    static func localFailure(_ code: URLError.Code, provider: Provider) -> DeepSeekError? {
+        guard provider.isLocal, code != .cancelled else { return nil }
+        if code == .timedOut {
+            return .badStatus(code: -1, message: "локальная модель не успела ответить (таймаут). Она работает, но слишком медленно для этого запроса — попробуй модель поменьше, сократи историю (скользящее окно) или повтори запрос.")
+        }
+        return .localUnavailable(provider)
+    }
+
     private func postRaw(
         messages: [ChatRequest.RequestMessage],
         settings: GenerationSettings,
@@ -481,15 +493,18 @@ struct DeepSeekClient {
             request.setValue("Manager assistant", forHTTPHeaderField: "X-Title")
         }
         request.httpBody = try JSONEncoder().encode(body)
+        // Дефолтные 60 с URLRequest — мало: локальная 7B+ на ноутбуке легко думает
+        // дольше минуты (загрузка модели + prompt eval + генерация без стриминга),
+        // облачный reasoner тоже бывает небыстрым. Таймаут — от последнего байта.
+        request.timeoutInterval = provider.isLocal ? 600 : 300
 
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await URLSession.shared.data(for: request)
-        } catch let error as URLError where provider.isLocal && error.code != .cancelled {
-            // connection refused и т.п. у локального раннера → человеческое сообщение.
-            // .cancelled НЕ трогаем: пауза FSM различает отмену по типу ошибки.
-            throw DeepSeekError.localUnavailable(provider)
+        } catch let error as URLError {
+            if let mapped = Self.localFailure(error.code, provider: provider) { throw mapped }
+            throw error
         }
 
         guard let http = response as? HTTPURLResponse else {

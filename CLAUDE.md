@@ -389,9 +389,13 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   Authorization шлётся лишь при непустом ключе — поддержка `llama-server --api-key`).
   Все три дают OpenAI-совместимые `/v1/chat/completions`+`/v1/models` → чат/FSM/рой/
   сравнение работают через тот же `DeepSeekClient`; для `.ollama` перед запросом —
-  `OllamaLauncher.ensureRunning` (тот же ленивый лончер, что у RAG), `URLError` у
-  локального провайдера (кроме .cancelled — это пауза FSM!) → `DeepSeekError.
-  localUnavailable` (человеческое сообщение). Адреса серверов — `LocalEndpoints`
+  `OllamaLauncher.ensureRunning` (тот же ленивый лончер, что у RAG). Сетевые сбои
+  локальных — через чистый `DeepSeekClient.localFailure(code:provider:)` (тест!):
+  `.cancelled` → nil (пауза FSM различает отмену по типу!), `.timedOut` → честное
+  «модель не успела ответить» (НЕ «сервер не запущен» — модель жива, просто
+  медленная), остальное → `DeepSeekError.localUnavailable`. Таймаут запроса в
+  `postRaw`: 600 с локальным / 300 с облачным (дефолтные 60 с URLRequest валили
+  ответы 7B+ на ноутбуке дольше минуты ложным «не запущен»). Адреса серверов — `LocalEndpoints`
   (UserDefaults `localBaseURL.<raw>`, дефолты 11434/1234/8080; НЕ per-chat: конфиг
   машины, нулевая миграция chats.json; `RagIndexConfig.ollamaBaseURL` отдельный —
   пер-индексный). `Provider.init(from:)` снисходительный (unknown → .deepseek).
