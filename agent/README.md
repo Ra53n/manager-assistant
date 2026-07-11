@@ -188,11 +188,58 @@ curl -s -H "Authorization: Bearer $TOKEN" "$BASE/agent/mcp-servers"     # connec
 - Тяжёлые промпты фанятся на 50–80k токенов (детали по каждому элементу) → крутить `maxTokensBudget`
   рутины или упрощать промпт.
 
+## LLM-прокси (/llm → Ollama на VPS)
+
+Локальная LLM для ЧАТА приложения (провайдер «VPS (Ollama)»): Ollama крутится на
+этом же VPS и открыта наружу маршрутом Caddy `handle_path /llm/*` с проверкой
+`Authorization: Bearer <токен>`. Рутины агента это НЕ трогает — они по-прежнему
+ходят в облачный DeepSeek (3–4B модель слабовата для tool-loop, а прогоны на
+2 CPU занимали бы десятки минут).
+
+Установка (идемпотентно; повторный запуск печатает тот же токен):
+
+```bash
+# модели — аргументами; дефолт: qwen2.5:3b + qwen3:4b-instruct-2507-q4_K_M
+sudo bash /opt/manager-agent-src/deploy/install-llm.sh
+```
+
+Скрипт: добавляет swap до ≥4 ГБ (`/swapfile-llm`; 3.8 ГБ RAM впритык для 3–4B),
+ставит Ollama (bind ТОЛЬКО 127.0.0.1:11434 — проверяется), пишет systemd-override
+(`OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`, `OLLAMA_KEEP_ALIVE=30m`),
+генерит токен в `/etc/llm-proxy.token` (0600), вставляет `/llm`-блок в Caddyfile
+(бэкап + `caddy validate` + reload; файл получает права root:caddy 0640 — токен
+внутри) и пуллит модели. Адрес+токен печатает баннером — ввести в приложении:
+⋯ → API-ключи → VPS (Ollama).
+
+Смоук:
+
+```bash
+TOKEN=$(cat /etc/llm-proxy.token)
+curl -H "Authorization: Bearer $TOKEN" https://<домен>/llm/v1/models   # 200 + список
+curl -s -o /dev/null -w '%{http_code}\n' https://<домен>/llm/v1/models # 401
+curl https://<домен>/agent/health                                      # 200 (не пострадал)
+```
+
+Грабли:
+- **deploy.sh может снести /llm-блок**: при ОТСУТСТВИИ `/agent/` в Caddyfile он
+  переписывает файл с нуля. Сейчас `/agent/` есть → пропускает; если Caddyfile
+  пересоздавался — перезапусти install-llm.sh.
+- **Ротация токена**: `rm /etc/llm-proxy.token`, удалить `/llm`-блок из Caddyfile,
+  перезапустить install-llm.sh (и обновить токен в приложении).
+- **7B на этот VPS не влезает** (Q4-веса ~4.7 ГБ > 3.8 ГБ RAM → swap-инференс
+  1–2 ток/с). Реалистично: 3–4B в Q4, ~4–10 ток/с на 2 CPU.
+- **Рой в приложении**: `OLLAMA_NUM_PARALLEL=1` сериализует подагентов на сервере —
+  для провайдера VPS держи `maxParallelAgents=2` или выключай swarm на тяжёлых
+  задачах, иначе хвост волны упрётся в 600-секундный таймаут.
+- Модели ставятся/удаляются и из приложения: панель «Локальные модели» → секция
+  «VPS (Ollama)» (тот же прокси, стриминг прогресса через `flush_interval -1`).
+
 ## Безопасность соседства (НЕ сломать VPN/MCP)
 
 На этом VPS также крутятся: контейнер VPN (Amnezia, docker), x-ui/xray, Caddy и
 `yougile-mcp.service`. Правила:
-- только новый порт `3100`, новый юнит `manager-agent.service`, один новый handle в Caddy;
+- только новые порты `3100` (агент) и loopback-`11434` (Ollama), юниты
+  `manager-agent.service`/`ollama.service`, два новых handle в Caddy (`/agent/*`, `/llm/*`);
 - **не трогать** docker/VPN/x-ui/xray, `yougile-mcp.service`, маршрут `/mcp`;
 - Caddy не перезапускать жёстко — только `reload`; правки Caddyfile с бэкапом и `validate`;
 - сервис слушает loopback; наружу — только через TLS Caddy + bearer.

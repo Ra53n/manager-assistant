@@ -21,6 +21,8 @@ struct LocalModelsPanelView: View {
     @State private var deleting: InstalledLocalModel?
     /// Выбранный тег на семейство каталога (по умолчанию — первый).
     @State private var selectedTags: [String: String] = [:]
+    /// Куда ставить модели из каталога (локальная Ollama или VPS).
+    @State private var installTarget: Provider = .ollama
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,10 +36,10 @@ struct LocalModelsPanelView: View {
 
             Form {
                 pullProgressSection
-                ForEach(LocalModelsViewModel.localProviders, id: \.self) { provider in
+                ForEach(LocalModelsViewModel.panelProviders, id: \.self) { provider in
                     runnerSection(provider)
                 }
-                if vm.status[.ollama] == .running {
+                if !runningTargets.isEmpty {
                     catalogSection
                 }
                 if let err = vm.errorText {
@@ -47,7 +49,7 @@ struct LocalModelsPanelView: View {
                     }
                 }
                 Section {
-                    Text("Локальные модели работают без интернета и бесплатны (стоимость в метриках не считается). Модели Ollama ставятся из этой панели; LM Studio и llama.cpp управляют моделями сами — здесь видно, что установлено, а для чата их сервер должен быть запущен.")
+                    Text("Локальные модели работают без интернета и бесплатны (стоимость в метриках не считается). Модели Ollama — локальной и на VPS — ставятся из этой панели; LM Studio и llama.cpp управляют моделями сами — здесь видно, что установлено, а для чата их сервер должен быть запущен. Адрес и токен VPS задаются в «API-ключи».")
                         .font(.caption).foregroundColor(.secondary)
                 }
             }
@@ -55,13 +57,13 @@ struct LocalModelsPanelView: View {
         }
         .frame(width: 620, height: 680)
         .onAppear {
-            for p in LocalModelsViewModel.localProviders {
+            for p in LocalModelsViewModel.panelProviders {
                 baseURLs[p] = LocalEndpoints.baseURL(for: p)
             }
             vm.refreshAll()
         }
         .confirmationDialog(
-            "Удалить модель «\(deleting?.name ?? "")»? Файлы будут стёрты с диска.",
+            "Удалить модель «\(deleting?.name ?? "")»\(deleting?.provider == .vps ? " с VPS" : "")? Файлы будут стёрты с диска\(deleting?.provider == .vps ? " сервера" : "").",
             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } })
         ) {
             Button("Удалить", role: .destructive) {
@@ -93,7 +95,8 @@ struct LocalModelsPanelView: View {
             case .running:
                 Label("работает", systemImage: "checkmark.circle.fill").font(.caption).foregroundColor(.green)
             case .stopped:
-                Label("не запущен", systemImage: "pause.circle").font(.caption).foregroundColor(.secondary)
+                Label(provider == .vps ? "недоступен" : "не запущен", systemImage: "pause.circle")
+                    .font(.caption).foregroundColor(.secondary)
             case .notInstalled:
                 Label("не установлен", systemImage: "xmark.circle.fill").font(.caption).foregroundColor(.orange)
             }
@@ -112,7 +115,9 @@ struct LocalModelsPanelView: View {
             .buttonStyle(.borderless)
             .help("Проверить статус и обновить список моделей")
         }
-        if status == .notInstalled {
+        // VPS «не установлен» не детектится (удалённая машина) — подсказку
+        // показываем на «недоступен».
+        if status == .notInstalled || (provider == .vps && status == .stopped) {
             Text(provider.runnerInstallHint).font(.caption).foregroundColor(.secondary)
         }
     }
@@ -126,7 +131,9 @@ struct LocalModelsPanelView: View {
                     get: { baseURLs[provider] ?? "" },
                     set: { baseURLs[provider] = $0 }
                 ),
-                prompt: Text(LocalEndpoints.defaultBaseURL(for: provider))
+                prompt: Text(provider == .vps
+                             ? "https://<домен-vps>/llm"
+                             : LocalEndpoints.defaultBaseURL(for: provider))
             )
             .textFieldStyle(.plain)
             .font(.system(.caption, design: .monospaced))
@@ -163,10 +170,10 @@ struct LocalModelsPanelView: View {
                         }
                     }
                     Spacer()
-                    if provider == .ollama {
+                    if provider == .ollama || provider == .vps {
                         Button { deleting = model } label: { Image(systemName: "trash") }
                             .buttonStyle(.borderless).foregroundColor(.secondary)
-                            .help("Удалить модель с диска")
+                            .help(provider == .vps ? "Удалить модель с диска VPS" : "Удалить модель с диска")
                     }
                 }
             }
@@ -175,13 +182,41 @@ struct LocalModelsPanelView: View {
 
     // MARK: Каталог Ollama
 
-    private var installedOllamaNames: Set<String> {
-        Set((vm.installed[.ollama] ?? []).map(\.name))
+    /// Цели установки, которые точно работают (гейт видимости каталога).
+    private var runningTargets: [Provider] {
+        [Provider.ollama, .vps].filter { vm.status[$0] == .running }
+    }
+
+    /// «Живые» цели: .checking тоже считается — иначе обновление статуса на
+    /// долю секунды выкидывало бы цель из списка и МОЛЧА перекидывало выбор
+    /// (и клик «Скачать»!) на другую.
+    private var aliveTargets: [Provider] {
+        [Provider.ollama, .vps].filter { vm.status[$0] == .running || vm.status[$0] == .checking }
+    }
+
+    /// Куда реально качаем: выбор пользователя, пока цель жива, иначе первая живая.
+    private var effectiveTarget: Provider {
+        aliveTargets.contains(installTarget) ? installTarget : (runningTargets.first ?? aliveTargets.first ?? .ollama)
+    }
+
+    private func installedNames(on target: Provider) -> Set<String> {
+        Set((vm.installed[target] ?? []).map(\.name))
     }
 
     @ViewBuilder
     private var catalogSection: some View {
         Section("Каталог (Ollama)") {
+            // Селектор цели — только когда живы обе (локальная и VPS).
+            if aliveTargets.count > 1 {
+                Picker("Ставить на", selection: Binding(
+                    get: { effectiveTarget },
+                    set: { installTarget = $0 }
+                )) {
+                    Text("Локально").tag(Provider.ollama)
+                    Text("VPS").tag(Provider.vps)
+                }
+                .pickerStyle(.segmented)
+            }
             ForEach(LocalCatalog.entries) { entry in
                 catalogRow(entry)
             }
@@ -193,7 +228,7 @@ struct LocalModelsPanelView: View {
                 )
                 .textFieldStyle(.plain)
                 .font(.system(.caption, design: .monospaced))
-                Button("Скачать") { vm.pull(manualName); manualName = "" }
+                Button("Скачать") { vm.pull(manualName, on: effectiveTarget); manualName = "" }
                     .buttonStyle(.borderless)
                     .disabled(manualName.trimmingCharacters(in: .whitespaces).isEmpty || vm.pullingModel != nil)
             }
@@ -207,8 +242,8 @@ struct LocalModelsPanelView: View {
         let tag = selectedTags[entry.family] ?? entry.tags.first?.tag ?? ""
         let tagInfo = entry.tagInfo(tag)
         let fullName = entry.fullName(tag: tag)
-        let isInstalled = installedOllamaNames.contains(fullName)
-            || installedOllamaNames.contains("\(fullName):latest")
+        let names = installedNames(on: effectiveTarget)
+        let isInstalled = names.contains(fullName) || names.contains("\(fullName):latest")
         // Фиксированные ширины колонок (вес / вариант / действие) — строки
         // ровные независимо от того, установлена модель или нет и есть ли
         // у семейства выбор варианта.
@@ -248,7 +283,7 @@ struct LocalModelsPanelView: View {
                     Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
                         .help("Уже установлена")
                 } else {
-                    Button("Скачать") { vm.pull(fullName) }
+                    Button("Скачать") { vm.pull(fullName, on: effectiveTarget) }
                         .buttonStyle(.borderless)
                         .disabled(vm.pullingModel != nil)
                 }
@@ -265,7 +300,8 @@ struct LocalModelsPanelView: View {
             Section {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
-                        Text("Скачивание \(name)").font(.caption).fontWeight(.medium)
+                        Text("Скачивание \(name)\(vm.pullingTarget == .vps ? " → VPS" : "")")
+                            .font(.caption).fontWeight(.medium)
                         Spacer()
                         Button("Отменить") { vm.cancelPull() }.buttonStyle(.borderless)
                     }

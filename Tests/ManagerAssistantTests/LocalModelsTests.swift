@@ -41,6 +41,16 @@ final class LocalModelsTests: XCTestCase {
         XCTAssertEqual(try LocalModelsParsing.parseOllamaTags(empty).count, 0)
     }
 
+    func testParseOllamaTagsForVps() throws {
+        // Тот же /api/tags, но от Ollama на VPS: модели помечаются .vps —
+        // иначе удаление/обновление в панели целились бы в локальный раннер.
+        let json = #"{"models":[{"name":"qwen2.5:3b","size":1900000000}]}"#.data(using: .utf8)!
+        let models = try LocalModelsParsing.parseOllamaTags(json, provider: .vps)
+        XCTAssertEqual(models.first?.provider, .vps)
+        XCTAssertEqual(models.first?.id, "vps|qwen2.5:3b")
+        XCTAssertTrue(models.allSatisfy(\.chattable))
+    }
+
     // MARK: /v1/models
 
     func testParseOpenAIModels() throws {
@@ -136,7 +146,7 @@ final class LocalModelsTests: XCTestCase {
     func testProviderLenientDecode() throws {
         let dec = JSONDecoder()
         for (raw, expected): (String, Provider) in
-            [("deepseek", .deepseek), ("openrouter", .openrouter),
+            [("deepseek", .deepseek), ("openrouter", .openrouter), ("vps", .vps),
              ("ollama", .ollama), ("lmstudio", .lmstudio), ("llamacpp", .llamacpp)] {
             let decoded = try dec.decode(Provider.self, from: "\"\(raw)\"".data(using: .utf8)!)
             XCTAssertEqual(decoded, expected)
@@ -172,6 +182,27 @@ final class LocalModelsTests: XCTestCase {
         // У локальных URL строятся от LocalEndpoints.
         XCTAssertTrue(Provider.ollama.chatURL.hasSuffix("/v1/chat/completions"))
         XCTAssertTrue(Provider.lmstudio.modelsURL.hasSuffix("/v1/models"))
+        // VPS: не локальный (ничего не спавним), но self-hosted (длинный таймаут,
+        // честный маппинг ошибок) и с обязательным токеном (endpoint публичный).
+        XCTAssertFalse(Provider.vps.isLocal)
+        XCTAssertTrue(Provider.vps.isSelfHosted)
+        XCTAssertTrue(Provider.vps.requiresKey)
+        for p: Provider in [.ollama, .lmstudio, .llamacpp] {
+            XCTAssertTrue(p.isSelfHosted)
+        }
+        for p: Provider in [.deepseek, .openrouter] {
+            XCTAssertFalse(p.isSelfHosted)
+        }
+    }
+
+    func testVpsURLsBuiltFromLocalEndpoints() {
+        // Пока адрес не задан — URL пустые-битые, loadModels обязан скипать.
+        XCTAssertEqual(LocalEndpoints.defaultBaseURL(for: .vps), "")
+        // Заданный адрес (с хвостовым «/» — normalize срежет) → полные endpoints.
+        LocalEndpoints.setBaseURL("https://x.sslip.io/llm/", for: .vps)
+        defer { LocalEndpoints.setBaseURL("", for: .vps) }  // не загрязняем UserDefaults
+        XCTAssertEqual(Provider.vps.chatURL, "https://x.sslip.io/llm/v1/chat/completions")
+        XCTAssertEqual(Provider.vps.modelsURL, "https://x.sslip.io/llm/v1/models")
     }
 
     // MARK: маппинг сетевых ошибок локальных раннеров
@@ -192,6 +223,24 @@ final class LocalModelsTests: XCTestCase {
             XCTAssertEqual(p, .lmstudio)
         } else {
             XCTFail("cannotConnectToHost должен маппиться в localUnavailable")
+        }
+    }
+
+    func testLocalFailureMappingForVps() {
+        // VPS — self-hosted: тот же маппинг, что у локальных, но свои тексты.
+        XCTAssertNil(DeepSeekClient.localFailure(.cancelled, provider: .vps))  // пауза FSM
+        if case .badStatus(_, let message)? = DeepSeekClient.localFailure(.timedOut, provider: .vps) {
+            XCTAssertTrue(message.contains("таймаут"))
+            XCTAssertTrue(message.contains("VPS"))
+        } else {
+            XCTFail("timedOut у .vps должен маппиться в badStatus с текстом про таймаут")
+        }
+        if case .localUnavailable(let p)? = DeepSeekClient.localFailure(.cannotConnectToHost, provider: .vps) {
+            XCTAssertEqual(p, .vps)
+            // Текст не должен отправлять в панель локальных моделей.
+            XCTAssertEqual(DeepSeekError.localUnavailable(.vps).errorDescription?.contains("VPS"), true)
+        } else {
+            XCTFail("cannotConnectToHost у .vps должен маппиться в localUnavailable")
         }
     }
 

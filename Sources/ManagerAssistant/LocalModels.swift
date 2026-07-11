@@ -72,7 +72,9 @@ enum LocalModelsParsing {
     }
 
     /// Список установленных моделей Ollama (имя обязательно, остальное — как есть).
-    static func parseOllamaTags(_ data: Data) throws -> [InstalledLocalModel] {
+    /// provider параметризован: тот же /api/tags отдаёт и Ollama на VPS (.vps) —
+    /// без этого удаление/обновление целились бы в локальный раннер.
+    static func parseOllamaTags(_ data: Data, provider: Provider = .ollama) throws -> [InstalledLocalModel] {
         let decoded = try JSONDecoder().decode(OllamaTags.self, from: data)
         return (decoded.models ?? []).map { m in
             InstalledLocalModel(
@@ -80,7 +82,7 @@ enum LocalModelsParsing {
                 sizeBytes: m.size,
                 quantization: m.details?.quantization_level,
                 parameterSize: m.details?.parameter_size,
-                provider: .ollama
+                provider: provider
             )
         }
     }
@@ -222,6 +224,7 @@ extension Provider {
         case .ollama: return "Скачайте Ollama с ollama.com/download и запустите — модели ставятся прямо из этой панели."
         case .lmstudio: return "Скачайте LM Studio с lmstudio.ai; модели ставятся в самом LM Studio, для чата включите его сервер (Developer → Start Server)."
         case .llamacpp: return "Соберите/установите llama.cpp и запустите llama-server с моделью GGUF."
+        case .vps: return "Ollama на VPS недоступна: проверь адрес/токен в «API-ключи», а на сервере — bash agent/deploy/install-llm.sh (ставит Ollama и защищённый прокси)."
         case .deepseek, .openrouter: return ""
         }
     }
@@ -231,7 +234,7 @@ extension Provider {
         case .ollama: return URL(string: "https://ollama.com/download")
         case .lmstudio: return URL(string: "https://lmstudio.ai")
         case .llamacpp: return URL(string: "https://github.com/ggml-org/llama.cpp")
-        case .deepseek, .openrouter: return nil
+        case .deepseek, .openrouter, .vps: return nil
         }
     }
 }

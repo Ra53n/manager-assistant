@@ -421,6 +421,27 @@ Providers.swift (Provider, KeyStore, DeepSeekPricing)
   ChatSettingsView; каталог — `LocalCatalogTag {tag, approxGB}` (примерный вес
   скачивания у каждого варианта, ≥15 ГБ = `isHeavy` → оранжевым). Тесты —
   `LocalModelsTests.swift` (парсеры/скан/каталог/снисходительный декод/normalize).
+- **Провайдер VPS (Ollama на своём сервере)** — case `.vps`: НЕ локальный
+  (isLocal=false — ничего не спавним; ключ обязателен: endpoint публичный), но
+  **isSelfHosted=true** (`isLocal || .vps`) — по этому флагу таймаут 600с и маппинг
+  ошибок `localFailure` (у `.vps` свои тексты: НЕ отправляют в панель локальных
+  моделей). Адрес — `LocalEndpoints.baseURL(for: .vps)` (дефолт ПУСТОЙ: без адреса
+  loadModels/панель молча скипают), токен — KeyStore (vps.key / VPS_LLM_API_KEY);
+  оба вводятся в листе «API-ключи» (у секции VPS доп. поле «Адрес»). Серверная
+  сторона — `agent/deploy/install-llm.sh` (идемпотентный): Ollama на loopback +
+  Caddy `handle_path /llm/*` с bearer-проверкой (без токена 401) + swap 4 ГБ;
+  грабли — agent/README.md «LLM-прокси» (deploy.sh может снести /llm-блок при
+  пересоздании Caddyfile). Модели и метаданные (вес/квант) — через /llm/api/tags
+  (`fetchVpsModels`; `parseOllamaTags(provider:)` помечает модели `.vps` — иначе
+  delete целился бы в локальную Ollama); недоступный НАСТРОЕННЫЙ VPS — ошибка в
+  modelsError (не молчание: он должен жить 24/7). Панель «Локальные модели»
+  управляет и VPS: `panelProviders` = локальные + `.vps`, bearer-параметр в
+  `LocalModelsClient`, pull/delete параметризованы целью (`pullingTarget`),
+  в каталоге сегмент «Локально|VPS», когда живы обе. Чат/FSM/рой/RAG/сравнение
+  работают без правок (обычный Provider). Рой сериализуется сервером
+  (`OLLAMA_NUM_PARALLEL=1`) — на `.vps` держи maxParallelAgents=2. 7B в 3.8 ГБ
+  RAM VPS не влезает; стоят qwen2.5:3b и qwen3:4b-instruct-2507-q4_K_M
+  (~4–10 ток/с на 2 CPU). Рутины агента НЕ переключены — остаются на DeepSeek.
 - **Мультипровайдер** — добавить провайдера = новый case в `Provider` +
   endpoints/keyFileName/envVar; UI подхватит сам через `allCases` (лист ключей —
   `allCases.filter(\.requiresKey)`, локальным раннерам поля ключа не показываются).

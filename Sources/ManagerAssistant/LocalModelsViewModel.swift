@@ -16,6 +16,8 @@ final class LocalModelsViewModel: ObservableObject {
     @Published var installed: [Provider: [InstalledLocalModel]] = [:]
     /// Имя модели, которая сейчас скачивается (nil — ничего не качаем).
     @Published var pullingModel: String? = nil
+    /// Куда качаем (локальная Ollama или VPS) — для подписи прогресса и refresh.
+    @Published var pullingTarget: Provider? = nil
     @Published var pullProgress: PullProgress? = nil
     @Published var errorText: String? = nil
 
@@ -25,13 +27,15 @@ final class LocalModelsViewModel: ObservableObject {
     private let client = LocalModelsClient()
     private var pullTask: Task<Void, Never>? = nil
 
-    static let localProviders: [Provider] = Provider.allCases.filter(\.isLocal)
+    /// Раннеры панели: локальные + Ollama на VPS (не локальная, но управляется
+    /// той же панелью через защищённый прокси).
+    static let panelProviders: [Provider] = Provider.allCases.filter(\.isLocal) + [.vps]
 
     // MARK: Обновление статусов и списков
 
-    /// Обновляет все три раннера параллельно.
+    /// Обновляет все раннеры параллельно.
     func refreshAll() {
-        for provider in Self.localProviders { refresh(provider) }
+        for provider in Self.panelProviders { refresh(provider) }
     }
 
     func refresh(_ provider: Provider) {
@@ -42,6 +46,7 @@ final class LocalModelsViewModel: ObservableObject {
             case .ollama: await self.refreshOllama()
             case .lmstudio: await self.refreshLMStudio()
             case .llamacpp: await self.refreshLlamaCpp()
+            case .vps: await self.refreshVps()
             default: break
             }
         }
@@ -97,6 +102,40 @@ final class LocalModelsViewModel: ObservableObject {
         }
     }
 
+    /// Текст ошибки кривого токена VPS — константа, чтобы успешный refresh мог
+    /// снять именно её, не затирая чужие ошибки (например, упавшего pull).
+    private static let vpsTokenErrorText = "VPS отвечает, но токен не подходит (401) — проверь «API-ключи»."
+
+    /// Ollama на VPS через защищённый прокси: /api/tags с bearer-токеном.
+    /// «Не установлена» не детектится (удалённая машина) — только running/stopped;
+    /// 401 — сервер жив, но токен кривой: показываем running + понятную ошибку.
+    private func refreshVps() async {
+        let base = LocalEndpoints.baseURL(for: .vps)
+        guard !base.isEmpty else {
+            // Адрес не настроен — секция честно молчит «недоступен», без ошибок.
+            status[.vps] = .stopped
+            installed[.vps] = []
+            return
+        }
+        do {
+            installed[.vps] = try await client.ollamaInstalled(
+                baseURL: base, bearerToken: KeyStore.key(for: .vps), provider: .vps)
+            status[.vps] = .running
+            if errorText == Self.vpsTokenErrorText { errorText = nil }  // токен починили
+        } catch let e as LocalModelsError {
+            if case .badStatus(let code, _) = e, code == 401 {
+                status[.vps] = .running
+                errorText = Self.vpsTokenErrorText
+            } else {
+                status[.vps] = .stopped
+            }
+            installed[.vps] = []
+        } catch {
+            status[.vps] = .stopped
+            installed[.vps] = []
+        }
+    }
+
     /// Кнопка «Запустить» для Ollama: ленивый запуск сервера + обновление списка.
     func startOllamaIfNeeded() {
         status[.ollama] = .checking
@@ -106,13 +145,17 @@ final class LocalModelsViewModel: ObservableObject {
         }
     }
 
-    // MARK: Скачивание / удаление (только Ollama)
+    // MARK: Скачивание / удаление (Ollama локально и на VPS)
 
     /// Скачивает модель из реестра Ollama со стриминговым прогрессом.
-    func pull(_ name: String) {
+    /// target: .ollama — локальный раннер (поднимем сервер сами), .vps — через
+    /// защищённый прокси (качает сервер НА VPS, модель ложится там).
+    func pull(_ name: String, on target: Provider = .ollama) {
+        guard target == .ollama || target == .vps else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, pullTask == nil else { return }
         pullingModel = trimmed
+        pullingTarget = target
         pullProgress = PullProgress(status: "подготовка…")
         errorText = nil
 
@@ -121,17 +164,20 @@ final class LocalModelsViewModel: ObservableObject {
                 Task { @MainActor in self?.pullProgress = p }
             }
             do {
-                let base = LocalEndpoints.baseURL(for: .ollama)
-                // Сервер может быть не запущен — поднимем (модель качает ОН).
-                guard await OllamaLauncher.shared.ensureRunning(baseURL: base) else {
-                    throw DeepSeekError.localUnavailable(.ollama)
+                let base = LocalEndpoints.baseURL(for: target)
+                if target == .ollama {
+                    // Сервер может быть не запущен — поднимем (модель качает ОН).
+                    guard await OllamaLauncher.shared.ensureRunning(baseURL: base) else {
+                        throw DeepSeekError.localUnavailable(.ollama)
+                    }
                 }
+                let token = target == .vps ? KeyStore.key(for: .vps) : nil
                 let client = LocalModelsClient()
-                try await client.pullOllama(model: trimmed, baseURL: base, progress: onProgress)
+                try await client.pullOllama(model: trimmed, baseURL: base, bearerToken: token, progress: onProgress)
                 await MainActor.run {
                     guard let self else { return }
                     self.finishPull()
-                    self.refresh(.ollama)
+                    self.refresh(target)
                     self.onModelsChanged?()
                 }
             } catch is CancellationError {
@@ -149,14 +195,18 @@ final class LocalModelsViewModel: ObservableObject {
 
     func cancelPull() { pullTask?.cancel() }
 
-    /// Удаляет модель Ollama (подтверждение — на вью).
+    /// Удаляет модель Ollama — локальную или на VPS (подтверждение — на вью).
     func delete(_ model: InstalledLocalModel) {
-        guard model.provider == .ollama else { return }
+        guard model.provider == .ollama || model.provider == .vps else { return }
+        let target = model.provider
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.client.deleteOllama(model: model.name, baseURL: LocalEndpoints.baseURL(for: .ollama))
-                self.refresh(.ollama)
+                try await self.client.deleteOllama(
+                    model: model.name,
+                    baseURL: LocalEndpoints.baseURL(for: target),
+                    bearerToken: target == .vps ? KeyStore.key(for: .vps) : nil)
+                self.refresh(target)
                 self.onModelsChanged?()
             } catch {
                 self.errorText = Self.describe(error)
@@ -168,6 +218,7 @@ final class LocalModelsViewModel: ObservableObject {
 
     private func finishPull() {
         pullingModel = nil
+        pullingTarget = nil
         pullProgress = nil
         pullTask = nil
     }

@@ -25,6 +25,10 @@ import Foundation
 enum Provider: String, CaseIterable, Codable, Hashable {
     case deepseek
     case openrouter
+    // Своя Ollama на VPS за Caddy-прокси с bearer-токеном (agent/deploy/install-llm.sh):
+    // не локальная (ничего не спавним), но и не облако (адрес из LocalEndpoints,
+    // цен нет, инференс медленный — см. isSelfHosted).
+    case vps
     // Локальные раннеры (облачные выше — остаются первыми в пикерах).
     case ollama
     case lmstudio
@@ -33,18 +37,23 @@ enum Provider: String, CaseIterable, Codable, Hashable {
     /// Локальный раннер на этой машине (без ключа, endpoint из LocalEndpoints).
     var isLocal: Bool {
         switch self {
-        case .deepseek, .openrouter: return false
+        case .deepseek, .openrouter, .vps: return false
         case .ollama, .lmstudio, .llamacpp: return true
         }
     }
 
-    /// Нужен ли ключ API для работы (локальным — нет).
+    /// Наш собственный инференс-сервер (локальный раннер или Ollama на VPS):
+    /// CPU-инференс медленный → длинный таймаут и честный маппинг сетевых ошибок.
+    var isSelfHosted: Bool { isLocal || self == .vps }
+
+    /// Нужен ли ключ API для работы (локальным — нет; VPS — да, endpoint публичный).
     var requiresKey: Bool { !isLocal }
 
     var displayName: String {
         switch self {
         case .deepseek: return "DeepSeek"
         case .openrouter: return "OpenRouter"
+        case .vps: return "VPS (Ollama)"
         case .ollama: return "Ollama (локально)"
         case .lmstudio: return "LM Studio (локально)"
         case .llamacpp: return "llama.cpp (локально)"
@@ -56,7 +65,7 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "https://api.deepseek.com/chat/completions"
         case .openrouter: return "https://openrouter.ai/api/v1/chat/completions"
-        case .ollama, .lmstudio, .llamacpp:
+        case .vps, .ollama, .lmstudio, .llamacpp:
             return LocalEndpoints.baseURL(for: self) + "/v1/chat/completions"
         }
     }
@@ -66,7 +75,7 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "https://api.deepseek.com/models"
         case .openrouter: return "https://openrouter.ai/api/v1/models"
-        case .ollama, .lmstudio, .llamacpp:
+        case .vps, .ollama, .lmstudio, .llamacpp:
             return LocalEndpoints.baseURL(for: self) + "/v1/models"
         }
     }
@@ -77,6 +86,7 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "deepseek.key"
         case .openrouter: return "openrouter.key"
+        case .vps: return "vps.key"
         case .ollama: return "ollama.key"
         case .lmstudio: return "lmstudio.key"
         case .llamacpp: return "llamacpp.key"
@@ -88,6 +98,7 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "DEEPSEEK_API_KEY"
         case .openrouter: return "OPENROUTER_API_KEY"
+        case .vps: return "VPS_LLM_API_KEY"
         case .ollama: return "OLLAMA_API_KEY"
         case .lmstudio: return "LMSTUDIO_API_KEY"
         case .llamacpp: return "LLAMACPP_API_KEY"
@@ -99,6 +110,7 @@ enum Provider: String, CaseIterable, Codable, Hashable {
         switch self {
         case .deepseek: return "Ключ с platform.deepseek.com (sk-...)"
         case .openrouter: return "Ключ с openrouter.ai/keys (sk-or-...)"
+        case .vps: return "Токен LLM-прокси с VPS (печатает install-llm.sh)"
         case .ollama, .lmstudio, .llamacpp: return "Ключ не нужен (локальный сервер)"
         }
     }
@@ -121,12 +133,14 @@ enum LocalEndpoints {
     }
 
     /// Стандартный адрес раннера (для облачных — пусто).
+    /// У .vps дефолта нет: пока пользователь не задал адрес (лист «API-ключи»),
+    /// провайдер неактивен — loadModels/панель его молча пропускают.
     static func defaultBaseURL(for provider: Provider) -> String {
         switch provider {
         case .ollama: return "http://127.0.0.1:11434"
         case .lmstudio: return "http://127.0.0.1:1234"
         case .llamacpp: return "http://127.0.0.1:8080"
-        case .deepseek, .openrouter: return ""
+        case .deepseek, .openrouter, .vps: return ""
         }
     }
 

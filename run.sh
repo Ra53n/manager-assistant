@@ -25,6 +25,17 @@ mkdir -p "${APP_DIR}/Contents/Resources"
 
 cp "${BIN_PATH}" "${APP_DIR}/Contents/MacOS/${BIN_NAME}"
 
+# Ресурс-бандл SwiftPM (AppIcon.icns и др.): без него Bundle.module в
+# AppDelegate.loadAppIcon() делает fatalError на старте .app. Аксессор
+# executable-таргета ищет его в Bundle.main.bundleURL — то есть в КОРНЕ .app
+# (не в Contents/Resources!); фолбэк на путь .build у установленного
+# приложения не работает (TCC не пускает в ~/Desktop).
+RES_BUNDLE="$(swift build -c release --show-bin-path)/${APP_NAME}_${APP_NAME}.bundle"
+if [ -d "${RES_BUNDLE}" ]; then
+    rm -rf "${APP_DIR}/${APP_NAME}_${APP_NAME}.bundle"
+    cp -R "${RES_BUNDLE}" "${APP_DIR}/"
+fi
+
 # Иконка приложения (если собрана).
 ICON_SRC="Sources/ManagerAssistant/Resources/AppIcon.icns"
 if [ -f "${ICON_SRC}" ]; then

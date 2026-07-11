@@ -35,6 +35,9 @@ enum DeepSeekError: LocalizedError {
         case .emptyResponse:
             return "Пустой ответ от модели."
         case .localUnavailable(let provider):
+            if provider == .vps {
+                return "Сервер VPS (Ollama) недоступен. Проверь адрес и токен в «API-ключи» и что на VPS выполнен install-llm.sh (сервис ollama запущен)."
+            }
             return "Локальный сервер \(provider.displayName) не запущен. Открой панель «Локальные модели» (иконка компьютера) и проверь статус."
         }
     }
@@ -434,14 +437,16 @@ struct DeepSeekClient {
 
     /// HTTP-ядро: строит ChatRequest (с инструментами или без), POST, декодирует
     /// ChatResponse. Единая точка для текстовых и tool-calling запросов.
-    /// Понятная ошибка сетевого сбоя ЛОКАЛЬНОГО раннера; nil — не переопределяем
-    /// (облачные провайдеры и отмена: пауза FSM различает отмену по типу ошибки).
+    /// Понятная ошибка сетевого сбоя СВОЕГО инференс-сервера (локальный раннер
+    /// или Ollama на VPS); nil — не переопределяем (облачные провайдеры и отмена:
+    /// пауза FSM различает отмену по типу ошибки).
     /// ВАЖНО: таймаут ≠ «сервер не запущен» — модель жива, но думает дольше лимита
     /// (раньше любой URLError превращался в «не запущен» и сбивал с толку).
     static func localFailure(_ code: URLError.Code, provider: Provider) -> DeepSeekError? {
-        guard provider.isLocal, code != .cancelled else { return nil }
+        guard provider.isSelfHosted, code != .cancelled else { return nil }
         if code == .timedOut {
-            return .badStatus(code: -1, message: "локальная модель не успела ответить (таймаут). Она работает, но слишком медленно для этого запроса — попробуй модель поменьше, сократи историю (скользящее окно) или повтори запрос.")
+            let subject = provider == .vps ? "модель на VPS" : "локальная модель"
+            return .badStatus(code: -1, message: "\(subject) не успела ответить (таймаут). Она работает, но слишком медленно для этого запроса — попробуй модель поменьше, сократи историю (скользящее окно) или повтори запрос.")
         }
         return .localUnavailable(provider)
     }
@@ -496,7 +501,8 @@ struct DeepSeekClient {
         // Дефолтные 60 с URLRequest — мало: локальная 7B+ на ноутбуке легко думает
         // дольше минуты (загрузка модели + prompt eval + генерация без стриминга),
         // облачный reasoner тоже бывает небыстрым. Таймаут — от последнего байта.
-        request.timeoutInterval = provider.isLocal ? 600 : 300
+        // Свой инференс (локальный/VPS на CPU) — самый медленный → 600 с.
+        request.timeoutInterval = provider.isSelfHosted ? 600 : 300
 
         let data: Data
         let response: URLResponse
@@ -534,6 +540,9 @@ struct DeepSeekClient {
         if !key.isEmpty {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
+        // /models — лёгкий GET; дефолтные 60 с только затягивают loadModels,
+        // когда настроенный VPS лежит.
+        request.timeoutInterval = 15
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {

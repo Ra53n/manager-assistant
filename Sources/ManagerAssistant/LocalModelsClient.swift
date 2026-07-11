@@ -38,9 +38,11 @@ struct LocalModelsClient {
     }
 
     /// Установленные модели Ollama с размерами/квантами: GET /api/tags.
-    func ollamaInstalled(baseURL: String) async throws -> [InstalledLocalModel] {
-        let data = try await get(baseURL + "/api/tags")
-        return try LocalModelsParsing.parseOllamaTags(data)
+    /// bearerToken — для Ollama за защищённым прокси (VPS); provider помечает
+    /// модели (у .vps иначе удаление/обновление целились бы в локальный раннер).
+    func ollamaInstalled(baseURL: String, bearerToken: String? = nil, provider: Provider = .ollama) async throws -> [InstalledLocalModel] {
+        let data = try await get(baseURL + "/api/tags", bearerToken: bearerToken)
+        return try LocalModelsParsing.parseOllamaTags(data, provider: provider)
     }
 
     /// Модели OpenAI-совместимого /v1/models (LM Studio, llama.cpp).
@@ -55,12 +57,16 @@ struct LocalModelsClient {
     func pullOllama(
         model: String,
         baseURL: String,
+        bearerToken: String? = nil,
         progress: @escaping @Sendable (PullProgress) -> Void
     ) async throws {
         guard let url = URL(string: baseURL + "/api/pull") else { throw LocalModelsError.badURL }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         // Оба ключа: новые версии Ollama ждут "model", старые — "name"; лишний игнорируется.
         struct PullBody: Encodable { let model: String; let name: String; let stream: Bool }
         req.httpBody = try JSONEncoder().encode(PullBody(model: model, name: model, stream: true))
@@ -93,11 +99,14 @@ struct LocalModelsClient {
     }
 
     /// Удаление модели Ollama: DELETE /api/delete.
-    func deleteOllama(model: String, baseURL: String) async throws {
+    func deleteOllama(model: String, baseURL: String, bearerToken: String? = nil) async throws {
         guard let url = URL(string: baseURL + "/api/delete") else { throw LocalModelsError.badURL }
         var req = URLRequest(url: url)
         req.httpMethod = "DELETE"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = bearerToken, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         req.httpBody = try JSONEncoder().encode(["model": model, "name": model])
         let (data, response) = try await URLSession.shared.data(for: req)
         guard let http = response as? HTTPURLResponse else {
@@ -137,10 +146,13 @@ struct LocalModelsClient {
 
     // MARK: Вспомогательное
 
-    private func get(_ urlString: String) async throws -> Data {
+    private func get(_ urlString: String, bearerToken: String? = nil) async throws -> Data {
         guard let url = URL(string: urlString) else { throw LocalModelsError.badURL }
         var req = URLRequest(url: url)
         req.timeoutInterval = 5
+        if let token = bearerToken, !token.isEmpty {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         let (data, response) = try await URLSession.shared.data(for: req)
         guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1

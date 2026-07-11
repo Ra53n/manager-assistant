@@ -424,6 +424,25 @@ final class ChatViewModel: ObservableObject {
                     continue
                 }
                 guard KeyStore.hasKey(for: provider) else { continue }
+                if provider == .vps {
+                    // Ollama на VPS: «настроен» = адрес И токен. Без любого из
+                    // них — молчаливый skip (guard hasKey выше — как у облачных
+                    // без ключа, guard адреса — ниже). НАСТРОЕННЫЙ, но
+                    // недоступный — ошибка (VPS должен жить 24/7, молчание
+                    // скрыло бы поломку). Список — через /api/tags прокси:
+                    // сразу с весом/квантом в подпись пикера, цен нет.
+                    guard !LocalEndpoints.baseURL(for: .vps).isEmpty else { continue }
+                    do {
+                        for model in try await Self.fetchVpsModels() {
+                            let option = ModelOption(provider: provider, model: model.name)
+                            combined.append(option)
+                            if let line = model.detailLine { details[option.id] = line }
+                        }
+                    } catch {
+                        failed.append(provider.displayName)
+                    }
+                    continue
+                }
                 do {
                     let infos = try await client.fetchModels(provider: provider)
                     for info in infos {
@@ -481,6 +500,16 @@ final class ChatViewModel: ObservableObject {
         default:
             return []
         }
+    }
+
+    /// Модели Ollama на VPS через защищённый прокси (/api/tags с bearer-токеном).
+    /// Ошибки НЕ глотаются — loadModels показывает недоступный VPS в modelsError.
+    private nonisolated static func fetchVpsModels() async throws -> [InstalledLocalModel] {
+        try await LocalModelsClient().ollamaInstalled(
+            baseURL: LocalEndpoints.baseURL(for: .vps),
+            bearerToken: KeyStore.key(for: .vps),
+            provider: .vps
+        )
     }
 
     /// Удаляет чат и тем самым полностью очищает его контекст.

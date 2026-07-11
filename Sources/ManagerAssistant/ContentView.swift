@@ -479,10 +479,10 @@ struct ChatDetailView: View {
                     showingLocalModels = true
                 } label: {
                     Image(systemName: "desktopcomputer")
-                        .foregroundStyle((vm.selectedChat?.settings.provider.isLocal ?? false)
+                        .foregroundStyle((vm.selectedChat?.settings.provider.isSelfHosted ?? false)
                                          ? Color.accentColor : Color.secondary)
                 }
-                .help("Локальные модели: Ollama / LM Studio / llama.cpp — установка, статус, что уже стоит на ПК")
+                .help("Локальные модели: Ollama / LM Studio / llama.cpp / VPS — установка, статус, что уже стоит")
 
                 Button {
                     showingMemory = true
@@ -2747,6 +2747,8 @@ struct ProviderKeysView: View {
     @Environment(\.dismiss) private var dismiss
 
     @State private var keys: [Provider: String] = [:]
+    /// Адрес LLM-прокси на VPS (не ключ — хранится в LocalEndpoints, не в KeyStore).
+    @State private var vpsBaseURL: String = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2763,6 +2765,15 @@ struct ProviderKeysView: View {
                 // Локальным раннерам ключ не нужен — поля не показываем.
                 ForEach(Provider.allCases.filter(\.requiresKey), id: \.self) { provider in
                     Section(provider.displayName) {
+                        if provider == .vps {
+                            // У VPS кроме токена нужен адрес прокси (Caddy /llm).
+                            TextField(
+                                "",
+                                text: $vpsBaseURL,
+                                prompt: Text("Адрес: https://<домен-vps>/llm")
+                            )
+                            .font(.system(.body, design: .monospaced))
+                        }
                         TextField(
                             "",
                             text: Binding(
@@ -2772,7 +2783,9 @@ struct ProviderKeysView: View {
                             prompt: Text(provider.keyHint)
                         )
                         .font(.system(.body, design: .monospaced))
-                        Text(provider.keyHint)
+                        Text(provider == .vps
+                             ? "Адрес и токен печатает agent/deploy/install-llm.sh на VPS. Без адреса провайдер неактивен."
+                             : provider.keyHint)
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -2798,6 +2811,7 @@ struct ProviderKeysView: View {
                     for provider in Provider.allCases.filter(\.requiresKey) {
                         KeyStore.setKey(keys[provider] ?? "", for: provider)
                     }
+                    LocalEndpoints.setBaseURL(vpsBaseURL, for: .vps)
                     vm.loadModels(force: true)
                     dismiss()
                 }
@@ -2805,11 +2819,12 @@ struct ProviderKeysView: View {
             }
             .padding()
         }
-        .frame(width: 480, height: 420)
+        .frame(width: 480, height: 540)
         .onAppear {
             for provider in Provider.allCases.filter(\.requiresKey) {
                 keys[provider] = KeyStore.key(for: provider)
             }
+            vpsBaseURL = LocalEndpoints.baseURL(for: .vps)
         }
     }
 }
